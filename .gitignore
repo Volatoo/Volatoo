@@ -1,0 +1,19 @@
+# Built artifacts — never commit images
+*.squashfs
+*.img
+*.iso
+*.qcow2
+*.tar.*
+initramfs.cpio*
+vmlinuz*
+
+# Build work dirs
+/build/
+/work/
+/out/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+.idea/
+.vscode/
