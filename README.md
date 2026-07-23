@@ -81,4 +81,4 @@ The project is in the design phase — issues and discussions about the boot flo
 
 ## License
 
-GPL-2.0 (same spirit as Gentoo itself). A `LICENSE` file will be added with the first code drop.
+GPL-2.0; see [`LICENSE`](LICENSE).
