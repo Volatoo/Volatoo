@@ -1,0 +1,65 @@
+# Kernel baseline
+
+Volatoo keeps its amd64 kernel policy as a Kconfig fragment rather than a
+version-specific generated `.config`. The fragment is merged on top of the
+selected Linux kernel's `x86_64_defconfig`, resolved by that kernel's own
+Kconfig implementation, and then checked for lost requirements.
+
+The boot-critical options in [`config/amd64.fragment`](config/amd64.fragment)
+are all built into the kernel. In particular, tmpfs, SquashFS with Zstd,
+OverlayFS, ext4, loop devices, virtio block, USB mass storage, and the serial
+console cannot be modules: the standalone Volatoo initramfs does not ship a
+kernel module tree.
+
+## Prepare a configuration
+
+Use a supported Linux source tree and a dedicated output directory:
+
+```sh
+scripts/prepare-kernel-config.sh /usr/src/linux out/kernel-build
+```
+
+The script starts from `x86_64_defconfig`, merges the baseline, runs
+`olddefconfig`, and fails if Kconfig cannot retain any requirement. It marks
+its output directory before reuse so an unrelated build tree is never
+overwritten accidentally.
+
+Build the kernel and modules with the same output directory:
+
+```sh
+make -C /usr/src/linux O="$PWD/out/kernel-build" -j"$(nproc)" bzImage modules
+```
+
+Install the matching modules into the Catalyst image before relying on any
+optional driver configured as a module. Modules are not required for Volatoo's
+image discovery or tmpfs handoff.
+
+To audit any already-generated configuration:
+
+```sh
+scripts/validate-kernel-config.sh /path/to/.config
+```
+
+## Baseline scope
+
+The first console image targets amd64 BIOS and UEFI machines. The baseline
+covers:
+
+- the initramfs, devtmpfs, procfs, sysfs, and tmpfs handoff;
+- raw SquashFS, SquashFS files on ext4 or ISO9660, and optional OverlayFS mode;
+- virtio, NVMe, AHCI, and USB mass-storage image/state devices;
+- GPT and MBR partition tables;
+- serial diagnostics and rescue access;
+- virtio and common QEMU Intel network devices for DHCP and SSH.
+
+Hardware-specific drivers outside this set may be built in or supplied as
+matching modules by a future kernel package. Secure Boot, signing, and module
+installation policy belong to the release-image work rather than this boot
+baseline.
+
+## Validation record
+
+On 2026-07-23 the fragment was merged into `x86_64_defconfig` and resolved with
+Linux 6.18.39's Kconfig implementation. All 55 requirements remained built in.
+This records compatibility with the selected LTS line; release builds still
+need to pin and verify their exact kernel source archive.

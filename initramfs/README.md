@@ -7,16 +7,16 @@ stage3 userspace. The Phase 0 QEMU helper remains the current test harness.
 ## Inputs
 
 - Docker with Buildx for producing the stage3 squashfs;
-- an x86_64 kernel image with support for initramfs, devtmpfs, procfs, sysfs,
-  tmpfs, a serial console, virtio block devices, ext4, SquashFS, and Zstd;
+- an x86_64 kernel built with the validated
+  [`kernel/config/amd64.fragment`](../kernel/config/amd64.fragment) baseline;
 - a statically linked x86_64 BusyBox binary containing the applets used by
   `init`;
 - `qemu-system-x86_64`, `cpio`, and `gzip` on the host.
 
-Virtio block and SquashFS should be built into the kernel. A development kernel
-may instead provide them as modules when its base initramfs contains the module
-tree. The kernel and BusyBox remain explicit inputs because they are build
-artifacts and must not be committed.
+The standalone initramfs contains no kernel module tree, so the baseline keeps
+all early-boot storage and filesystem support built in. The kernel and BusyBox
+remain explicit inputs because they are build artifacts and must not be
+committed.
 
 ## Build the stage3 image
 
