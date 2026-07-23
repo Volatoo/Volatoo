@@ -50,9 +50,10 @@ at level 19.
 ## Weekly CI build
 
 The `Weekly minimal image` GitHub Actions workflow runs every Monday and can
-also be started manually. Pull requests only run its metadata, shell, builder,
-and spec validation job; scheduled and manual runs additionally build the full
-image and retain it as a workflow artifact for 14 days.
+also be started manually. Pull requests and relevant pushes only run its
+metadata, shell, builder, and spec validation job; scheduled and manual runs
+additionally build the full image and retain it as a workflow artifact for 14
+days.
 
 The workflow does not trust mutable `current` downloads. It uses
 `scripts/fetch-gentoo-inputs.sh` to verify the clearsigned stage3 pointer and

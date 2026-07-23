@@ -1,6 +1,13 @@
 name: Weekly minimal image
 
 on:
+  push:
+    paths:
+      - ".github/workflows/weekly-minimal-image.yml"
+      - "image/catalyst/**"
+      - "persist/**"
+      - "scripts/build-catalyst-squashfs.sh"
+      - "scripts/fetch-gentoo-inputs.sh"
   pull_request:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
@@ -47,7 +54,7 @@ jobs:
 
   build:
     name: Build minimal image
-    if: github.event_name != 'pull_request'
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 360
