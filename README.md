@@ -63,6 +63,7 @@ the machine-id, SSH host-key, log, and opt-out semantics.
 ```
 initramfs/   standalone volatoo-initramfs sources and default configuration
 image/       image build specs (catalyst specs, package sets, profiles)
+kernel/      amd64 kernel baseline and build guidance
 persist/     volatoo-persist tool and default policies
 docs/        design notes and user documentation
 ```
