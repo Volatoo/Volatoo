@@ -2,6 +2,7 @@
 *.squashfs
 *.img
 *.iso
+*.ext4
 *.qcow2
 *.tar.*
 initramfs.cpio*
@@ -11,6 +12,8 @@ vmlinuz*
 /build/
 /work/
 /out/
+__pycache__/
+*.pyc
 
 # Editor / OS noise
 .DS_Store

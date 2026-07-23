@@ -1,0 +1,591 @@
+#!/usr/bin/env python3
+
+"""Synchronize and restore Volatoo state policies."""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import datetime
+import fcntl
+import hashlib
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+
+class PersistError(RuntimeError):
+    pass
+
+
+@dataclasses.dataclass(frozen=True)
+class Policy:
+    kind: str
+    target: str
+    key: str
+
+
+@dataclasses.dataclass(frozen=True)
+class Entry:
+    kind: str
+    mode: int
+    uid: int
+    gid: int
+    payload: str | int | None
+
+
+STATE_ROOT = Path(os.environ.get("VOLATOO_STATE_ROOT", "/.volatoo/state"))
+SYSTEM_ROOT = Path(os.environ.get("VOLATOO_ROOT", "/"))
+VOLATOO_STATE = STATE_ROOT / "volatoo"
+CONFIG_PATH = VOLATOO_STATE / "config/persist.conf"
+IMAGE_ID_PATH = SYSTEM_ROOT / ".volatoo/image-id"
+KEY_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+TARGET_RE = re.compile(r"^/[A-Za-z0-9_./+@:-]+$")
+IMAGE_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+PROTECTED_TARGETS = ("/dev", "/proc", "/run", "/sys", "/.volatoo")
+
+
+def ensure_safe_directory(path: Path, description: str, create: bool = False) -> None:
+    if path.is_symlink():
+        raise PersistError(f"{description} must not be a symbolic link: {path}")
+    if path.exists():
+        if not path.is_dir():
+            raise PersistError(f"{description} is not a directory: {path}")
+        return
+    if create:
+        path.mkdir()
+
+
+def require_safe_directory(path: Path, description: str) -> None:
+    ensure_safe_directory(path, description)
+    if not path.exists():
+        raise PersistError(f"{description} is missing: {path}")
+
+
+def require_safe_file(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise PersistError(f"{description} is missing or unsafe: {path}")
+
+
+def rooted(target: str) -> Path:
+    return SYSTEM_ROOT / target.removeprefix("/")
+
+
+def validate_runtime() -> None:
+    marker = VOLATOO_STATE / "layout-version"
+    require_safe_file(marker, "state layout marker")
+    if marker.read_text(encoding="ascii").strip() != "1":
+        raise PersistError("unsupported state layout version")
+    for relative in ("config", "data/sync", "snapshots"):
+        require_safe_directory(
+            VOLATOO_STATE / relative, f"state layout directory {relative}"
+        )
+    require_safe_file(IMAGE_ID_PATH, "verified image id")
+    image_id = IMAGE_ID_PATH.read_text(encoding="ascii").strip()
+    if not IMAGE_ID_RE.fullmatch(image_id):
+        raise PersistError("verified image id is malformed")
+
+
+def image_id() -> str:
+    return IMAGE_ID_PATH.read_text(encoding="ascii").strip()
+
+
+def parse_policies() -> list[Policy]:
+    if CONFIG_PATH.is_symlink():
+        raise PersistError("persistence configuration must not be a symbolic link")
+    if not CONFIG_PATH.exists():
+        return []
+    if not CONFIG_PATH.is_file():
+        raise PersistError("persistence configuration is not a regular file")
+
+    policies: list[Policy] = []
+    seen_targets: list[str] = []
+    seen_keys: set[tuple[str, str]] = set()
+    for number, raw_line in enumerate(
+        CONFIG_PATH.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if len(raw_line) > 512:
+            raise PersistError(f"config line {number} exceeds 512 characters")
+        fields = raw_line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 3:
+            raise PersistError(
+                f"config line {number} must contain: policy target key"
+            )
+        kind, target, key = fields
+        if kind not in {"bind", "overlay", "sync"}:
+            raise PersistError(f"config line {number} has invalid policy: {kind}")
+        if (
+            not TARGET_RE.fullmatch(target)
+            or target == "/"
+            or target.endswith("/")
+            or "//" in target
+            or "/./" in f"{target}/"
+            or "/../" in f"{target}/"
+            or len(target) > 255
+        ):
+            raise PersistError(f"config line {number} has invalid target: {target}")
+        if any(target == path or target.startswith(f"{path}/") for path in PROTECTED_TARGETS):
+            raise PersistError(f"config line {number} targets protected path: {target}")
+        if not KEY_RE.fullmatch(key):
+            raise PersistError(f"config line {number} has invalid storage key: {key}")
+        if any(
+            target == existing
+            or target.startswith(f"{existing}/")
+            or existing.startswith(f"{target}/")
+            for existing in seen_targets
+        ):
+            raise PersistError(f"config line {number} target overlaps: {target}")
+        if (kind, key) in seen_keys:
+            raise PersistError(f"config line {number} duplicates key: {kind}:{key}")
+        target_path = rooted(target)
+        if target_path.is_symlink() or not target_path.is_dir():
+            raise PersistError(
+                f"config line {number} target is not a real directory: {target}"
+            )
+        policies.append(Policy(kind, target, key))
+        seen_targets.append(target)
+        seen_keys.add((kind, key))
+        if len(policies) > 64:
+            raise PersistError("configuration exceeds 64 policies")
+    return policies
+
+
+def run_rsync(source: Path, destination: Path) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    command = [
+        "rsync",
+        "-aHAX",
+        "--numeric-ids",
+        "--checksum",
+        "--delete",
+        f"{source}/",
+        f"{destination}/",
+    ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise PersistError(
+            f"rsync failed with status {result.returncode}: {source} -> {destination}"
+        )
+
+
+def atomic_write(path: Path, content: str) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    with temporary.open("w", encoding="ascii") as stream:
+        stream.write(content)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.replace(temporary, path)
+    directory_fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def policy_root(policy: Policy) -> Path:
+    return VOLATOO_STATE / "data/sync" / policy.key
+
+
+def validate_sync_storage(policy: Policy) -> None:
+    root = policy_root(policy)
+    ensure_safe_directory(root, f"sync storage for {policy.target}")
+    if not root.exists():
+        return
+    ensure_safe_directory(root / "bases", f"sync bases for {policy.target}")
+    ensure_safe_directory(
+        root / "generations", f"sync generations for {policy.target}"
+    )
+    current = root / "current"
+    if current.is_symlink() or (current.exists() and not current.is_file()):
+        raise PersistError(f"unsafe current-generation pointer: {current}")
+
+
+def capture_base(policy: Policy, current_image: str) -> Path:
+    root = policy_root(policy)
+    ensure_safe_directory(root, f"sync storage for {policy.target}", create=True)
+    bases = root / "bases"
+    ensure_safe_directory(bases, f"sync bases for {policy.target}", create=True)
+    base = bases / current_image
+    tree = base / "tree"
+    if base.is_symlink():
+        raise PersistError(f"unsafe pristine base: {base}")
+    if base.exists() and (
+        (base / "complete").is_symlink() or tree.is_symlink()
+    ):
+        raise PersistError(f"unsafe pristine base: {base}")
+    if (base / "complete").is_file() and tree.is_dir():
+        return tree
+    if base.exists():
+        raise PersistError(f"incomplete pristine base requires recovery: {base}")
+
+    temporary = bases / f".{current_image}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    temporary.mkdir()
+    try:
+        run_rsync(rooted(policy.target), temporary / "tree")
+        (temporary / "complete").write_text("1\n", encoding="ascii")
+        os.rename(temporary, base)
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print(f"captured pristine base for {policy.target}: {current_image}")
+    return tree
+
+
+def current_generation(policy: Policy) -> Path | None:
+    root = policy_root(policy)
+    current_file = root / "current"
+    if current_file.is_symlink():
+        raise PersistError(f"unsafe current-generation pointer: {current_file}")
+    if not current_file.exists():
+        return None
+    generation_name = current_file.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9]{8}T[0-9]{6}Z-[0-9a-f]{32}", generation_name):
+        raise PersistError(f"malformed current generation: {generation_name}")
+    generation = root / "generations" / generation_name
+    if (
+        generation.is_symlink()
+        or (generation / "complete").is_symlink()
+        or (generation / "tree").is_symlink()
+        or not (generation / "complete").is_file()
+        or not (generation / "tree").is_dir()
+    ):
+        raise PersistError(f"incomplete current generation: {generation}")
+    return generation
+
+
+def create_generation(policy: Policy, current_image: str) -> Path:
+    root = policy_root(policy)
+    generations = root / "generations"
+    ensure_safe_directory(root, f"sync storage for {policy.target}", create=True)
+    ensure_safe_directory(
+        generations, f"sync generations for {policy.target}", create=True
+    )
+    timestamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{timestamp}-{uuid.uuid4().hex}"
+    temporary = generations / f".{name}.tmp-{os.getpid()}"
+    generation = generations / name
+    temporary.mkdir()
+    try:
+        run_rsync(rooted(policy.target), temporary / "tree")
+        (temporary / "image-id").write_text(f"{current_image}\n", encoding="ascii")
+        (temporary / "complete").write_text("1\n", encoding="ascii")
+        os.rename(temporary, generation)
+        atomic_write(root / "current", f"{name}\n")
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    return generation
+
+
+def hash_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def scan_tree(root: Path) -> dict[str, Entry]:
+    entries: dict[str, Entry] = {}
+
+    def visit(directory: Path, prefix: str = "") -> None:
+        for item in os.scandir(directory):
+            relative = f"{prefix}/{item.name}" if prefix else item.name
+            item_stat = item.stat(follow_symlinks=False)
+            mode = stat.S_IMODE(item_stat.st_mode)
+            if stat.S_ISDIR(item_stat.st_mode):
+                kind, payload = "directory", None
+            elif stat.S_ISREG(item_stat.st_mode):
+                kind, payload = "file", hash_file(Path(item.path))
+            elif stat.S_ISLNK(item_stat.st_mode):
+                kind, payload = "symlink", os.readlink(item.path)
+            elif stat.S_ISFIFO(item_stat.st_mode):
+                kind, payload = "fifo", None
+            elif stat.S_ISCHR(item_stat.st_mode):
+                kind, payload = "character", item_stat.st_rdev
+            elif stat.S_ISBLK(item_stat.st_mode):
+                kind, payload = "block", item_stat.st_rdev
+            else:
+                raise PersistError(f"unsupported entry type: {root / relative}")
+            entries[relative] = Entry(
+                kind, mode, item_stat.st_uid, item_stat.st_gid, payload
+            )
+            if kind == "directory":
+                visit(Path(item.path), relative)
+
+    visit(root)
+    return entries
+
+
+def remove_entry(path: Path) -> None:
+    try:
+        entry_stat = path.lstat()
+    except FileNotFoundError:
+        return
+    if stat.S_ISDIR(entry_stat.st_mode) and not stat.S_ISLNK(entry_stat.st_mode):
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+
+
+def apply_metadata(path: Path, entry: Entry) -> None:
+    if entry.kind == "symlink":
+        os.chown(path, entry.uid, entry.gid, follow_symlinks=False)
+        return
+    os.chown(path, entry.uid, entry.gid)
+    os.chmod(path, entry.mode)
+
+
+def copy_entry(source: Path, destination: Path, entry: Entry) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_entry(destination)
+    if entry.kind == "directory":
+        destination.mkdir()
+    elif entry.kind == "file":
+        shutil.copy2(source, destination, follow_symlinks=False)
+    elif entry.kind == "symlink":
+        destination.symlink_to(os.readlink(source))
+    elif entry.kind == "fifo":
+        os.mkfifo(destination, entry.mode)
+    elif entry.kind in {"character", "block"}:
+        node_type = stat.S_IFCHR if entry.kind == "character" else stat.S_IFBLK
+        os.mknod(destination, node_type | entry.mode, int(entry.payload))
+    else:
+        raise PersistError(f"cannot copy unsupported entry: {source}")
+    apply_metadata(destination, entry)
+
+
+def archive_conflict_entry(source: Path, destination: Path, entry: Entry) -> None:
+    if entry.kind != "directory":
+        copy_entry(source, destination, entry)
+        return
+
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    remove_entry(destination)
+    run_rsync(source, destination)
+    apply_metadata(destination, entry)
+
+
+def is_blocked(relative: str, blocked: set[str]) -> bool:
+    return any(relative.startswith(f"{prefix}/") for prefix in blocked)
+
+
+def stage_inline_conflict(new_root: Path, live_root: Path, relative: str, entry: Entry) -> Path | None:
+    if entry.kind not in {"file", "symlink"}:
+        return None
+    parent = live_root / Path(relative).parent
+    if not parent.is_dir():
+        return None
+    name = Path(relative).name
+    for number in range(10_000):
+        candidate = parent / f"._cfg{number:04d}_{name}"
+        if not candidate.exists() and not candidate.is_symlink():
+            copy_entry(new_root / relative, candidate, entry)
+            return candidate
+    raise PersistError(f"no free CONFIG_PROTECT name for: /{relative}")
+
+
+def merge_etc(
+    policy: Policy, base_root: Path, local_root: Path, new_root: Path
+) -> int:
+    base_entries = scan_tree(base_root)
+    local_entries = scan_tree(local_root)
+    new_entries = scan_tree(new_root)
+    all_paths = sorted(
+        set(base_entries) | set(local_entries) | set(new_entries),
+        key=lambda value: (value.count("/"), value),
+    )
+    blocked: set[str] = set()
+    directory_metadata: list[tuple[Path, Entry]] = []
+    conflicts: list[str] = []
+    conflict_root: Path | None = None
+
+    for relative in all_paths:
+        if is_blocked(relative, blocked):
+            continue
+        base_entry = base_entries.get(relative)
+        local_entry = local_entries.get(relative)
+        new_entry = new_entries.get(relative)
+        conflict = False
+        if local_entry == base_entry:
+            chosen_entry, chosen_root = new_entry, new_root
+        elif new_entry == base_entry:
+            chosen_entry, chosen_root = local_entry, local_root
+        elif local_entry == new_entry:
+            chosen_entry, chosen_root = local_entry, local_root
+        else:
+            conflict = True
+            chosen_entry, chosen_root = local_entry, local_root
+
+        if conflict:
+            staged = None
+            if new_entry is not None:
+                staged = stage_inline_conflict(
+                    new_root, rooted(policy.target), relative, new_entry
+                )
+            if staged is None and new_entry is not None:
+                if conflict_root is None:
+                    conflict_parent = VOLATOO_STATE / "snapshots/etc-conflicts"
+                    ensure_safe_directory(
+                        conflict_parent,
+                        "/etc conflict snapshot directory",
+                        create=True,
+                    )
+                    timestamp = datetime.datetime.now(datetime.UTC).strftime(
+                        "%Y%m%dT%H%M%SZ"
+                    )
+                    conflict_root = (
+                        conflict_parent
+                        / f"{timestamp}-{uuid.uuid4().hex}"
+                    )
+                destination = conflict_root / "new" / relative
+                archive_conflict_entry(
+                    new_root / relative, destination, new_entry
+                )
+            conflicts.append(
+                f"/{relative}\tnew={'deleted' if new_entry is None else new_entry.kind}"
+            )
+
+        live_path = rooted(policy.target) / relative
+        if chosen_entry is None:
+            remove_entry(live_path)
+            blocked.add(relative)
+            continue
+        if chosen_entry.kind == "directory":
+            if live_path.is_symlink() or not live_path.is_dir():
+                remove_entry(live_path)
+                live_path.mkdir(parents=True)
+            directory_metadata.append((live_path, chosen_entry))
+        else:
+            copy_entry(chosen_root / relative, live_path, chosen_entry)
+            blocked.add(relative)
+
+    for path, entry in reversed(directory_metadata):
+        apply_metadata(path, entry)
+
+    if conflicts:
+        if conflict_root is None:
+            conflict_parent = VOLATOO_STATE / "snapshots/etc-conflicts"
+            ensure_safe_directory(
+                conflict_parent,
+                "/etc conflict snapshot directory",
+                create=True,
+            )
+            timestamp = datetime.datetime.now(datetime.UTC).strftime(
+                "%Y%m%dT%H%M%SZ"
+            )
+            conflict_root = (
+                conflict_parent
+                / f"{timestamp}-{uuid.uuid4().hex}"
+            )
+        conflict_root.mkdir(parents=True, exist_ok=True)
+        manifest = conflict_root / "manifest"
+        manifest.write_text("\n".join(conflicts) + "\n", encoding="utf-8")
+        print(
+            f"warning: /etc merge has {len(conflicts)} conflict(s); "
+            f"see {manifest}",
+            file=sys.stderr,
+        )
+    return len(conflicts)
+
+
+def restore_policy(policy: Policy, current_image: str) -> int:
+    new_base = capture_base(policy, current_image)
+    generation = current_generation(policy)
+    if generation is None:
+        print(f"no synchronized generation for {policy.target}; using image state")
+        return 0
+    require_safe_file(generation / "image-id", "generation image id")
+    generation_image = (generation / "image-id").read_text(encoding="ascii").strip()
+    if not IMAGE_ID_RE.fullmatch(generation_image):
+        raise PersistError(f"generation has malformed image id: {generation}")
+    old_base = policy_root(policy) / "bases" / generation_image / "tree"
+    if old_base.is_symlink() or not old_base.is_dir():
+        raise PersistError(f"pristine merge base is missing: {old_base}")
+    local = generation / "tree"
+    if policy.target == "/etc":
+        conflicts = merge_etc(policy, old_base, local, new_base)
+        print(f"restored {policy.target} with three-way merge ({conflicts} conflicts)")
+        return conflicts
+    run_rsync(local, rooted(policy.target))
+    print(f"restored synchronized policy: {policy.target}")
+    return 0
+
+
+def command_restore(policies: list[Policy]) -> int:
+    current_image = image_id()
+    conflicts = 0
+    for policy in policies:
+        if policy.kind == "sync":
+            conflicts += restore_policy(policy, current_image)
+    os.sync()
+    return 0 if conflicts == 0 else 2
+
+
+def command_sync(policies: list[Policy]) -> int:
+    current_image = image_id()
+    sync_policies = [policy for policy in policies if policy.kind == "sync"]
+    for policy in sync_policies:
+        base = policy_root(policy) / "bases" / current_image
+        if (
+            base.is_symlink()
+            or (base / "complete").is_symlink()
+            or (base / "tree").is_symlink()
+            or not (base / "complete").is_file()
+            or not (base / "tree").is_dir()
+        ):
+            raise PersistError(
+                f"pristine base was not captured during boot: {policy.target}"
+            )
+    for policy in sync_policies:
+        generation = create_generation(policy, current_image)
+        print(f"synchronized {policy.target}: {generation.name}")
+    os.sync()
+    return 0
+
+
+def command_status(policies: list[Policy]) -> int:
+    for policy in policies:
+        if policy.kind != "sync":
+            continue
+        generation = current_generation(policy)
+        current = generation.name if generation else "never"
+        print(f"{policy.target}\t{policy.key}\t{current}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="volatoo-persist")
+    parser.add_argument("command", choices=("restore", "status", "sync"))
+    arguments = parser.parse_args()
+
+    validate_runtime()
+    policies = parse_policies()
+    for policy in policies:
+        if policy.kind == "sync":
+            validate_sync_storage(policy)
+    lock_path = VOLATOO_STATE / ".persist.lock"
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise PersistError(f"unsafe persistence lock: {lock_path}")
+    with lock_path.open("a+", encoding="ascii") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if arguments.command == "restore":
+            return command_restore(policies)
+        if arguments.command == "sync":
+            return command_sync(policies)
+        return command_status(policies)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except PersistError as error:
+        print(f"volatoo-persist: error: {error}", file=sys.stderr)
+        raise SystemExit(1)

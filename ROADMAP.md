@@ -6,39 +6,44 @@ Phases are sequential; each ends with something bootable or measurable.
 
 ## Phase 0 — Prototype (prove the boot path)
 
-Manual, VM-only. No tooling yet.
+Manual, VM-only prototype.
 
-- [ ] Boot a stock Gentoo stage3 into tmpfs by hand: custom initramfs `init` script that mounts tmpfs, unpacks a squashfs, `switch_root`s
-- [ ] Measure: unpack time vs image size (squashfs zstd levels), RAM footprint after boot
-- [ ] Decide: unpack-into-tmpfs vs squashfs+tmpfs-overlay hybrid (write-layer-only in RAM)
-- [ ] Write up the boot flow decision in `docs/design/boot.md`
+- [x] Boot a stock Gentoo stage3 into tmpfs by hand: custom initramfs `init` script that mounts tmpfs, unpacks a squashfs, `switch_root`s
+  - [x] Boot a minimal Volatoo initramfs into a BusyBox rescue shell in QEMU
+  - [x] Attach a Gentoo squashfs, populate tmpfs, and `switch_root` into its userspace
+- [x] Complete the stock OpenRC boot through a Phase 0 serial console
+- [x] Measure: unpack time vs image size (squashfs zstd levels), RAM footprint after boot
+- [x] Decide: unpack-into-tmpfs vs squashfs+tmpfs-overlay hybrid (write-layer-only in RAM)
+- [x] Write up the boot flow decision in `docs/design/boot.md`
 
 ## Phase 1 — volatoo-initramfs
 
 Turn the prototype into a maintainable initramfs generator.
 
-- [ ] Initramfs generator (dracut module or standalone), config file for image location
-- [ ] Image discovery: by-label/by-uuid block device, USB, ISO loopback
-- [ ] Failure UX: drop to rescue shell with a useful message when the image is missing/corrupt
-- [ ] Image integrity check (sha256 / signature) before unpack
-- [ ] Boots reliably in QEMU (UEFI + BIOS) from a one-command test harness
+- [x] Standalone initramfs generator with an embedded image-location config
+- [x] Image discovery: by-label/by-uuid block device, USB, ISO loopback
+- [x] Failure UX: diagnostic summary and a reliable rescue shell on boot errors
+- [x] SHA-256 image integrity check before mounting or copying the root
+- [x] Boots reliably in QEMU (UEFI + BIOS) from a one-command test harness
 
 ## Phase 2 — volatoo-persist
 
 Volatile by default, persistence as policy.
 
-- [ ] State partition layout and discovery (label `VOLATOO-STATE`)
-- [ ] Declarative config: which paths are bind-mounted, which are overlaid, which sync on shutdown
-- [ ] `/etc` handling: three-way merge vs snapshot-restore — pick one, document why
-- [ ] `volatoo-persist sync` (manual), sync-on-shutdown OpenRC service
-- [ ] Machine identity that must survive reboot by default: ssh host keys, machine-id, logs (opt-out)
+- [x] State partition layout and discovery (label `VOLATOO-STATE`)
+- [x] Declarative config: which paths are bind-mounted, which are overlaid, which sync on shutdown
+- [x] `/etc` handling: use a three-way merge; document upgrade and conflict semantics
+- [x] `volatoo-persist sync` (manual), sync-on-shutdown OpenRC service
+- [x] Machine identity that must survive reboot by default: ssh host keys, machine-id, logs (opt-out)
 
 ## Phase 3 — volatoo-image
 
 Reproducible image builds instead of hand-rolled squashfs.
 
-- [ ] Catalyst-based spec: stage3 + Volatoo overlay + package set → squashfs image
-- [ ] Volatoo Portage overlay (ebuilds for initramfs/persist tools, profile tweaks)
+- [x] Catalyst-based spec: stage3 + Volatoo overlay + package set → squashfs image
+- [x] Volatoo Portage overlay (ebuilds for initramfs/persist tools, profile tweaks)
+  - [x] Scaffold `slchris/volatoo-overlay`, live ebuilds, and amd64/23.0 profile
+  - [x] Publish the Volatoo sources and pass live `emerge` installation tests
 - [ ] Kernel config baseline (tmpfs, squashfs+zstd, overlayfs built-in)
 - [ ] CI pipeline building a weekly minimal image
 - [ ] Image variants: `minimal` (console) first; `desktop` later
