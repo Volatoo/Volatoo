@@ -1,0 +1,382 @@
+#!/usr/bin/env python3
+
+"""Create and restore Volatoo's default machine identity."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import uuid
+from pathlib import Path
+
+
+class IdentityError(RuntimeError):
+    pass
+
+
+STATE_ROOT = Path(os.environ.get("VOLATOO_STATE_ROOT", "/.volatoo/state"))
+SYSTEM_ROOT = Path(os.environ.get("VOLATOO_ROOT", "/"))
+UUID_SOURCE = Path(
+    os.environ.get("VOLATOO_UUID_SOURCE", "/proc/sys/kernel/random/uuid")
+)
+VOLATOO_STATE = STATE_ROOT / "volatoo"
+IDENTITY_ROOT = VOLATOO_STATE / "data/identity"
+CONFIG_PATH = VOLATOO_STATE / "config/identity.conf"
+PERSIST_CONFIG_PATH = VOLATOO_STATE / "config/persist.conf"
+SETTING_NAMES = ("machine-id", "ssh-host-keys", "logs")
+MACHINE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
+SSH_KEY_RE = re.compile(
+    r"^ssh_host_(?:dsa|ecdsa|ed25519|rsa)_key(?:\.pub)?$"
+)
+
+
+def rooted(target: str) -> Path:
+    return SYSTEM_ROOT / target.removeprefix("/")
+
+
+def ensure_safe_directory(
+    path: Path, description: str, create: bool = False
+) -> None:
+    if path.is_symlink():
+        raise IdentityError(f"{description} must not be a symbolic link: {path}")
+    if path.exists():
+        if not path.is_dir():
+            raise IdentityError(f"{description} is not a directory: {path}")
+        return
+    if create:
+        path.mkdir()
+        os.chmod(path, 0o700)
+
+
+def require_safe_directory(path: Path, description: str) -> None:
+    ensure_safe_directory(path, description)
+    if not path.exists():
+        raise IdentityError(f"{description} is missing: {path}")
+
+
+def require_safe_file(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise IdentityError(f"{description} is missing or unsafe: {path}")
+
+
+def fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def atomic_write(path: Path, content: str, mode: int) -> None:
+    temporary = path.with_name(f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}")
+    descriptor = os.open(
+        temporary,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+        mode,
+    )
+    try:
+        with os.fdopen(descriptor, "w", encoding="ascii") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except Exception:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def validate_runtime() -> None:
+    marker = VOLATOO_STATE / "layout-version"
+    require_safe_file(marker, "state layout marker")
+    if marker.read_text(encoding="ascii").strip() != "1":
+        raise IdentityError("unsupported state layout version")
+    require_safe_directory(VOLATOO_STATE / "config", "state config directory")
+    require_safe_directory(VOLATOO_STATE / "data", "state data directory")
+    ensure_safe_directory(IDENTITY_ROOT, "identity storage", create=True)
+
+
+def parse_settings() -> dict[str, bool]:
+    settings = {name: True for name in SETTING_NAMES}
+    if CONFIG_PATH.is_symlink():
+        raise IdentityError("identity configuration must not be a symbolic link")
+    if not CONFIG_PATH.exists():
+        return settings
+    if not CONFIG_PATH.is_file():
+        raise IdentityError("identity configuration is not a regular file")
+
+    seen: set[str] = set()
+    for number, raw_line in enumerate(
+        CONFIG_PATH.read_text(encoding="utf-8").splitlines(), start=1
+    ):
+        if len(raw_line) > 512:
+            raise IdentityError(f"identity config line {number} exceeds 512 characters")
+        fields = raw_line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 2:
+            raise IdentityError(
+                f"identity config line {number} must contain: setting yes-or-no"
+            )
+        name, value = fields
+        if name not in SETTING_NAMES:
+            raise IdentityError(
+                f"identity config line {number} has unknown setting: {name}"
+            )
+        if name in seen:
+            raise IdentityError(
+                f"identity config line {number} duplicates setting: {name}"
+            )
+        if value not in {"yes", "no"}:
+            raise IdentityError(
+                f"identity config line {number} must use yes or no: {name}"
+            )
+        settings[name] = value == "yes"
+        seen.add(name)
+    return settings
+
+
+def load_or_create_machine_id() -> str:
+    state_path = IDENTITY_ROOT / "machine-id"
+    if state_path.is_symlink() or (
+        state_path.exists() and not state_path.is_file()
+    ):
+        raise IdentityError(f"machine-id state is unsafe: {state_path}")
+
+    if state_path.exists():
+        value = state_path.read_text(encoding="ascii").strip()
+        if not MACHINE_ID_RE.fullmatch(value):
+            raise IdentityError("stored machine-id is malformed")
+    else:
+        require_safe_file(UUID_SOURCE, "kernel UUID source")
+        value = UUID_SOURCE.read_text(encoding="ascii").strip().replace("-", "")
+        if not MACHINE_ID_RE.fullmatch(value):
+            raise IdentityError("kernel UUID source returned a malformed value")
+        atomic_write(state_path, f"{value}\n", 0o444)
+        print("created persistent machine-id")
+
+    etc_directory = rooted("/etc")
+    require_safe_directory(etc_directory, "live /etc")
+    live_path = etc_directory / "machine-id"
+    if live_path.exists() and live_path.is_dir() and not live_path.is_symlink():
+        raise IdentityError(f"live machine-id is a directory: {live_path}")
+    atomic_write(live_path, f"{value}\n", 0o444)
+    print("restored persistent machine-id")
+    return value
+
+
+def host_key_paths(directory: Path) -> list[Path]:
+    paths: list[Path] = []
+    for path in directory.iterdir():
+        if SSH_KEY_RE.fullmatch(path.name):
+            if path.is_symlink() or not path.is_file():
+                raise IdentityError(f"SSH host key is unsafe: {path}")
+            paths.append(path)
+    return sorted(paths)
+
+
+def generate_host_keys(live_directory: Path) -> list[Path]:
+    for path in host_key_paths(live_directory):
+        path.unlink()
+    command = ["ssh-keygen", "-A"]
+    if SYSTEM_ROOT != Path("/"):
+        command.extend(("-f", str(SYSTEM_ROOT)))
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise IdentityError(
+            f"ssh-keygen -A failed with status {result.returncode}"
+        )
+    paths = host_key_paths(live_directory)
+    if not any(not path.name.endswith(".pub") for path in paths):
+        raise IdentityError("ssh-keygen did not create a private host key")
+    return paths
+
+
+def copy_host_keys(source_paths: list[Path], destination: Path) -> None:
+    for source in source_paths:
+        target = destination / source.name
+        shutil.copy2(source, target, follow_symlinks=False)
+        os.chown(target, 0, 0)
+        with target.open("rb") as stream:
+            os.fsync(stream.fileno())
+
+
+def load_or_create_host_keys() -> None:
+    live_directory = rooted("/etc/ssh")
+    require_safe_directory(live_directory, "live SSH configuration directory")
+    state_directory = IDENTITY_ROOT / "ssh-host-keys"
+    complete = state_directory / "complete"
+
+    if state_directory.is_symlink() or (
+        state_directory.exists() and not state_directory.is_dir()
+    ):
+        raise IdentityError(f"SSH host-key state is unsafe: {state_directory}")
+    if state_directory.exists():
+        require_safe_file(complete, "SSH host-key completion marker")
+        state_paths = [
+            path
+            for path in host_key_paths(state_directory)
+            if path.name != "complete"
+        ]
+        if not any(not path.name.endswith(".pub") for path in state_paths):
+            raise IdentityError("stored SSH identity has no private host key")
+        for path in host_key_paths(live_directory):
+            path.unlink()
+        copy_host_keys(state_paths, live_directory)
+        print("restored persistent SSH host keys")
+        return
+
+    live_paths = generate_host_keys(live_directory)
+    temporary = IDENTITY_ROOT / (
+        f".ssh-host-keys.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    )
+    temporary.mkdir(mode=0o700)
+    try:
+        copy_host_keys(live_paths, temporary)
+        atomic_write(temporary / "complete", "1\n", 0o600)
+        os.rename(temporary, state_directory)
+        fsync_directory(IDENTITY_ROOT)
+        os.sync()
+    except Exception:
+        shutil.rmtree(temporary, ignore_errors=True)
+        raise
+    print("created persistent SSH host keys")
+
+
+def persistence_overlaps_logs() -> bool:
+    if PERSIST_CONFIG_PATH.is_symlink():
+        raise IdentityError("persistence configuration must not be a symbolic link")
+    if not PERSIST_CONFIG_PATH.exists():
+        return False
+    if not PERSIST_CONFIG_PATH.is_file():
+        raise IdentityError("persistence configuration is not a regular file")
+    for raw_line in PERSIST_CONFIG_PATH.read_text(encoding="utf-8").splitlines():
+        fields = raw_line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if len(fields) != 3:
+            raise IdentityError("persistence configuration is malformed")
+        target = fields[1]
+        if (
+            target == "/var/log"
+            or target.startswith("/var/log/")
+            or "/var/log".startswith(f"{target}/")
+        ):
+            return True
+    return False
+
+
+def run_rsync(source: Path, destination: Path) -> None:
+    command = [
+        "rsync",
+        "-aHAX",
+        "--numeric-ids",
+        "--checksum",
+        "--delete",
+        f"{source}/",
+        f"{destination}/",
+    ]
+    result = subprocess.run(command, check=False)
+    if result.returncode != 0:
+        raise IdentityError(
+            f"rsync failed with status {result.returncode}: {source} -> {destination}"
+        )
+
+
+def mount_persistent_logs() -> str:
+    if persistence_overlaps_logs():
+        print("explicit persistence policy manages /var/log; skipping default")
+        return "explicit-policy"
+
+    live_directory = rooted("/var/log")
+    require_safe_directory(live_directory, "live /var/log")
+    state_directory = IDENTITY_ROOT / "logs"
+    initialized = IDENTITY_ROOT / "logs-initialized"
+    ensure_safe_directory(state_directory, "persistent log directory", create=True)
+    if initialized.is_symlink() or (
+        initialized.exists() and not initialized.is_file()
+    ):
+        raise IdentityError(f"log initialization marker is unsafe: {initialized}")
+    if not initialized.exists():
+        run_rsync(live_directory, state_directory)
+        atomic_write(initialized, "1\n", 0o600)
+        print("seeded persistent logs")
+
+    result = subprocess.run(
+        ["mount", "--bind", str(state_directory), str(live_directory)],
+        check=False,
+    )
+    if result.returncode != 0:
+        raise IdentityError(
+            f"could not bind persistent logs at {live_directory}"
+        )
+    print("mounted persistent logs")
+    return "state-backed"
+
+
+def command_apply(settings: dict[str, bool]) -> int:
+    if settings["machine-id"]:
+        load_or_create_machine_id()
+    else:
+        print("machine-id persistence disabled")
+    if settings["ssh-host-keys"]:
+        load_or_create_host_keys()
+    else:
+        print("SSH host-key persistence disabled")
+    if settings["logs"]:
+        mount_persistent_logs()
+    else:
+        print("log persistence disabled")
+    os.sync()
+    return 0
+
+
+def command_status(settings: dict[str, bool]) -> int:
+    machine_state = IDENTITY_ROOT / "machine-id"
+    ssh_state = IDENTITY_ROOT / "ssh-host-keys/complete"
+    log_state = IDENTITY_ROOT / "logs-initialized"
+    states = {
+        "machine-id": machine_state.is_file() and not machine_state.is_symlink(),
+        "ssh-host-keys": ssh_state.is_file() and not ssh_state.is_symlink(),
+        "logs": log_state.is_file() and not log_state.is_symlink(),
+    }
+    for name in SETTING_NAMES:
+        enabled = "enabled" if settings[name] else "disabled"
+        stored = "stored" if states[name] else "not-stored"
+        print(f"{name}\t{enabled}\t{stored}")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(prog="volatoo-identity")
+    parser.add_argument("command", choices=("apply", "status"))
+    arguments = parser.parse_args()
+
+    validate_runtime()
+    settings = parse_settings()
+    lock_path = IDENTITY_ROOT / ".identity.lock"
+    if lock_path.is_symlink() or (lock_path.exists() and not lock_path.is_file()):
+        raise IdentityError(f"unsafe identity lock: {lock_path}")
+    with lock_path.open("a+", encoding="ascii") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if arguments.command == "apply":
+            return command_apply(settings)
+        return command_status(settings)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except IdentityError as error:
+        print(f"volatoo-identity: error: {error}", file=sys.stderr)
+        raise SystemExit(1)

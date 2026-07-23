@@ -1,0 +1,16 @@
+.git
+.gitignore
+.dockerignore
+
+build
+out
+work
+
+*.img
+*.iso
+*.ext4
+*.qcow2
+*.squashfs
+*.tar.*
+initramfs.cpio*
+vmlinuz*

@@ -1,0 +1,31 @@
+#!/bin/sh
+
+real_init=${1:-/sbin/init}
+shift 2>/dev/null || true
+
+if [ -f /.volatoo/image-id ]; then
+	echo "[volatoo] restoring synchronized persistence policies"
+	restore_status=0
+	/usr/sbin/volatoo-persist restore || restore_status=$?
+	case $restore_status in
+		0)
+			echo "[volatoo] synchronized persistence restore completed"
+			;;
+		2)
+			echo "[volatoo] persistence restore completed with merge conflicts"
+			;;
+		*)
+			echo "[volatoo] persistence restore failed; opening an emergency shell"
+			exec /bin/sh
+			;;
+	esac
+fi
+
+echo "[volatoo] applying persistent machine identity"
+if ! /usr/sbin/volatoo-identity apply; then
+	echo "[volatoo] machine identity setup failed; opening an emergency shell"
+	exec /bin/sh
+fi
+echo "[volatoo] persistent machine identity ready"
+
+exec "$real_init" "$@"

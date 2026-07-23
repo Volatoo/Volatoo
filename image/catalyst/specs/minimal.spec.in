@@ -1,0 +1,21 @@
+# Rendered by scripts/build-catalyst-squashfs.sh.
+subarch: amd64
+target: stage4
+version_stamp: @VERSION@
+rel_type: volatoo
+profile: default/linux/amd64/23.0
+snapshot_treeish: @SNAPSHOT@
+source_subpath: volatoo/@SOURCE@
+
+# The dedicated builder extends pyDeComp's compressor map to create a
+# 1 MiB-block SquashFS with Zstd at the measured Volatoo level 19.
+compression_mode: squashfs_zstd
+decompressor_search_order: pixz lbzip2 squashfs gzip xz bzip2 tar
+
+stage4/packages:
+@PACKAGES@
+
+stage4/root_overlay: /config/overlay
+stage4/fsscript: /config/finalize.sh
+stage4/rcadd: sysklogd|default volatoo-persist|default
+stage4/empty: /var/cache/binpkgs /var/cache/distfiles /var/tmp/portage

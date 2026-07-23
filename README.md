@@ -2,7 +2,9 @@
 
 **Volatoo** (*volatile* + *Gentoo*) is a Gentoo-based distribution that runs entirely from RAM: the root filesystem is a tmpfs, populated at boot from a compressed system image. Disks are demoted to cold storage — the OS itself lives in memory.
 
-> Status: early design / prototyping. Nothing bootable is published yet — see [ROADMAP.md](ROADMAP.md).
+> Status: Phases 0 through 2 are complete; Phase 3 now has a validated Catalyst
+> minimal-image build, with the remaining release-image work tracked below.
+> No release image is published yet — see [ROADMAP.md](ROADMAP.md).
 
 ## Why
 
@@ -17,10 +19,13 @@
 ```
 bootloader
    └─ kernel + volatoo-initramfs
-        ├─ mount tmpfs on /newroot
         ├─ locate system image (disk / USB / PXE)
-        ├─ unpack squashfs image into tmpfs
-        ├─ apply persistence overlays (/etc, /var, /home …)
+        ├─ discover the optional VOLATOO-STATE filesystem
+        ├─ verify its configured SHA-256 digest
+        ├─ mount tmpfs on /newroot
+        ├─ copy the squashfs contents into tmpfs
+        ├─ apply persistence policies (/etc, /var, /home …)
+        ├─ restore machine identity and persistent logs
         └─ switch_root into RAM
              └─ OpenRC boots a normal Gentoo — from memory
 ```
@@ -35,11 +40,17 @@ Three cooperating pieces:
 
 ### Persistence model
 
-Everything is volatile by default. Persistence is opt-in and declarative:
+Without a state filesystem, everything is volatile. When state is present,
+machine identity and logs persist by default so one installed machine does not
+change identity on every boot; each default can be disabled explicitly.
+Additional persistence is opt-in and declarative:
 
 - **bind/overlay paths** — e.g. `/home`, `/var/lib` mounted from real storage at boot
 - **sync-on-demand / sync-on-shutdown** — e.g. `/etc` snapshots written back to the state partition
 - **rebuild into the image** — the "correct" way to make a change permanent: bake it into the next system image
+
+See [`docs/design/machine-identity.md`](docs/design/machine-identity.md) for
+the machine-id, SSH host-key, log, and opt-out semantics.
 
 ## Requirements (target)
 
@@ -47,14 +58,22 @@ Everything is volatile by default. Persistence is opt-in and declarative:
 - RAM ≥ 8 GiB recommended (image size + working set; a minimal image targets ~2 GiB unpacked)
 - Any block device, USB stick, or PXE server to hold the boot image — or no disk at all
 
-## Repository layout (planned)
+## Repository layout
 
 ```
-initramfs/   volatoo-initramfs sources and dracut-style modules
+initramfs/   standalone volatoo-initramfs sources and default configuration
 image/       image build specs (catalyst specs, package sets, profiles)
 persist/     volatoo-persist tool and default policies
 docs/        design notes and user documentation
 ```
+
+The reproducible minimal-image entry point is
+`scripts/build-catalyst-squashfs.sh`; see
+[`image/catalyst/README.md`](image/catalyst/README.md) for its pinned-input
+workflow and Docker requirements.
+
+The official Gentoo package repository is maintained separately in
+[`slchris/volatoo-overlay`](https://github.com/slchris/volatoo-overlay).
 
 ## Contributing
 

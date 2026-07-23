@@ -1,0 +1,812 @@
+#!/bin/sh
+
+# Volatoo early userspace. Keep this script compatible with BusyBox ash.
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+echo "[volatoo] initramfs started"
+
+rescue_shell() {
+	echo
+	echo "=== Volatoo boot failure ==="
+	echo "code: $failure_code"
+	echo "message: $failure_message"
+	echo
+	echo "=== Boot state ==="
+	echo "kernel: $(uname -srmo 2>/dev/null || echo unavailable)"
+	echo "command line: $(cat /proc/cmdline 2>/dev/null || echo unavailable)"
+	echo "image spec: ${image_spec:-unset}"
+	echo "image file: ${image_file:-none}"
+	echo "resolved device: ${image_device:-unresolved}"
+	echo "loop device: ${loop_device:-none}"
+	echo "expected sha256: ${image_sha256:-not configured}"
+	echo "actual sha256: ${actual_image_sha256:-not computed}"
+	echo "root mode: ${root_mode:-unset}"
+	echo "target init: ${target_init:-unset}"
+	echo "tmpfs size: ${tmpfs_size:-unset}"
+	echo "state spec: ${state_spec:-unset}"
+	echo "state required: ${state_required:-unset}"
+	echo "state device: ${state_device:-not found}"
+	echo "state mounted: ${state_mounted:-0}"
+	echo
+	echo "=== Block devices and filesystems ==="
+	if ! cat /proc/partitions 2>/dev/null; then
+		echo "/proc/partitions is unavailable"
+	fi
+	echo
+	echo "blkid:"
+	blkid 2>/dev/null || true
+	echo
+	echo "=== Current mounts ==="
+	if ! cat /proc/mounts 2>/dev/null; then
+		echo "/proc/mounts is unavailable"
+	fi
+	echo
+	echo "=== Rescue shell ==="
+	echo "Useful commands:"
+	echo "  blkid"
+	echo "  ls -l /dev"
+	echo "  cat /proc/partitions"
+	echo "  cat /proc/cmdline"
+	echo "  cat /proc/mounts"
+	echo "  dmesg | tail"
+	echo "  poweroff -f"
+	echo
+
+	PS1='volatoo-rescue# '
+	export PS1
+	if [ -c /dev/console ]; then
+		while true; do
+			setsid -c sh </dev/console >/dev/console 2>&1
+			echo "[volatoo] rescue shell exited; restarting it" >/dev/console
+		done
+	fi
+	exec sh
+}
+
+fatal() {
+	failure_code=$1
+	failure_message=$2
+	rescue_shell
+}
+
+load_module() {
+	module=$1
+
+	# A development base initramfs may provide kmod with support for compressed
+	# modules. Prefer it over BusyBox modprobe when it is available.
+	if [ -x /sbin/modprobe ]; then
+		/sbin/modprobe "$module" 2>/dev/null || true
+	else
+		modprobe "$module" 2>/dev/null || true
+	fi
+}
+
+resolve_device_spec() {
+	device_spec=$1
+
+	case $device_spec in
+		LABEL=*)
+			metadata_key=LABEL
+			metadata_value=${device_spec#LABEL=}
+			;;
+		UUID=*)
+			metadata_key=UUID
+			metadata_value=${device_spec#UUID=}
+			;;
+		*)
+			printf '%s\n' "$device_spec"
+			return
+			;;
+	esac
+
+	# BusyBox blkid does not implement util-linux's -L/-U lookup flags. Scan
+	# all currently visible filesystems and match the quoted metadata value.
+	blkid 2>/dev/null |
+		while IFS= read -r metadata; do
+			case $metadata in
+				*"$metadata_key=\"$metadata_value\""*)
+					printf '%s\n' "${metadata%%:*}"
+					;;
+			esac
+		done
+}
+
+verify_image_integrity() {
+	integrity_source=$1
+
+	if [ -z "$image_sha256" ]; then
+		echo "[volatoo] warning: no SHA-256 configured; image integrity is unchecked"
+		return
+	fi
+
+	echo "[volatoo] verifying SHA-256: $integrity_source"
+	verify_started=$(date +%s)
+	if ! checksum_output=$(sha256sum "$integrity_source" 2>/dev/null); then
+		fatal image.hash-read \
+			"could not calculate SHA-256 for: $integrity_source"
+	fi
+	actual_image_sha256=${checksum_output%% *}
+	verify_finished=$(date +%s)
+
+	if [ "$actual_image_sha256" != "$image_sha256" ]; then
+		fatal image.integrity \
+			"SHA-256 mismatch for: $integrity_source"
+	fi
+	echo "[volatoo] SHA-256 verified in $((verify_finished - verify_started))s"
+}
+
+parse_persist_config_line() {
+	persist_config_line=$1
+	persist_config_line_number=$2
+	persist_policy=
+	persist_target=
+	persist_key=
+
+	if [ "${#persist_config_line}" -gt 512 ]; then
+		fatal persist.config \
+			"line $persist_config_line_number exceeds 512 characters"
+	fi
+
+	set -f
+	# Intentional field splitting implements the whitespace-delimited grammar.
+	# Globbing remains disabled so state-controlled input cannot expand paths.
+	# shellcheck disable=SC2086
+	set -- $persist_config_line
+	set +f
+
+	if [ "$#" -eq 0 ]; then
+		return
+	fi
+	case $1 in
+		\#*) return ;;
+	esac
+	if [ "$#" -ne 3 ]; then
+		fatal persist.config \
+			"line $persist_config_line_number must contain: policy target key"
+	fi
+
+	persist_policy=$1
+	persist_target=$2
+	persist_key=$3
+
+	case $persist_policy in
+		bind | overlay | sync) ;;
+		*)
+			fatal persist.config \
+				"line $persist_config_line_number has an unsupported policy: $persist_policy"
+			;;
+	esac
+
+	case $persist_target in
+		/*) ;;
+		*)
+			fatal persist.config \
+				"line $persist_config_line_number target must be absolute: $persist_target"
+			;;
+	esac
+	if [ "$persist_target" = / ] || \
+		[ "${persist_target%/}" != "$persist_target" ] || \
+		[ "${#persist_target}" -gt 255 ]; then
+		fatal persist.config \
+			"line $persist_config_line_number has an invalid target: $persist_target"
+	fi
+	case "/${persist_target#/}/" in
+		*/../* | */./* | *//*)
+			fatal persist.config \
+				"line $persist_config_line_number target is not normalized: $persist_target"
+			;;
+	esac
+	case $persist_target in
+		*[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./+@:-]*)
+			fatal persist.config \
+				"line $persist_config_line_number target contains unsupported characters"
+			;;
+	esac
+	case "$persist_target/" in
+		/dev/* | /proc/* | /run/* | /sys/* | /.volatoo/*)
+			fatal persist.config \
+				"line $persist_config_line_number targets a protected early-boot path: $persist_target"
+			;;
+	esac
+
+	if [ "${#persist_key}" -gt 64 ]; then
+		fatal persist.config \
+			"line $persist_config_line_number key exceeds 64 characters"
+	fi
+	case $persist_key in
+		'' | *[!abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._-]*)
+			fatal persist.config \
+				"line $persist_config_line_number has an invalid storage key: $persist_key"
+			;;
+	esac
+}
+
+validate_persist_config() {
+	persist_config_path=$1
+	persist_config_line_number=0
+	persist_policy_count=0
+	persist_sync_configured=0
+	persist_seen_targets=
+	persist_seen_keys=
+
+	while IFS= read -r persist_config_line || [ -n "$persist_config_line" ]; do
+		persist_config_line_number=$((persist_config_line_number + 1))
+		parse_persist_config_line \
+			"$persist_config_line" "$persist_config_line_number"
+		if [ -z "$persist_policy" ]; then
+			continue
+		fi
+
+		persist_policy_count=$((persist_policy_count + 1))
+		if [ "$persist_policy_count" -gt 64 ]; then
+			fatal persist.config "configuration exceeds 64 policies"
+		fi
+		if [ "$persist_policy" = sync ]; then
+			persist_sync_configured=1
+		fi
+
+		for existing_target in $persist_seen_targets; do
+			case "$persist_target/" in
+				"$existing_target/"*)
+					fatal persist.config \
+						"line $persist_config_line_number target overlaps: $persist_target and $existing_target"
+					;;
+			esac
+			case "$existing_target/" in
+				"$persist_target/"*)
+					fatal persist.config \
+						"line $persist_config_line_number target overlaps: $persist_target and $existing_target"
+					;;
+			esac
+		done
+
+		persist_key_token=$persist_policy:$persist_key
+		for existing_key in $persist_seen_keys; do
+			if [ "$persist_key_token" = "$existing_key" ]; then
+				fatal persist.config \
+					"line $persist_config_line_number duplicates storage key: $persist_key_token"
+			fi
+		done
+
+		if [ ! -d "/newroot$persist_target" ] || \
+			[ -L "/newroot$persist_target" ]; then
+			fatal persist.target \
+				"line $persist_config_line_number target must be an existing directory: $persist_target"
+		fi
+
+		persist_policy_base=/state/volatoo/data/$persist_policy/$persist_key
+		if [ -L "$persist_policy_base" ] || \
+			{ [ -e "$persist_policy_base" ] && [ ! -d "$persist_policy_base" ]; }; then
+			fatal persist.state-path \
+				"line $persist_config_line_number storage key is not a safe directory: $persist_key"
+		fi
+		case $persist_policy in
+			bind)
+				if [ -L "$persist_policy_base/root" ] || \
+					{ [ -e "$persist_policy_base/root" ] && [ ! -d "$persist_policy_base/root" ]; } || \
+					[ -L "$persist_policy_base/initialized" ] || \
+					{ [ -e "$persist_policy_base/initialized" ] && [ ! -f "$persist_policy_base/initialized" ]; }; then
+					fatal persist.state-path \
+						"line $persist_config_line_number bind storage is unsafe: $persist_key"
+				fi
+				;;
+				overlay)
+					for overlay_directory in upper work; do
+					if [ -L "$persist_policy_base/$overlay_directory" ] || \
+						{ [ -e "$persist_policy_base/$overlay_directory" ] && \
+							[ ! -d "$persist_policy_base/$overlay_directory" ]; }; then
+						fatal persist.state-path \
+							"line $persist_config_line_number overlay storage is unsafe: $persist_key"
+					fi
+					done
+					;;
+				sync)
+					for sync_directory in bases generations; do
+						if [ -L "$persist_policy_base/$sync_directory" ] || \
+							{ [ -e "$persist_policy_base/$sync_directory" ] && \
+								[ ! -d "$persist_policy_base/$sync_directory" ]; }; then
+							fatal persist.state-path \
+								"line $persist_config_line_number sync storage is unsafe: $persist_key"
+						fi
+					done
+					if [ -L "$persist_policy_base/current" ] || \
+						{ [ -e "$persist_policy_base/current" ] && \
+							[ ! -f "$persist_policy_base/current" ]; }; then
+						fatal persist.state-path \
+							"line $persist_config_line_number sync pointer is unsafe: $persist_key"
+					fi
+					;;
+			esac
+
+		persist_seen_targets="$persist_seen_targets $persist_target"
+		persist_seen_keys="$persist_seen_keys $persist_key_token"
+	done <"$persist_config_path"
+
+	echo "[volatoo] validated $persist_policy_count persistence policies"
+}
+
+apply_persist_config() {
+	persist_config_path=$1
+	persist_config_line_number=0
+
+	while IFS= read -r persist_config_line || [ -n "$persist_config_line" ]; do
+		persist_config_line_number=$((persist_config_line_number + 1))
+		parse_persist_config_line \
+			"$persist_config_line" "$persist_config_line_number"
+		if [ -z "$persist_policy" ]; then
+			continue
+		fi
+
+		case $persist_policy in
+			bind)
+				persist_base=/state/volatoo/data/bind/$persist_key
+				persist_root=$persist_base/root
+				persist_initialized=$persist_base/initialized
+				mkdir -p "$persist_base"
+				if [ ! -f "$persist_initialized" ]; then
+					echo "[volatoo] seeding bind policy $persist_target"
+					if [ -d "$persist_root" ]; then
+						if ! cp -a "/newroot$persist_target/." "$persist_root/"; then
+							fatal persist.bind-seed \
+								"could not resume seeding bind policy: $persist_target"
+						fi
+					elif ! cp -a "/newroot$persist_target" "$persist_root"; then
+						fatal persist.bind-seed \
+							"could not seed bind policy: $persist_target"
+					fi
+					if ! printf '1\n' >"$persist_initialized"; then
+						fatal persist.bind-seed \
+							"could not mark bind policy initialized: $persist_target"
+					fi
+				fi
+				if ! mount --bind "$persist_root" "/newroot$persist_target"; then
+					fatal persist.bind-mount \
+						"could not bind persistent data at: $persist_target"
+				fi
+				echo "[volatoo] bind policy mounted: $persist_target"
+				;;
+			overlay)
+				persist_base=/state/volatoo/data/overlay/$persist_key
+				mkdir -p "$persist_base/upper" "$persist_base/work"
+				if ! mount -t overlay \
+					-o "lowerdir=/newroot$persist_target,upperdir=$persist_base/upper,workdir=$persist_base/work" \
+					overlay "/newroot$persist_target"; then
+					fatal persist.overlay-mount \
+						"could not mount persistent overlay at: $persist_target"
+				fi
+				echo "[volatoo] overlay policy mounted: $persist_target"
+				;;
+			sync)
+				echo "[volatoo] sync policy registered: $persist_target"
+				;;
+		esac
+	done <"$persist_config_path"
+}
+
+config_file=/etc/volatoo/initramfs.conf
+if [ -r "$config_file" ]; then
+	# The configuration is trusted input baked into the initramfs.
+	# shellcheck disable=SC1090
+	. "$config_file"
+fi
+
+image_spec=${VOLATOO_IMAGE:-/dev/vda}
+image_file=${VOLATOO_IMAGE_FILE:-}
+image_sha256=${VOLATOO_IMAGE_SHA256:-}
+actual_image_sha256=
+target_init=${VOLATOO_INIT:-/sbin/init}
+root_mode=${VOLATOO_ROOT_MODE:-copy}
+tmpfs_size=${VOLATOO_TMPFS_SIZE:-80%}
+state_spec=${VOLATOO_STATE:-LABEL=VOLATOO-STATE}
+state_required=${VOLATOO_STATE_REQUIRED:-no}
+state_device=
+state_mounted=0
+persist_config=
+persist_sync_configured=0
+
+mkdir -p /dev /image /newroot /overlay /proc /source /state /sys
+
+if ! mount -t devtmpfs devtmpfs /dev; then
+	fatal mount.devtmpfs "could not mount devtmpfs at /dev"
+fi
+
+if ! mount -t proc proc /proc; then
+	fatal mount.proc "could not mount proc at /proc"
+fi
+
+if ! mount -t sysfs sysfs /sys; then
+	fatal mount.sysfs "could not mount sysfs at /sys"
+fi
+
+# The kernel command line is intentionally parsed as whitespace-delimited words.
+# shellcheck disable=SC2013
+for argument in $(cat /proc/cmdline 2>/dev/null); do
+	case $argument in
+		volatoo.image=*) image_spec=${argument#volatoo.image=} ;;
+		volatoo.image-file=*) image_file=${argument#volatoo.image-file=} ;;
+		volatoo.image-sha256=*) image_sha256=${argument#volatoo.image-sha256=} ;;
+		volatoo.init=*) target_init=${argument#volatoo.init=} ;;
+		volatoo.root=*) root_mode=${argument#volatoo.root=} ;;
+		volatoo.tmpfs-size=*) tmpfs_size=${argument#volatoo.tmpfs-size=} ;;
+		volatoo.state=*) state_spec=${argument#volatoo.state=} ;;
+		volatoo.state-required=*) state_required=${argument#volatoo.state-required=} ;;
+	esac
+done
+
+case $image_spec in
+	/*) ;;
+	LABEL=*)
+		if [ -z "${image_spec#LABEL=}" ]; then
+			fatal config.image "image LABEL must not be empty"
+		fi
+		;;
+	UUID=*)
+		if [ -z "${image_spec#UUID=}" ]; then
+			fatal config.image "image UUID must not be empty"
+		fi
+		;;
+	*)
+		fatal config.image \
+			"image location must be /dev/..., LABEL=..., or UUID=..."
+		;;
+esac
+
+case $image_file in
+	'') ;;
+	/*)
+		case "/${image_file#/}/" in
+			*/../* | */./*)
+				fatal config.image-file \
+					"image file must not contain . or .. components"
+				;;
+		esac
+		;;
+	*)
+		fatal config.image-file \
+			"image file must be an absolute path: $image_file"
+		;;
+esac
+
+if [ -n "$image_sha256" ]; then
+	if [ "${#image_sha256}" -ne 64 ]; then
+		fatal config.image-sha256 \
+			"image SHA-256 must contain exactly 64 lowercase hexadecimal characters"
+	fi
+	case $image_sha256 in
+		*[!0-9a-f]*)
+			fatal config.image-sha256 \
+				"image SHA-256 must contain exactly 64 lowercase hexadecimal characters"
+			;;
+	esac
+fi
+
+case $target_init in
+	/*) ;;
+	*)
+		fatal config.init \
+			"target init must be an absolute path: $target_init"
+		;;
+esac
+
+case $root_mode in
+	copy | overlay) ;;
+	*)
+		fatal config.root-mode "unsupported root mode: $root_mode"
+		;;
+esac
+
+case $tmpfs_size in
+	*%)
+		tmpfs_percent=${tmpfs_size%\%}
+		case $tmpfs_percent in
+			'' | *[!0-9]*)
+				fatal config.tmpfs-size \
+					"tmpfs size must be a percentage: $tmpfs_size"
+				;;
+		esac
+		if [ "$tmpfs_percent" -lt 1 ] || [ "$tmpfs_percent" -gt 100 ]; then
+			fatal config.tmpfs-size \
+				"tmpfs percentage must be between 1 and 100"
+		fi
+		;;
+	*)
+		fatal config.tmpfs-size \
+			"tmpfs size must be a percentage: $tmpfs_size"
+		;;
+esac
+
+case $state_spec in
+	none) ;;
+	/dev/*) ;;
+	LABEL=*)
+		if [ -z "${state_spec#LABEL=}" ]; then
+			fatal config.state "state LABEL must not be empty"
+		fi
+		;;
+	UUID=*)
+		if [ -z "${state_spec#UUID=}" ]; then
+			fatal config.state "state UUID must not be empty"
+		fi
+		;;
+	*)
+		fatal config.state \
+			"state location must be none, /dev/..., LABEL=..., or UUID=..."
+		;;
+esac
+
+case $state_required in
+	yes | no) ;;
+	*)
+		fatal config.state-required \
+			"state-required must be yes or no: $state_required"
+		;;
+esac
+
+if [ "$state_spec" = none ] && [ "$state_required" = yes ]; then
+	fatal config.state-required \
+		"state-required=yes cannot be combined with state=none"
+fi
+
+echo "[volatoo] kernel: $(uname -srmo)"
+echo "[volatoo] command line: $(cat /proc/cmdline 2>/dev/null)"
+
+# A development kernel may provide these as modules; the target Volatoo kernel
+# will build required boot drivers in. Failure is harmless for built-in drivers.
+load_module virtio_blk
+load_module xhci_pci
+load_module usb_storage
+load_module sd_mod
+load_module loop
+load_module squashfs
+load_module overlay
+load_module ext4
+load_module isofs
+
+attempt=0
+image_device=
+while [ "$attempt" -lt 100 ]; do
+	image_candidates=$(resolve_device_spec "$image_spec")
+	image_device=
+	for candidate in $image_candidates; do
+		if [ -n "$image_device" ] && [ "$candidate" != "$image_device" ]; then
+			fatal image.ambiguous \
+				"multiple devices match the image location: $image_spec"
+		fi
+		image_device=$candidate
+	done
+	if [ -n "$image_device" ] && [ -b "$image_device" ]; then
+		break
+	fi
+	attempt=$((attempt + 1))
+	sleep 0.1
+done
+
+if [ -z "$image_device" ] || [ ! -b "$image_device" ]; then
+	fatal image.not-found \
+		"image device was not found within 10 seconds: $image_spec"
+fi
+
+echo "[volatoo] image device resolved: $image_spec -> $image_device"
+
+if [ "$state_spec" = none ]; then
+	echo "[volatoo] state partition discovery disabled"
+else
+	state_attempt_limit=1
+	if [ "$state_required" = yes ]; then
+		state_attempt_limit=100
+	fi
+	state_attempt=0
+	while [ "$state_attempt" -lt "$state_attempt_limit" ]; do
+		state_candidates=$(resolve_device_spec "$state_spec")
+		state_device=
+		for candidate in $state_candidates; do
+			if [ -n "$state_device" ] && [ "$candidate" != "$state_device" ]; then
+				fatal state.ambiguous \
+					"multiple devices match the state location: $state_spec"
+			fi
+			state_device=$candidate
+		done
+		if [ -n "$state_device" ] && [ -b "$state_device" ]; then
+			break
+		fi
+		state_attempt=$((state_attempt + 1))
+		if [ "$state_attempt" -lt "$state_attempt_limit" ]; then
+			sleep 0.1
+		fi
+	done
+
+	if [ -z "$state_device" ] || [ ! -b "$state_device" ]; then
+		state_device=
+		if [ "$state_required" = yes ]; then
+			fatal state.not-found \
+				"required state partition was not found within 10 seconds: $state_spec"
+		fi
+		echo "[volatoo] state partition not found; continuing without persistence"
+	else
+		echo "[volatoo] state device resolved: $state_spec -> $state_device"
+		if ! mount -o rw "$state_device" /state; then
+			fatal state.mount \
+				"could not mount the state partition read-write: $state_device"
+		fi
+		state_mounted=1
+		state_layout_file=/state/volatoo/layout-version
+		if [ -L "$state_layout_file" ] || [ ! -f "$state_layout_file" ]; then
+			fatal state.layout-missing \
+				"state partition has no safe /volatoo/layout-version file"
+		fi
+		IFS= read -r state_layout_version <"$state_layout_file" || true
+		if [ "$state_layout_version" != 1 ]; then
+			fatal state.layout-version \
+				"unsupported state layout version: ${state_layout_version:-empty}"
+		fi
+		for state_layout_directory in \
+			/state/volatoo/config \
+			/state/volatoo/data/bind \
+			/state/volatoo/data/overlay \
+			/state/volatoo/data/sync \
+			/state/volatoo/snapshots; do
+			if [ -L "$state_layout_directory" ] || \
+				[ ! -d "$state_layout_directory" ]; then
+				fatal state.layout-directory \
+					"state layout has no safe directory: ${state_layout_directory#/state}"
+			fi
+		done
+		echo "[volatoo] state layout version 1 mounted read-write"
+		if [ -L /state/volatoo/config/persist.conf ]; then
+			fatal state.config \
+				"persistence configuration must not be a symbolic link"
+		elif [ -f /state/volatoo/config/persist.conf ]; then
+			persist_config=/state/volatoo/config/persist.conf
+			echo "[volatoo] persistence configuration found"
+		elif [ -e /state/volatoo/config/persist.conf ]; then
+			fatal state.config \
+				"persistence configuration is not a regular file"
+		else
+			echo "[volatoo] no persistence configuration; state is available but unused"
+		fi
+	fi
+fi
+
+image_source=$image_device
+loop_device=
+source_mounted=0
+if [ -n "$image_file" ]; then
+	echo "[volatoo] mounting image container from $image_device"
+	if ! mount -o ro "$image_device" /source; then
+		fatal image.container-mount \
+			"could not mount the image container: $image_device"
+	fi
+	source_mounted=1
+
+	if [ ! -f "/source$image_file" ]; then
+		fatal image.file-not-found \
+			"squashfs file not found in container: $image_file"
+	fi
+
+	verify_image_integrity "/source$image_file"
+
+	loop_device=$(losetup -f)
+	if [ -z "$loop_device" ] || \
+		! losetup -r "$loop_device" "/source$image_file"; then
+		fatal image.loop-setup \
+			"could not create a read-only loop device for: $image_file"
+	fi
+	image_source=$loop_device
+	echo "[volatoo] squashfs file attached: $image_file -> $loop_device"
+else
+	verify_image_integrity "$image_device"
+fi
+
+echo "[volatoo] mounting squashfs from $image_source"
+if ! mount -t squashfs -o ro "$image_source" /image; then
+	fatal image.squashfs-mount \
+		"could not mount squashfs from: $image_source"
+fi
+
+case $root_mode in
+	copy)
+		if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" tmpfs /newroot; then
+			fatal root.tmpfs-mount \
+				"could not mount tmpfs at /newroot"
+		fi
+
+		copy_started=$(date +%s)
+		echo "[volatoo] copying the root filesystem into tmpfs"
+		if ! cp -a /image/. /newroot/; then
+			fatal root.copy "could not populate the tmpfs root"
+		fi
+		copy_finished=$(date +%s)
+
+		echo "[volatoo] root copy completed in $((copy_finished - copy_started))s"
+		;;
+	overlay)
+		if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" tmpfs /overlay; then
+			fatal root.overlay-tmpfs \
+				"could not mount the overlay write layer"
+		fi
+		mkdir -p /overlay/upper /overlay/work
+		if ! mount -t overlay \
+			-o lowerdir=/image,upperdir=/overlay/upper,workdir=/overlay/work \
+			overlay /newroot; then
+			fatal root.overlay-mount \
+				"could not mount the overlay root"
+		fi
+		echo "[volatoo] overlay root ready"
+		;;
+esac
+
+if [ -n "$persist_config" ]; then
+	validate_persist_config "$persist_config"
+	if [ "$persist_sync_configured" -eq 1 ] && [ -z "$image_sha256" ]; then
+		fatal persist.image-id \
+			"sync policies require a verified image SHA-256"
+	fi
+	apply_persist_config "$persist_config"
+fi
+
+if [ ! -x "/newroot$target_init" ]; then
+	fatal root.init-missing \
+		"target init is not executable: $target_init"
+fi
+
+if [ "$state_mounted" -eq 1 ]; then
+	mkdir -p /newroot/.volatoo/state
+	mount --move /state /newroot/.volatoo/state ||
+		fatal state.move "could not preserve the state partition mount"
+	echo "[volatoo] state partition available at /.volatoo/state"
+	if [ ! -x /newroot/usr/libexec/volatoo-persist-early ]; then
+		fatal persist.helper-missing \
+			"early persistence helper is not executable"
+	fi
+	if [ ! -x /newroot/usr/sbin/volatoo-identity ]; then
+		fatal identity.helper-missing \
+			"machine identity helper is not executable"
+	fi
+fi
+if [ "$persist_sync_configured" -eq 1 ]; then
+	if ! printf '%s\n' "$image_sha256" > /newroot/.volatoo/image-id; then
+		fatal persist.image-id \
+			"could not publish the verified image id"
+	fi
+fi
+
+if [ "$root_mode" = copy ]; then
+	umount /image || true
+	if [ -n "$loop_device" ]; then
+		losetup -d "$loop_device" || true
+	fi
+	if [ "$source_mounted" -eq 1 ]; then
+		umount /source || true
+	fi
+else
+	# Keep the overlay's lower and writable backing mounts alive after the
+	# initramfs is discarded by moving them beneath the new root.
+	mkdir -p /newroot/.volatoo/lower /newroot/.volatoo/writable
+	mount --move /image /newroot/.volatoo/lower ||
+		fatal root.move-lower "could not preserve the squashfs lower mount"
+	mount --move /overlay /newroot/.volatoo/writable ||
+		fatal root.move-writable "could not preserve the overlay write mount"
+	if [ "$source_mounted" -eq 1 ]; then
+		mkdir -p /newroot/.volatoo/source
+		mount --move /source /newroot/.volatoo/source ||
+			fatal root.move-source "could not preserve the image container mount"
+	fi
+fi
+mkdir -p /newroot/dev /newroot/proc /newroot/sys
+mount --move /proc /newroot/proc ||
+	fatal root.move-proc "could not move /proc into the new root"
+mount --move /sys /newroot/sys ||
+	fatal root.move-sys "could not move /sys into the new root"
+mount --move /dev /newroot/dev ||
+	fatal root.move-dev "could not move /dev into the new root"
+
+echo "[volatoo] switching to $root_mode root; init=$target_init"
+# switch_root must replace PID 1; running it as a child is rejected by BusyBox.
+# shellcheck disable=SC2093
+if [ "$state_mounted" -eq 1 ]; then
+	exec switch_root \
+		/newroot /usr/libexec/volatoo-persist-early "$target_init"
+fi
+exec switch_root /newroot "$target_init"
