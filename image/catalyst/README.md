@@ -47,6 +47,27 @@ It parses the rendered spec, verifies its required stage4 fields and package
 set, and confirms that the builder's pyDeComp extension supplies SquashFS Zstd
 at level 19.
 
+## Weekly CI build
+
+The `Weekly minimal image` GitHub Actions workflow runs every Monday and can
+also be started manually. Pull requests and relevant pushes only run its
+metadata, shell, builder, and spec validation job; scheduled and manual runs
+additionally build the full image and retain it as a workflow artifact for 14
+days.
+
+The workflow does not trust mutable `current` downloads. It uses
+`scripts/fetch-gentoo-inputs.sh` to verify the clearsigned stage3 pointer and
+snapshot checksum index against the expected Gentoo release fingerprints,
+then verifies each downloaded payload with SHA-512. The uploaded artifact
+contains the SquashFS, its SHA-256 file, and a build manifest recording the
+source URLs, upstream digests, repository commit, and workflow run.
+
+Resolve and verify current metadata locally without downloading the payloads:
+
+```sh
+scripts/fetch-gentoo-inputs.sh --metadata-only out/gentoo-inputs
+```
+
 ## Validated input set
 
 The first end-to-end build was completed on 2026-07-23 with Catalyst

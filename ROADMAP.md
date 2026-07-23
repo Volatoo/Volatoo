@@ -45,7 +45,7 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Scaffold `slchris/volatoo-overlay`, live ebuilds, and amd64/23.0 profile
   - [x] Publish the Volatoo sources and pass live `emerge` installation tests
 - [x] Kernel config baseline (tmpfs, squashfs+zstd, overlayfs built-in)
-- [ ] CI pipeline building a weekly minimal image
+- [x] CI pipeline building a weekly minimal image
 - [ ] Image variants: `minimal` (console) first; `desktop` later
 - [ ] In-place image update: download new image to state partition, reboot into it (A/B slots)
 
