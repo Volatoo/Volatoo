@@ -41,9 +41,9 @@ Volatile by default, persistence as policy.
 Reproducible image builds instead of hand-rolled squashfs.
 
 - [x] Catalyst-based spec: stage3 + Volatoo overlay + package set → squashfs image
-- [ ] Volatoo Portage overlay (ebuilds for initramfs/persist tools, profile tweaks)
+- [x] Volatoo Portage overlay (ebuilds for initramfs/persist tools, profile tweaks)
   - [x] Scaffold `slchris/volatoo-overlay`, live ebuilds, and amd64/23.0 profile
-  - [ ] Publish the Volatoo sources and pass live `emerge` installation tests
+  - [x] Publish the Volatoo sources and pass live `emerge` installation tests
 - [ ] Kernel config baseline (tmpfs, squashfs+zstd, overlayfs built-in)
 - [ ] CI pipeline building a weekly minimal image
 - [ ] Image variants: `minimal` (console) first; `desktop` later
