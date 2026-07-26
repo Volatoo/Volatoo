@@ -613,10 +613,10 @@ def create_archive(
         "--numeric-owner",
         "--acls",
         "--xattrs",
-        f"--files-from={path_list}",
     ]
     if no_recursion:
         argv.append("--no-recursion")
+    argv.append(f"--files-from={path_list}")
     try:
         subprocess.run(argv, check=True)
     except (OSError, subprocess.CalledProcessError) as error:
