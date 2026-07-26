@@ -17,6 +17,12 @@ cleanup()
 	docker rm -f -- "$binhost_container" >/dev/null 2>&1 || true
 	docker rm -f -- "$repo_container" >/dev/null 2>&1 || true
 	docker network rm -- "$binhost_network" >/dev/null 2>&1 || true
+	docker run --rm \
+		--platform "$platform" \
+		--mount "type=bind,src=$work_dir,dst=/result" \
+		--entrypoint /bin/chmod \
+		"$openrc_stage3" \
+		-R a+rwX /result >/dev/null 2>&1 || true
 	rm -rf -- "$work_dir"
 }
 trap cleanup EXIT
@@ -266,8 +272,8 @@ for missing_action in local-build remote-build; do
 done
 
 signed_root=$work_dir/signed/$openrc_target
-mkdir -p "$signed_root" "$work_dir/gnupg"
-chmod 700 "$work_dir/gnupg"
+mkdir -p "$signed_root" "$work_dir/gnupg" "$work_dir/verify-gnupg"
+chmod 700 "$work_dir/gnupg" "$work_dir/verify-gnupg"
 cp -R "$work_dir/pkgdir/$openrc_target/." "$signed_root/"
 docker run --rm \
 	--platform "$platform" \
@@ -288,6 +294,14 @@ docker run --rm \
 	)
 	printf "%s:6:\n" "$fingerprint" |
 		gpg --homedir /result/gnupg --import-ownertrust
+	gpg --homedir /result/gnupg --batch \
+		--export "$fingerprint" >/result/test-signing-public.gpg
+	gpg --homedir /result/verify-gnupg --batch \
+		--import /result/test-signing-public.gpg
+	printf "%s:6:\n" "$fingerprint" |
+		gpg --homedir /result/verify-gnupg --import-ownertrust
+	find /result/verify-gnupg -type d -exec chmod 755 {} +
+	find /result/verify-gnupg -type f -exec chmod 644 {} +
 	printf "%s\n" "$fingerprint" >/result/fingerprint
 	' >/dev/null
 fingerprint=$(cat "$work_dir/fingerprint")
@@ -401,7 +415,7 @@ jq -n \
 	    location: $location,
 	    signature_policy: "required",
 	    compatibility: "portage-resolved",
-	    gpg_home: "/result/gnupg",
+	    gpg_home: "/result/verify-gnupg",
 	    trusted_fingerprints: [$fingerprint]
 	  }]
 	}' >"$work_dir/remote-catalog.json"
