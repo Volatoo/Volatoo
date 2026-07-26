@@ -826,6 +826,7 @@ def write_receipt(
             stream.write(encoded)
             stream.flush()
             os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
         os.replace(temporary, path)
     except OSError as error:
         if temporary is not None:
