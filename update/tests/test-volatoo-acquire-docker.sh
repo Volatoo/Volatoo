@@ -11,6 +11,7 @@ repo_container=volatoo-acquire-portage-$$
 binhost_container=volatoo-acquire-binhost-$$
 binhost_network=volatoo-acquire-net-$$
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-acquire-test.XXXXXX")
+chmod 755 "$work_dir"
 
 cleanup()
 {
