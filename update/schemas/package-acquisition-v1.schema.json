@@ -1,0 +1,171 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/package-acquisition-v1.schema.json",
+  "title": "Volatoo package acquisition receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_id",
+    "build_context_digest",
+    "build_spec_digest",
+    "source_catalog_digest",
+    "complete",
+    "missing_action",
+    "packages",
+    "missing"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.package-acquisition/v1"
+    },
+    "target_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "build_context_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "build_spec_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "source_catalog_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "complete": {
+      "type": "boolean"
+    },
+    "missing_action": {
+      "enum": [
+        "fail",
+        "local-build",
+        "remote-build"
+      ]
+    },
+    "packages": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/package"
+      }
+    },
+    "missing": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/missing"
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 192,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*(/[a-z0-9][a-z0-9._+-]*)+$"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*$"
+    },
+    "package": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "cpv",
+        "package_digest",
+        "source_id",
+        "source_kind",
+        "build_id",
+        "artifact_digest",
+        "artifact_size",
+        "store_path",
+        "signature",
+        "compatibility"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cpv": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^\\S+$"
+        },
+        "package_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "source_id": {
+          "$ref": "#/$defs/name"
+        },
+        "source_kind": {
+          "enum": [
+            "local",
+            "remote"
+          ]
+        },
+        "build_id": {
+          "type": "string",
+          "maxLength": 128
+        },
+        "artifact_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "artifact_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "store_path": {
+          "type": "string",
+          "pattern": "^sha256/[0-9a-f]{64}\\.gpkg\\.tar$"
+        },
+        "signature": {
+          "enum": [
+            "verified",
+            "machine-local"
+          ]
+        },
+        "compatibility": {
+          "enum": [
+            "volatoo-attested",
+            "portage-resolved"
+          ]
+        }
+      }
+    },
+    "missing": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sequence",
+        "cpv",
+        "action"
+      ],
+      "properties": {
+        "sequence": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cpv": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512,
+          "pattern": "^\\S+$"
+        },
+        "action": {
+          "enum": [
+            "fail",
+            "local-build",
+            "remote-build"
+          ]
+        }
+      }
+    }
+  }
+}

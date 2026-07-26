@@ -1,0 +1,42 @@
+{
+  "schema": "org.volatoo.build-context/v1",
+  "target": {
+    "id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+    "arch": "amd64",
+    "chost": "x86_64-pc-linux-gnu",
+    "libc": "glibc",
+    "abi": {
+      "mode": "multilib",
+      "values": [
+        "amd64",
+        "x86"
+      ]
+    },
+    "init": "openrc",
+    "profile_id": "volatoo/amd64/glibc/openrc/base-v1",
+    "profile_revision": "1111111111111111111111111111111111111111",
+    "cpu_class": "generic-amd64"
+  },
+  "sources": [
+    {
+      "name": "gentoo",
+      "revision": "2222222222222222222222222222222222222222",
+      "tree_digest": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    },
+    {
+      "name": "volatoo-overlay",
+      "revision": "3333333333333333333333333333333333333333",
+      "tree_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+    }
+  ],
+  "base": {
+    "generation": "base-v1",
+    "rootfs_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "toolchain": {
+    "portage_version": "3.0.77",
+    "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "config_digest": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+  "world_digest": "sha256:7777777777777777777777777777777777777777777777777777777777777777"
+}

@@ -1,0 +1,1000 @@
+#!/usr/bin/env python3
+
+"""Acquire and verify the binary package closure for a Volatoo BuildSpec."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import runpy
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, BinaryIO
+from urllib.error import HTTPError, URLError
+from urllib.parse import quote, urlsplit
+from urllib.request import HTTPRedirectHandler, Request, build_opener
+
+
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
+PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
+PACKAGE_SOURCE_CATALOG_SCHEMA = "org.volatoo.package-source-catalog/v1"
+MAX_INDEX_SIZE = 16 * 1024 * 1024
+DEFAULT_MAX_ARTIFACT_SIZE = 4 * 1024 * 1024 * 1024
+INDEX_KEY_RE = re.compile(r"^[A-Za-z0-9_+.-]{1,64}$")
+GPKG_TEXT_METADATA_FIELDS = {
+    "BUILD_ID",
+    "CATEGORY",
+    "CFLAGS",
+    "CHOST",
+    "CXXFLAGS",
+    "EAPI",
+    "FCFLAGS",
+    "FFLAGS",
+    "IUSE",
+    "IUSE_EFFECTIVE",
+    "KEYWORDS",
+    "LDFLAGS",
+    "LICENSE",
+    "PF",
+    "PROPERTIES",
+    "REQUIRED_USE",
+    "RESTRICT",
+    "SLOT",
+    "USE",
+    "repository",
+}
+
+
+class AcquisitionError(RuntimeError):
+    pass
+
+
+class RejectRedirects(HTTPRedirectHandler):
+    def redirect_request(
+        self,
+        request: Any,
+        file_pointer: Any,
+        code: int,
+        message: str,
+        headers: Any,
+        new_url: str,
+    ) -> None:
+        raise HTTPError(
+            request.full_url,
+            code,
+            "redirects are not allowed",
+            headers,
+            file_pointer,
+        )
+
+
+def load_contracts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-manifest")))
+
+
+def read_contract(
+    contracts: dict[str, Any],
+    path: Path,
+    schema: str,
+) -> dict[str, Any]:
+    try:
+        value = contracts["read_manifest"](str(path))
+        contracts["validate_manifest"](value)
+    except RuntimeError as error:
+        raise AcquisitionError(str(error)) from error
+    if value.get("schema") != schema:
+        raise AcquisitionError(f"{path} must use {schema}")
+    return value
+
+
+def manifest_digest(
+    contracts: dict[str, Any],
+    value: dict[str, Any],
+) -> str:
+    return contracts["manifest_digest"](value)
+
+
+def verify_contract_references(
+    contracts: dict[str, Any],
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    catalog: dict[str, Any],
+) -> None:
+    targets = {
+        context["target"]["id"],
+        spec["target_id"],
+        catalog["target_id"],
+    }
+    if len(targets) != 1:
+        raise AcquisitionError(
+            "build context, BuildSpec and source catalog targets differ"
+        )
+    context_digest = manifest_digest(contracts, context)
+    if spec["build_context_digest"] != context_digest:
+        raise AcquisitionError(
+            "BuildSpec build_context_digest does not match build context"
+        )
+    if (
+        spec["resolver"]["version"]
+        != context["toolchain"]["portage_version"]
+    ):
+        raise AcquisitionError(
+            "BuildSpec resolver.version does not match build context Portage"
+        )
+
+
+def verify_runtime(context: dict[str, Any]) -> tuple[Any, Any]:
+    try:
+        import portage
+    except ImportError as error:
+        raise AcquisitionError(
+            "Portage Python modules are unavailable; run acquisition inside "
+            "the selected pristine Gentoo root"
+        ) from error
+
+    settings = portage.settings
+    target = context["target"]
+    checks = {
+        "Portage version": (
+            portage.VERSION,
+            context["toolchain"]["portage_version"],
+        ),
+        "EROOT": (settings["EROOT"], "/"),
+        "architecture": (settings["ARCH"], target["arch"]),
+        "CHOST": (settings["CHOST"], target["chost"]),
+        "libc": (settings["ELIBC"], target["libc"]),
+    }
+    for label, (actual, expected) in checks.items():
+        if actual != expected:
+            raise AcquisitionError(
+                f"{label} does not match build context: "
+                f"active={actual!r}, expected={expected!r}"
+            )
+
+    active_abis = sorted(
+        settings.get("MULTILIB_ABIS", settings["DEFAULT_ABI"]).split()
+    )
+    if active_abis != sorted(target["abi"]["values"]):
+        raise AcquisitionError(
+            "ABI values do not match build context: "
+            f"active={active_abis}, expected={sorted(target['abi']['values'])}"
+        )
+    systemd_profile = any(
+        "systemd" in Path(profile).parts for profile in settings.profiles
+    )
+    vardb = portage.db[settings["EROOT"]]["vartree"].dbapi
+    has_openrc = bool(vardb.match("sys-apps/openrc"))
+    has_systemd = bool(vardb.match("sys-apps/systemd"))
+    if systemd_profile and has_systemd:
+        active_init = "systemd"
+    elif not systemd_profile and has_openrc and not has_systemd:
+        active_init = "openrc"
+    else:
+        raise AcquisitionError(
+            "cannot identify one active init target from profile and VDB"
+        )
+    if active_init != target["init"]:
+        raise AcquisitionError(
+            "init system does not match build context: "
+            f"active={active_init!r}, expected={target['init']!r}"
+        )
+    return portage, settings
+
+
+def read_limited(stream: BinaryIO, maximum: int, label: str) -> bytes:
+    value = stream.read(maximum + 1)
+    if len(value) > maximum:
+        raise AcquisitionError(f"{label} exceeds {maximum} bytes")
+    return value
+
+
+def fetch_remote(url: str, maximum: int, label: str) -> bytes:
+    request = Request(
+        url,
+        headers={
+            "Accept": "text/plain, application/octet-stream",
+            "User-Agent": "volatoo-acquire/1",
+        },
+    )
+    opener = build_opener(RejectRedirects())
+    try:
+        with opener.open(request, timeout=30) as response:
+            length = response.headers.get("Content-Length")
+            if length is not None and int(length) > maximum:
+                raise AcquisitionError(f"{label} exceeds {maximum} bytes")
+            return read_limited(response, maximum, label)
+    except (HTTPError, URLError, OSError, ValueError) as error:
+        raise AcquisitionError(f"cannot fetch {url}: {error}") from error
+
+
+def parse_index_stanzas(
+    text: str,
+    source_id: str,
+) -> list[dict[str, str]]:
+    stanzas: list[dict[str, str]] = []
+    current: dict[str, str] = {}
+    for line_number, line in enumerate(text.split("\n"), 1):
+        if not line:
+            if current:
+                stanzas.append(current)
+                current = {}
+            continue
+        if line[0].isspace() or ": " not in line:
+            raise AcquisitionError(
+                f"source {source_id} Packages line {line_number} is invalid"
+            )
+        key, value = line.split(": ", 1)
+        if INDEX_KEY_RE.fullmatch(key) is None:
+            raise AcquisitionError(
+                f"source {source_id} Packages line {line_number} has "
+                f"invalid key {key!r}"
+            )
+        if key in current:
+            raise AcquisitionError(
+                f"source {source_id} Packages stanza has duplicate {key}"
+            )
+        if any(ord(character) < 32 for character in value):
+            raise AcquisitionError(
+                f"source {source_id} Packages line {line_number} "
+                "has control characters"
+            )
+        current[key] = value
+    if current:
+        stanzas.append(current)
+    if not stanzas:
+        raise AcquisitionError(f"source {source_id} Packages index is empty")
+    return stanzas
+
+
+def validate_index_entry(
+    entry: dict[str, str],
+    index: int,
+    source_id: str,
+) -> None:
+    for field in ("CPV", "PATH", "SIZE"):
+        if not entry.get(field):
+            raise AcquisitionError(
+                f"source {source_id} package {index} is missing {field}"
+            )
+    validate_package_path(entry["PATH"], source_id)
+    try:
+        size = int(entry["SIZE"])
+    except ValueError as error:
+        raise AcquisitionError(
+            f"source {source_id} package {index} has invalid SIZE"
+        ) from error
+    if size <= 0:
+        raise AcquisitionError(
+            f"source {source_id} package {index} has invalid SIZE"
+        )
+
+
+def parse_packages_index(raw: bytes, source_id: str) -> list[dict[str, str]]:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeError as error:
+        raise AcquisitionError(
+            f"source {source_id} Packages index is not UTF-8"
+        ) from error
+    text = text.replace("\r\n", "\n")
+    if "\r" in text or "\x00" in text:
+        raise AcquisitionError(
+            f"source {source_id} Packages index has invalid characters"
+        )
+
+    stanzas = parse_index_stanzas(text, source_id)
+    preamble = stanzas[0]
+    if "CPV" in preamble or preamble.get("VERSION") != "0":
+        raise AcquisitionError(
+            f"source {source_id} Packages preamble is invalid"
+        )
+    try:
+        expected_count = int(preamble["PACKAGES"])
+    except (KeyError, ValueError) as error:
+        raise AcquisitionError(
+            f"source {source_id} Packages count is invalid"
+        ) from error
+    entries = stanzas[1:]
+    if expected_count != len(entries):
+        raise AcquisitionError(
+            f"source {source_id} Packages count mismatch: "
+            f"declared={expected_count}, actual={len(entries)}"
+        )
+    for index, entry in enumerate(entries):
+        validate_index_entry(entry, index, source_id)
+    return entries
+
+
+def validate_package_path(path: str, source_id: str) -> None:
+    candidate = Path(path)
+    if (
+        not path.endswith(".gpkg.tar")
+        or path.startswith("/")
+        or "\\" in path
+        or candidate.parts == ()
+        or any(part in ("", ".", "..") for part in candidate.parts)
+    ):
+        raise AcquisitionError(
+            f"source {source_id} has unsafe GPKG path {path!r}"
+        )
+
+
+def load_source_index(source: dict[str, Any]) -> list[dict[str, str]]:
+    if source["kind"] == "local":
+        index_path = Path(source["location"]) / "Packages"
+        try:
+            with index_path.open("rb") as stream:
+                raw = read_limited(
+                    stream,
+                    MAX_INDEX_SIZE,
+                    f"source {source['id']} Packages index",
+                )
+        except OSError as error:
+            raise AcquisitionError(
+                f"cannot read source {source['id']} index: {error}"
+            ) from error
+    else:
+        raw = fetch_remote(
+            source["location"].rstrip("/") + "/Packages",
+            MAX_INDEX_SIZE,
+            f"source {source['id']} Packages index",
+        )
+    return parse_packages_index(raw, source["id"])
+
+
+def normalize_words(value: str) -> str:
+    return " ".join(value.split())
+
+
+def normalize_iuse(value: str) -> list[str]:
+    return sorted(
+        {
+            flag[1:] if flag.startswith(("+", "-")) else flag
+            for flag in value.split()
+        }
+    )
+
+
+def split_slot(value: str) -> tuple[str, str]:
+    slot, separator, subslot = value.partition("/")
+    return slot, subslot if separator else slot
+
+
+def optional_index_match(
+    entry: dict[str, str],
+    field: str,
+    expected: str,
+) -> bool:
+    actual = entry.get(field)
+    return actual is None or normalize_words(actual) == normalize_words(expected)
+
+
+def entry_matches(
+    entry: dict[str, str],
+    package: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    if entry["CPV"] != package["cpv"]:
+        return False
+    if "SLOT" in entry and split_slot(entry["SLOT"]) != (
+        package["slot"],
+        package["subslot"],
+    ):
+        return False
+    if "USE" in entry and sorted(set(entry["USE"].split())) != package["use"][
+        "enabled"
+    ]:
+        return False
+    if "IUSE" in entry and not set(normalize_iuse(entry["IUSE"])).issubset(
+        package["use"]["iuse"]
+    ):
+        return False
+    repository = entry.get(
+        "repository",
+        entry.get("REPOSITORY", entry.get("REPO")),
+    )
+    if repository is not None and repository != package["repository"]:
+        return False
+    expected_fields = {
+        "EAPI": package["eapi"],
+        "KEYWORDS": package["metadata"]["keywords"],
+        "LICENSE": package["metadata"]["license"],
+        "PROPERTIES": package["metadata"]["properties"],
+        "REQUIRED_USE": package["metadata"]["required_use"],
+        "RESTRICT": package["metadata"]["restrict"],
+        "CHOST": context["target"]["chost"],
+    }
+    return all(
+        optional_index_match(entry, field, expected)
+        for field, expected in expected_fields.items()
+    )
+
+
+def candidate_sort_key(entry: dict[str, str]) -> tuple[int, int, str]:
+    build_time = entry.get("BUILD_TIME", "")
+    build_id = entry.get("BUILD_ID", "")
+    return (
+        int(build_time) if build_time.isdigit() else -1,
+        int(build_id) if build_id.isdigit() else -1,
+        entry["PATH"],
+    )
+
+
+def select_candidates(
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    catalog: dict[str, Any],
+) -> tuple[list[tuple[dict[str, Any], dict[str, str]] | None], list[dict[str, Any]]]:
+    indexed_sources: list[tuple[dict[str, Any], list[dict[str, str]]]] = []
+    for source in sorted(
+        catalog["sources"],
+        key=lambda value: (-value["priority"], value["id"]),
+    ):
+        indexed_sources.append((source, load_source_index(source)))
+
+    selected: list[tuple[dict[str, Any], dict[str, str]] | None] = []
+    missing: list[dict[str, Any]] = []
+    for package in spec["packages"]:
+        choice = None
+        for source, entries in indexed_sources:
+            matches = [
+                entry
+                for entry in entries
+                if entry_matches(entry, package, context)
+            ]
+            if matches:
+                choice = (source, max(matches, key=candidate_sort_key))
+                break
+        selected.append(choice)
+        if choice is None:
+            missing.append(package)
+    return selected, missing
+
+
+def source_artifact_stream(
+    source: dict[str, Any],
+    entry: dict[str, str],
+) -> tuple[BinaryIO, str]:
+    if source["kind"] == "local":
+        source_root = Path(source["location"]).resolve()
+        artifact = (source_root / entry["PATH"]).resolve()
+        try:
+            artifact.relative_to(source_root)
+        except ValueError as error:
+            raise AcquisitionError(
+                f"source {source['id']} package escapes source root"
+            ) from error
+        try:
+            return artifact.open("rb"), str(artifact)
+        except OSError as error:
+            raise AcquisitionError(
+                f"cannot read source {source['id']} artifact: {error}"
+            ) from error
+
+    path = quote(entry["PATH"], safe="/._+-")
+    url = source["location"].rstrip("/") + "/" + path
+    parsed = urlsplit(url)
+    if parsed.scheme != "https" or parsed.netloc != urlsplit(
+        source["location"]
+    ).netloc:
+        raise AcquisitionError(f"source {source['id']} artifact URL is invalid")
+    request = Request(
+        url,
+        headers={
+            "Accept": "application/octet-stream",
+            "User-Agent": "volatoo-acquire/1",
+        },
+    )
+    try:
+        response = build_opener(RejectRedirects()).open(request, timeout=60)
+    except (HTTPError, URLError, OSError) as error:
+        raise AcquisitionError(f"cannot fetch {url}: {error}") from error
+    return response, url
+
+
+def copy_candidate(
+    source: dict[str, Any],
+    entry: dict[str, str],
+    store: Path,
+    maximum: int,
+) -> tuple[Path, str, int]:
+    expected_size = int(entry["SIZE"])
+    if expected_size > maximum:
+        raise AcquisitionError(
+            f"source {source['id']} artifact exceeds {maximum} bytes"
+        )
+    store.mkdir(parents=True, exist_ok=True)
+    source_stream, label = source_artifact_stream(source, entry)
+    sha256 = hashlib.sha256()
+    sha1 = hashlib.sha1(usedforsecurity=False)
+    md5 = hashlib.md5(usedforsecurity=False)
+    size = 0
+    temporary = None
+    try:
+        with source_stream:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                dir=store,
+                prefix=".acquire.",
+                delete=False,
+            ) as output:
+                temporary = Path(output.name)
+                while True:
+                    block = source_stream.read(1024 * 1024)
+                    if not block:
+                        break
+                    size += len(block)
+                    if size > maximum or size > expected_size:
+                        raise AcquisitionError(
+                            f"artifact {label} exceeds declared size"
+                        )
+                    sha256.update(block)
+                    sha1.update(block)
+                    md5.update(block)
+                    output.write(block)
+                output.flush()
+                os.fsync(output.fileno())
+    except AcquisitionError:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise AcquisitionError(f"cannot acquire artifact {label}: {error}") from error
+    if size != expected_size:
+        temporary.unlink(missing_ok=True)
+        raise AcquisitionError(
+            f"artifact {label} size mismatch: expected={expected_size}, actual={size}"
+        )
+    for field, actual in (
+        ("SHA1", sha1.hexdigest()),
+        ("MD5", md5.hexdigest()),
+        ("SHA256", sha256.hexdigest()),
+    ):
+        expected = entry.get(field)
+        if expected is not None and expected.lower() != actual:
+            temporary.unlink(missing_ok=True)
+            raise AcquisitionError(f"artifact {label} {field} mismatch")
+    return temporary, "sha256:" + sha256.hexdigest(), size
+
+
+def trusted_primary_fingerprints(source: dict[str, Any]) -> list[str]:
+    try:
+        result = subprocess.run(
+            [
+                "gpg",
+                "--homedir",
+                source["gpg_home"],
+                "--batch",
+                "--with-colons",
+                "--fingerprint",
+                "--list-keys",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise AcquisitionError(
+            f"cannot inspect GPG keyring for source {source['id']}: {error}"
+        ) from error
+    fingerprints: list[str] = []
+    want_fingerprint = False
+    for line in result.stdout.splitlines():
+        fields = line.split(":")
+        record_type = fields[0] if fields else ""
+        if record_type == "pub":
+            want_fingerprint = True
+        elif record_type == "fpr" and want_fingerprint:
+            if len(fields) <= 9:
+                raise AcquisitionError(
+                    f"source {source['id']} GPG fingerprint output is invalid"
+                )
+            fingerprints.append(fields[9])
+            want_fingerprint = False
+        elif record_type in ("sub", "uid"):
+            want_fingerprint = False
+    return sorted(set(fingerprints))
+
+
+def decode_metadata(metadata: dict[str, bytes]) -> dict[str, str]:
+    decoded: dict[str, str] = {}
+    for key, value in metadata.items():
+        if (
+            key not in GPKG_TEXT_METADATA_FIELDS
+            and not key.startswith("VOLATOO_")
+        ):
+            continue
+        try:
+            decoded[key] = value.decode("utf-8").rstrip("\n")
+        except UnicodeError as error:
+            raise AcquisitionError(
+                f"GPKG metadata {key} is not UTF-8"
+            ) from error
+    return decoded
+
+
+def verify_metadata(
+    metadata: dict[str, str],
+    entry: dict[str, str],
+    package: dict[str, Any],
+    context: dict[str, Any],
+    package_digest: str,
+    compatibility: str,
+) -> str:
+    cpv = (
+        metadata.get("CATEGORY", "")
+        + "/"
+        + metadata.get("PF", "")
+    ).strip("/")
+    if cpv != package["cpv"]:
+        raise AcquisitionError(
+            f"GPKG CPV mismatch: expected={package['cpv']}, actual={cpv}"
+        )
+    required = {
+        "repository": package["repository"],
+        "SLOT": (
+            package["slot"]
+            if package["slot"] == package["subslot"]
+            else f"{package['slot']}/{package['subslot']}"
+        ),
+        "EAPI": package["eapi"],
+        "CHOST": context["target"]["chost"],
+        "CFLAGS": package["build_flags"]["cflags"],
+        "CXXFLAGS": package["build_flags"]["cxxflags"],
+        "LDFLAGS": package["build_flags"]["ldflags"],
+    }
+    for field, expected in required.items():
+        actual = metadata.get(field)
+        if actual is None or normalize_words(actual) != normalize_words(expected):
+            raise AcquisitionError(
+                f"GPKG {package['cpv']} metadata {field} mismatch"
+            )
+    optional = {
+        "FFLAGS": package["build_flags"]["fflags"],
+        "FCFLAGS": package["build_flags"]["fcflags"],
+        "KEYWORDS": package["metadata"]["keywords"],
+        "LICENSE": package["metadata"]["license"],
+        "PROPERTIES": package["metadata"]["properties"],
+        "REQUIRED_USE": package["metadata"]["required_use"],
+        "RESTRICT": package["metadata"]["restrict"],
+    }
+    for field, expected in optional.items():
+        actual = metadata.get(field)
+        if actual is not None and normalize_words(actual) != normalize_words(
+            expected
+        ):
+            raise AcquisitionError(
+                f"GPKG {package['cpv']} metadata {field} mismatch"
+            )
+    if sorted(set(metadata.get("USE", "").split())) != package["use"]["enabled"]:
+        raise AcquisitionError(f"GPKG {package['cpv']} USE mismatch")
+    if normalize_iuse(metadata.get("IUSE", "")) != package["use"]["iuse"]:
+        raise AcquisitionError(f"GPKG {package['cpv']} IUSE mismatch")
+
+    provenance = {
+        "VOLATOO_TARGET_ID": context["target"]["id"],
+        "VOLATOO_BUILD_CONTEXT_DIGEST": package_context_digest(context),
+        "VOLATOO_PACKAGE_DIGEST": package_digest,
+    }
+    present = any(field in metadata for field in provenance)
+    if compatibility == "volatoo-attested" or present:
+        for field, expected in provenance.items():
+            if metadata.get(field) != expected:
+                raise AcquisitionError(
+                    f"GPKG {package['cpv']} provenance {field} mismatch"
+                )
+    build_id = metadata.get("BUILD_ID", entry.get("BUILD_ID", ""))
+    if entry.get("BUILD_ID") and build_id != entry["BUILD_ID"]:
+        raise AcquisitionError(f"GPKG {package['cpv']} BUILD_ID mismatch")
+    return build_id
+
+
+def package_context_digest(context: dict[str, Any]) -> str:
+    encoded = (
+        json.dumps(
+            context,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+
+
+def verify_gpkg(
+    portage: Any,
+    base_settings: Any,
+    source: dict[str, Any],
+    entry: dict[str, str],
+    artifact: Path,
+    package: dict[str, Any],
+    context: dict[str, Any],
+    package_digest: str,
+) -> tuple[str, str]:
+    try:
+        from portage.gpkg import gpkg
+    except ImportError as error:
+        raise AcquisitionError("Portage GPKG support is unavailable") from error
+
+    require_signature = source["signature_policy"] == "required"
+    if require_signature:
+        actual_fingerprints = trusted_primary_fingerprints(source)
+        if actual_fingerprints != source["trusted_fingerprints"]:
+            raise AcquisitionError(
+                f"source {source['id']} GPG keyring fingerprints differ: "
+                f"active={actual_fingerprints}, "
+                f"expected={source['trusted_fingerprints']}"
+            )
+
+    settings = portage.config(clone=base_settings)
+    settings.unlock()
+    if require_signature:
+        settings["BINPKG_GPG_VERIFY_GPG_HOME"] = source["gpg_home"]
+    settings.lock()
+    try:
+        package_file = gpkg(
+            settings,
+            basename=package["cpv"],
+            gpkg_file=str(artifact),
+            verify_signature=require_signature,
+        )
+        metadata = decode_metadata(package_file.get_metadata())
+    except Exception as error:
+        raise AcquisitionError(
+            f"GPKG verification failed for {package['cpv']}: {error}"
+        ) from error
+    build_id = verify_metadata(
+        metadata,
+        entry,
+        package,
+        context,
+        package_digest,
+        source["compatibility"],
+    )
+    signature = "verified" if require_signature else "machine-local"
+    return build_id, signature
+
+
+def publish_artifact(
+    temporary: Path,
+    artifact_digest: str,
+    store: Path,
+) -> str:
+    hexadecimal = artifact_digest.removeprefix("sha256:")
+    relative = Path("sha256") / f"{hexadecimal}.gpkg.tar"
+    destination = store / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    def verify_existing() -> None:
+        if destination.is_symlink() or not destination.is_file():
+            raise AcquisitionError(
+                f"content-addressed object {destination} is not a regular file"
+            )
+        existing = hashlib.sha256()
+        with destination.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                existing.update(block)
+        if existing.hexdigest() != hexadecimal:
+            raise AcquisitionError(
+                f"content-addressed object {destination} is corrupt"
+            )
+
+    os.chmod(temporary, 0o644)
+    try:
+        os.link(temporary, destination)
+    except FileExistsError:
+        verify_existing()
+    except OSError as error:
+        raise AcquisitionError(
+            f"cannot publish content-addressed object {destination}: {error}"
+        ) from error
+    finally:
+        temporary.unlink(missing_ok=True)
+    return relative.as_posix()
+
+
+def write_receipt(
+    contracts: dict[str, Any],
+    path: Path,
+    receipt: dict[str, Any],
+) -> None:
+    try:
+        encoded = contracts["canonical_bytes"](receipt)
+    except RuntimeError as error:
+        raise AcquisitionError(str(error)) from error
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise AcquisitionError(f"cannot write {path}: {error}") from error
+
+
+def acquire(
+    contracts: dict[str, Any],
+    portage: Any,
+    settings: Any,
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    catalog: dict[str, Any],
+    store: Path,
+    receipt_path: Path,
+    missing_action: str,
+    maximum: int,
+) -> bool:
+    selected, missing_packages = select_candidates(context, spec, catalog)
+    if missing_packages and missing_action == "fail":
+        names = ", ".join(package["cpv"] for package in missing_packages)
+        raise AcquisitionError(f"binary package closure is incomplete: {names}")
+
+    acquired: list[dict[str, Any]] = []
+    missing: list[dict[str, Any]] = []
+    for sequence, (package, choice) in enumerate(
+        zip(spec["packages"], selected, strict=True)
+    ):
+        if choice is None:
+            missing.append(
+                {
+                    "sequence": sequence,
+                    "cpv": package["cpv"],
+                    "action": missing_action,
+                }
+            )
+            continue
+        source, entry = choice
+        temporary, artifact_digest, artifact_size = copy_candidate(
+            source,
+            entry,
+            store,
+            maximum,
+        )
+        package_digest = contracts["package_build_digest"](spec, package)
+        try:
+            build_id, signature = verify_gpkg(
+                portage,
+                settings,
+                source,
+                entry,
+                temporary,
+                package,
+                context,
+                package_digest,
+            )
+            store_path = publish_artifact(
+                temporary,
+                artifact_digest,
+                store,
+            )
+        except Exception:
+            temporary.unlink(missing_ok=True)
+            raise
+        acquired.append(
+            {
+                "sequence": sequence,
+                "cpv": package["cpv"],
+                "package_digest": package_digest,
+                "source_id": source["id"],
+                "source_kind": source["kind"],
+                "build_id": build_id,
+                "artifact_digest": artifact_digest,
+                "artifact_size": artifact_size,
+                "store_path": store_path,
+                "signature": signature,
+                "compatibility": source["compatibility"],
+            }
+        )
+
+    receipt = {
+        "schema": PACKAGE_ACQUISITION_SCHEMA,
+        "target_id": spec["target_id"],
+        "build_context_digest": spec["build_context_digest"],
+        "build_spec_digest": manifest_digest(contracts, spec),
+        "source_catalog_digest": manifest_digest(contracts, catalog),
+        "complete": not missing,
+        "missing_action": missing_action,
+        "packages": acquired,
+        "missing": missing,
+    }
+    write_receipt(contracts, receipt_path, receipt)
+    return not missing
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Select, acquire and verify a target-specific GPKG closure."
+        )
+    )
+    parser.add_argument("--build-context", required=True, type=Path)
+    parser.add_argument("--build-spec", required=True, type=Path)
+    parser.add_argument("--source-catalog", required=True, type=Path)
+    parser.add_argument("--store", required=True, type=Path)
+    parser.add_argument("--receipt", required=True, type=Path)
+    parser.add_argument(
+        "--missing-action",
+        choices=("fail", "local-build", "remote-build"),
+        default="fail",
+    )
+    parser.add_argument(
+        "--max-artifact-size",
+        type=int,
+        default=DEFAULT_MAX_ARTIFACT_SIZE,
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        if arguments.max_artifact_size <= 0:
+            raise AcquisitionError("--max-artifact-size must be positive")
+        if not arguments.store.is_absolute() or not arguments.receipt.is_absolute():
+            raise AcquisitionError("--store and --receipt must be absolute paths")
+        if arguments.receipt.resolve() in (
+            arguments.build_context.resolve(),
+            arguments.build_spec.resolve(),
+            arguments.source_catalog.resolve(),
+        ):
+            raise AcquisitionError("receipt must not overwrite an input")
+        contracts = load_contracts()
+        context = read_contract(
+            contracts,
+            arguments.build_context,
+            BUILD_CONTEXT_SCHEMA,
+        )
+        spec = read_contract(
+            contracts,
+            arguments.build_spec,
+            BUILD_SPEC_SCHEMA,
+        )
+        catalog = read_contract(
+            contracts,
+            arguments.source_catalog,
+            PACKAGE_SOURCE_CATALOG_SCHEMA,
+        )
+        verify_contract_references(contracts, context, spec, catalog)
+        portage, settings = verify_runtime(context)
+        complete = acquire(
+            contracts,
+            portage,
+            settings,
+            context,
+            spec,
+            catalog,
+            arguments.store,
+            arguments.receipt,
+            arguments.missing_action,
+            arguments.max_artifact_size,
+        )
+        print(f"Acquisition receipt: {arguments.receipt}")
+        return 0 if complete else 2
+    except AcquisitionError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

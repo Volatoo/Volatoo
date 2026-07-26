@@ -1,0 +1,578 @@
+#!/usr/bin/env python3
+
+"""Bridge a canonical Volatoo BuildSpec to Portage Engine."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import runpy
+import stat
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+
+TARGET_SCHEMA = "org.volatoo.portage-engine-target/v1"
+JOB_SCHEMA = "org.volatoo.portage-engine-job/v1"
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._/-]{0,255}$")
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}$")
+CPV_RE = re.compile(r"^([^/]+)/(.+)-([0-9][A-Za-z0-9._-]*)$")
+MAX_RESPONSE = 1024 * 1024
+TERMINAL_SUCCESS = {"success", "completed", "succeeded"}
+TERMINAL_FAILURE = {"failed", "cancelled", "canceled"}
+
+
+class EngineError(RuntimeError):
+    pass
+
+
+def contracts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-manifest")))
+
+
+def canonical_bytes(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def digest_bytes(value: bytes) -> str:
+    return "sha256:" + hashlib.sha256(value).hexdigest()
+
+
+def write_new_file(path: Path, value: bytes) -> None:
+    temporary: Path | None = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.tmp-",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o644)
+        os.link(temporary, path)
+        temporary.unlink()
+    except FileExistsError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise EngineError(f"output already exists: {path}") from error
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise EngineError(f"cannot write {path}: {error}") from error
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def reject_nonstandard_constant(token: str) -> None:
+    raise ValueError(f"unsupported JSON value: {token}")
+
+
+def read_canonical_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > MAX_RESPONSE:
+            raise ValueError(f"input exceeds {MAX_RESPONSE} bytes")
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise EngineError(f"cannot read JSON {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise EngineError(f"JSON root must be an object: {path}")
+    canonical = canonical_bytes(value)
+    if raw != canonical:
+        raise EngineError(f"JSON must use canonical form: {path}")
+    return value, canonical
+
+
+def read_contract(
+    path: Path,
+    expected_schema: str,
+) -> tuple[dict[str, Any], bytes]:
+    module = contracts()
+    try:
+        value = module["read_manifest"](str(path))
+        module["validate_manifest"](value)
+        canonical = module["canonical_bytes"](value)
+    except RuntimeError as error:
+        raise EngineError(str(error)) from error
+    if value["schema"] != expected_schema:
+        raise EngineError(f"{path} must use {expected_schema}")
+    if path.read_bytes() != canonical:
+        raise EngineError(f"contract must be canonical JSON: {path}")
+    return value, canonical
+
+
+def require_string(
+    value: Any,
+    description: str,
+    pattern: re.Pattern[str],
+) -> str:
+    if not isinstance(value, str) or pattern.fullmatch(value) is None:
+        raise EngineError(f"{description} is invalid")
+    return value
+
+
+def require_sorted_strings(
+    value: Any,
+    description: str,
+    pattern: re.Pattern[str],
+    allow_empty: bool = False,
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (not value and not allow_empty)
+        or any(
+            not isinstance(item, str) or pattern.fullmatch(item) is None
+            for item in value
+        )
+        or value != sorted(set(value))
+    ):
+        raise EngineError(f"{description} must be a sorted unique array")
+    return value
+
+
+def read_target(path: Path) -> tuple[dict[str, Any], bytes]:
+    value, raw = read_canonical_json(path)
+    if set(value) != {
+        "schema",
+        "target_id",
+        "build_context_digest",
+        "engine",
+    }:
+        raise EngineError("Portage Engine target fields are invalid")
+    if value["schema"] != TARGET_SCHEMA:
+        raise EngineError("unsupported Portage Engine target schema")
+    require_string(value["target_id"], "target_id", ID_RE)
+    require_string(
+        value["build_context_digest"],
+        "build_context_digest",
+        DIGEST_RE,
+    )
+    engine = value["engine"]
+    if not isinstance(engine, dict) or set(engine) != {
+        "profile_id",
+        "arch",
+        "repository_ids",
+        "repository_names",
+        "resource_class",
+        "image_digest",
+        "mirror_bundle_digest",
+        "binhost_path",
+        "required_features",
+    }:
+        raise EngineError("Portage Engine binding fields are invalid")
+    require_string(engine["profile_id"], "engine.profile_id", ID_RE)
+    require_string(engine["arch"], "engine.arch", NAME_RE)
+    require_sorted_strings(
+        engine["repository_ids"],
+        "engine.repository_ids",
+        ID_RE,
+    )
+    require_sorted_strings(
+        engine["repository_names"],
+        "engine.repository_names",
+        NAME_RE,
+    )
+    require_string(engine["resource_class"], "engine.resource_class", NAME_RE)
+    require_string(engine["image_digest"], "engine.image_digest", DIGEST_RE)
+    require_string(
+        engine["mirror_bundle_digest"],
+        "engine.mirror_bundle_digest",
+        DIGEST_RE,
+    )
+    if engine["binhost_path"] != f"/binpkgs/{value['target_id']}":
+        raise EngineError(
+            "engine.binhost_path must be /binpkgs/<complete target_id>"
+        )
+    require_sorted_strings(
+        engine["required_features"],
+        "engine.required_features",
+        NAME_RE,
+        allow_empty=True,
+    )
+    return value, raw
+
+
+def split_cpv(cpv: str) -> tuple[str, str]:
+    match = CPV_RE.fullmatch(cpv)
+    if match is None:
+        raise EngineError(f"cannot split CPV for Portage Engine: {cpv}")
+    return f"{match.group(1)}/{match.group(2)}", match.group(3)
+
+
+def effective_use(package: dict[str, Any]) -> list[str]:
+    enabled = set(package["use"]["enabled"])
+    declared = {
+        flag.removeprefix("+").removeprefix("-")
+        for flag in package["use"]["iuse"]
+    }
+    flags = enabled | declared
+    return sorted(flag if flag in enabled else f"-{flag}" for flag in flags)
+
+
+def package_environment(package: dict[str, Any]) -> dict[str, str]:
+    flags = package["build_flags"]
+    return {
+        "CFLAGS": flags["cflags"],
+        "CXXFLAGS": flags["cxxflags"],
+        "FCFLAGS": flags["fcflags"],
+        "FFLAGS": flags["fflags"],
+        "LDFLAGS": flags["ldflags"],
+    }
+
+
+def make_request(
+    spec: dict[str, Any],
+    spec_bytes: bytes,
+    target: dict[str, Any],
+) -> dict[str, Any]:
+    required_features = target["engine"]["required_features"]
+    for package in spec["packages"]:
+        if package["build_flags"]["features"] != required_features:
+            raise EngineError(
+                f"{package['cpv']} FEATURES differ from Engine target policy"
+            )
+
+    package_specs = []
+    package_use = {}
+    package_keywords = {}
+    for package in spec["packages"]:
+        atom, version = split_cpv(package["cpv"])
+        exact = f"={package['cpv']}"
+        flags = effective_use(package)
+        keywords = package["acceptance"]["keywords"]
+        package_use[exact] = flags
+        package_keywords[exact] = keywords
+        package_specs.append(
+            {
+                "atom": atom,
+                "version": version,
+                "use_flags": flags,
+                "keywords": keywords,
+                "environment": package_environment(package),
+            }
+        )
+
+    first_atom, first_version = split_cpv(spec["packages"][0]["cpv"])
+    engine = target["engine"]
+    build_spec_digest = digest_bytes(spec_bytes)
+    return {
+        "package_name": first_atom,
+        "version": first_version,
+        "arch": engine["arch"],
+        "profile_id": engine["profile_id"],
+        "repository_ids": engine["repository_ids"],
+        "resource_class": engine["resource_class"],
+        "use_flags": {},
+        "environment": {},
+        "config_bundle": {
+            "config": {
+                "package_use": package_use,
+                "package_keywords": package_keywords,
+                "package_mask": [],
+                "package_unmask": [],
+                "make_conf": {},
+                "environment": {},
+                "global_use": [],
+                "repos": [],
+            },
+            "packages": {"packages": package_specs},
+            "metadata": {
+                "user_id": "volatoo",
+                "target_arch": engine["arch"],
+                "profile_id": engine["profile_id"],
+                "profile": "",
+                "created_at": "",
+                "description": f"Volatoo BuildSpec {build_spec_digest}",
+            },
+        },
+    }
+
+
+def render_request(arguments: argparse.Namespace) -> None:
+    context, context_bytes = read_contract(
+        arguments.build_context,
+        BUILD_CONTEXT_SCHEMA,
+    )
+    spec, spec_bytes = read_contract(arguments.build_spec, BUILD_SPEC_SCHEMA)
+    target, _ = read_target(arguments.engine_target)
+    context_digest = digest_bytes(context_bytes)
+    if (
+        spec["target_id"] != context["target"]["id"]
+        or target["target_id"] != spec["target_id"]
+        or spec["build_context_digest"] != context_digest
+        or target["build_context_digest"] != context_digest
+    ):
+        raise EngineError("BuildSpec, context and Engine target binding differ")
+
+    request = make_request(spec, spec_bytes, target)
+    output = canonical_bytes(request)
+    write_new_file(arguments.output, output)
+    print(f"Portage Engine request: {arguments.output} ({digest_bytes(output)})")
+
+
+def read_api_key(path: Path | None) -> str:
+    if path is None:
+        return ""
+    if path.is_symlink() or not path.is_file():
+        raise EngineError("API key file must be a regular file")
+    mode = stat.S_IMODE(path.stat().st_mode)
+    if mode & 0o077:
+        raise EngineError("API key file must not be accessible by group or other")
+    try:
+        value = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeError) as error:
+        raise EngineError(f"cannot read API key: {error}") from error
+    if not value or any(ord(character) < 33 for character in value):
+        raise EngineError("API key is empty or contains whitespace")
+    return value
+
+
+def server_base(value: str, allow_http: bool) -> str:
+    parsed = urllib.parse.urlsplit(value.rstrip("/"))
+    allowed_schemes = {"https"} | ({"http"} if allow_http else set())
+    if (
+        parsed.scheme not in allowed_schemes
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise EngineError("server must be a credential-free HTTPS origin")
+    return value.rstrip("/")
+
+
+def request_json(
+    url: str,
+    method: str,
+    api_key: str,
+    body: bytes | None = None,
+    idempotency_key: str = "",
+) -> dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+    if api_key:
+        headers["X-API-Key"] = api_key
+    if idempotency_key:
+        headers["Idempotency-Key"] = idempotency_key
+    request = urllib.request.Request(url, data=body, headers=headers, method=method)
+    try:
+        # server_base restricts this URL to a credential-free HTTPS origin;
+        # HTTP is available only behind the explicit test/LAN flag.
+        with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310
+            raw = response.read(MAX_RESPONSE + 1)
+            if len(raw) > MAX_RESPONSE:
+                raise EngineError("Portage Engine response is too large")
+            value = json.loads(
+                raw.decode("utf-8"),
+                object_pairs_hook=reject_duplicate_keys,
+                parse_constant=reject_nonstandard_constant,
+            )
+    except (
+        OSError,
+        UnicodeError,
+        ValueError,
+        urllib.error.HTTPError,
+    ) as error:
+        raise EngineError(f"Portage Engine request failed: {error}") from error
+    if not isinstance(value, dict):
+        raise EngineError("Portage Engine response must be an object")
+    return value
+
+
+def validate_status(
+    status: dict[str, Any],
+    target: dict[str, Any],
+) -> list[str]:
+    context = status.get("resolved_context")
+    if not isinstance(context, dict):
+        raise EngineError("successful job has no resolved_context")
+    engine = target["engine"]
+    expected = {
+        "profile_id": engine["profile_id"],
+        "arch": engine["arch"],
+        "resource_class": engine["resource_class"],
+        "image_digest": engine["image_digest"],
+        "mirror_bundle_digest": engine["mirror_bundle_digest"],
+    }
+    for field, value in expected.items():
+        if context.get(field) != value:
+            raise EngineError(f"resolved_context.{field} differs from target binding")
+    repositories = context.get("repositories")
+    if not isinstance(repositories, list):
+        raise EngineError("resolved_context.repositories is invalid")
+    names = sorted(
+        repository.get("name")
+        for repository in repositories
+        if isinstance(repository, dict)
+        and isinstance(repository.get("name"), str)
+    )
+    if names != engine["repository_names"]:
+        raise EngineError("resolved repository names differ from target binding")
+    artifacts = status.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        artifact = status.get("artifact_url")
+        artifacts = [artifact] if isinstance(artifact, str) and artifact else []
+    if not artifacts or any(
+            not isinstance(item, str)
+            or not item.startswith(engine["binhost_path"] + "/")
+            or "?" in item
+            or "#" in item
+            for item in artifacts
+    ):
+        raise EngineError("successful job artifact list is invalid")
+    if len(artifacts) != len(set(artifacts)):
+        raise EngineError("successful job artifact list contains duplicates")
+    return sorted(artifacts)
+
+
+def submit_request(arguments: argparse.Namespace) -> None:
+    if arguments.receipt.exists() or arguments.receipt.is_symlink():
+        raise EngineError(f"output already exists: {arguments.receipt}")
+    request, request_bytes = read_canonical_json(arguments.request)
+    target, target_bytes = read_target(arguments.engine_target)
+    spec, spec_bytes = read_contract(arguments.build_spec, BUILD_SPEC_SCHEMA)
+    if (
+        target["target_id"] != spec["target_id"]
+        or target["build_context_digest"] != spec["build_context_digest"]
+    ):
+        raise EngineError("BuildSpec and Engine target differ")
+    if request_bytes != canonical_bytes(make_request(spec, spec_bytes, target)):
+        raise EngineError("request does not match BuildSpec and Engine target")
+    base = server_base(arguments.server, arguments.allow_http)
+    api_key = read_api_key(arguments.api_key_file)
+    spec_digest = digest_bytes(spec_bytes)
+    idempotency_digest = hashlib.sha256(
+        spec_bytes + target_bytes + request_bytes
+    ).hexdigest()
+    response = request_json(
+        base + "/api/v1/builds/submit",
+        "POST",
+        api_key,
+        request_bytes,
+        "volatoo-" + idempotency_digest,
+    )
+    job_id = response.get("job_id")
+    if not isinstance(job_id, str) or not job_id or len(job_id) > 256:
+        raise EngineError("Portage Engine did not return a valid job_id")
+    # The submit endpoint returns only a compact BuildResponse. Always read the
+    # status endpoint at least once, even if a very fast job is already terminal.
+    status: dict[str, Any] = {"status": "queued"}
+    deadline = time.monotonic() + arguments.timeout
+    while status.get("status") not in TERMINAL_SUCCESS | TERMINAL_FAILURE:
+        if time.monotonic() >= deadline:
+            raise EngineError("timed out waiting for Portage Engine job")
+        time.sleep(arguments.poll_interval)
+        status = request_json(
+            base
+            + "/api/v1/packages/status?job_id="
+            + urllib.parse.quote(job_id, safe=""),
+            "GET",
+            api_key,
+        )
+    if status.get("status") in TERMINAL_FAILURE:
+        raise EngineError(
+            f"Portage Engine job failed: {status.get('error', 'unknown error')}"
+        )
+    artifacts = validate_status(status, target)
+    receipt = {
+        "schema": JOB_SCHEMA,
+        "target_id": target["target_id"],
+        "build_context_digest": target["build_context_digest"],
+        "build_spec_digest": spec_digest,
+        "engine_target_digest": digest_bytes(target_bytes),
+        "request_digest": digest_bytes(request_bytes),
+        "job_id": job_id,
+        "status": "succeeded",
+        "profile_id": target["engine"]["profile_id"],
+        "image_digest": target["engine"]["image_digest"],
+        "mirror_bundle_digest": target["engine"]["mirror_bundle_digest"],
+        "binhost_path": target["engine"]["binhost_path"],
+        "required_features": target["engine"]["required_features"],
+        "artifacts": artifacts,
+    }
+    content = canonical_bytes(receipt)
+    write_new_file(arguments.receipt, content)
+    print(f"Portage Engine job succeeded: {job_id}")
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="volatoo-engine")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    render = subparsers.add_parser("render")
+    render.add_argument("--build-context", type=Path, required=True)
+    render.add_argument("--build-spec", type=Path, required=True)
+    render.add_argument("--engine-target", type=Path, required=True)
+    render.add_argument("--output", type=Path, required=True)
+    render.set_defaults(handler=render_request)
+
+    submit = subparsers.add_parser("submit")
+    submit.add_argument("--request", type=Path, required=True)
+    submit.add_argument("--build-spec", type=Path, required=True)
+    submit.add_argument("--engine-target", type=Path, required=True)
+    submit.add_argument("--server", required=True)
+    submit.add_argument("--api-key-file", type=Path)
+    submit.add_argument("--receipt", type=Path, required=True)
+    submit.add_argument("--timeout", type=int, default=7200)
+    submit.add_argument("--poll-interval", type=float, default=5.0)
+    submit.add_argument("--allow-http", action="store_true")
+    submit.set_defaults(handler=submit_request)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        if (
+            arguments.command == "submit"
+            and (arguments.timeout < 1 or arguments.poll_interval < 0.01)
+        ):
+            raise EngineError("timeout and poll interval must be positive")
+        arguments.handler(arguments)
+    except EngineError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

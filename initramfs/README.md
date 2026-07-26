@@ -79,11 +79,12 @@ The supported settings are:
 | `VOLATOO_TMPFS_SIZE` | `80%` | Percentage of RAM allowed for the tmpfs |
 | `VOLATOO_STATE` | `LABEL=VOLATOO-STATE` | State device spec, or `none` |
 | `VOLATOO_STATE_REQUIRED` | `no` | Whether missing state is a boot failure |
+| `VOLATOO_GENERATION` | `auto` | `auto`, `previous`, `none`, or a digest |
 
 Kernel parameters `volatoo.image=`, `volatoo.image-file=`,
 `volatoo.image-sha256=`, `volatoo.init=`, `volatoo.root=`, and
-`volatoo.tmpfs-size=`, `volatoo.state=`, and `volatoo.state-required=`
-override the embedded settings for one boot.
+`volatoo.tmpfs-size=`, `volatoo.state=`, `volatoo.state-required=`, and
+`volatoo.generation=` override the embedded settings for one boot.
 
 A raw SquashFS partition needs only `VOLATOO_IMAGE`. For a SquashFS stored
 inside a labeled filesystem or ISO:
@@ -112,10 +113,13 @@ environment with `state.not-found` if the filesystem remains absent.
 `VOLATOO_STATE=none` disables discovery explicitly.
 
 A discovered state filesystem is mounted read-write and must contain
-`/volatoo/layout-version` with the supported value `1`. Before `switch_root`,
-the mount is moved to `/.volatoo/state`, where later persistence policies can
-use it without depending on a kernel device name. Missing or unsupported layout
-metadata is a fatal error rather than an invitation to modify unknown data.
+`/volatoo/layout-version` with the supported value `1`. An optional
+`/volatoo/system/layout-version` value of `1` enables immutable generation
+selection without changing the Phase 2 persistence layout version. Before
+`switch_root`, the mount is moved to `/.volatoo/state`, where later persistence
+policies can use it without depending on a kernel device name. Missing or
+unsupported layout metadata is a fatal error rather than an invitation to
+modify unknown data.
 The complete versioned layout is documented in
 [`docs/design/state-layout.md`](../docs/design/state-layout.md).
 
@@ -124,6 +128,28 @@ Create an empty 128 MiB test filesystem using Docker:
 ```sh
 scripts/build-state-image.sh
 ```
+
+The generated image includes an empty system-generation sublayout. A prepared
+state tree containing published generations can be converted to ext4 with:
+
+```sh
+VOLATOO_STATE_SIZE=1G scripts/build-state-image.sh \
+  --source /path/to/prepared-state-root \
+  out/volatoo-generation-state.ext4
+```
+
+With `VOLATOO_GENERATION=auto`, a safe `current` pointer selects the default
+generation. The initramfs verifies the canonical manifest digest, derived boot
+plan, build context, base, ordered layer, tombstone and transaction objects
+before changing `/newroot`. A rejected current generation falls back to a
+fully verified `previous`. `VOLATOO_GENERATION=previous`, `none`, or an
+explicit digest provides deterministic recovery behavior.
+
+For copy roots, the verified base and each layer are copied into the root
+tmpfs. For overlay roots, the base remains the read-only lower filesystem and
+layer contents plus tombstones are applied to the tmpfs upper layer. A
+tombstone is applied before its corresponding layer, allowing a package update
+to remove an old path and recreate it in the same transaction.
 
 An empty state image still enables the default persistent machine identity and
 logs. Supply an identity configuration to disable or customize those defaults:
@@ -370,6 +396,28 @@ VOLATOO_TARGET_INIT=/sbin/init scripts/run-phase0-qemu.sh \
   out/volatoo-initramfs.cpio.gz \
   out/volatoo-stage3.squashfs
 ```
+
+Release images do not enable an automatic root login. The test harness can
+therefore validate an init system non-interactively by waiting for its serial
+login prompt and PID 1 marker, then exiting QEMU without modifying the image:
+
+```sh
+VOLATOO_TEST_INIT_SYSTEM=openrc scripts/test-qemu-boot.sh \
+  /path/to/bzImage \
+  out/volatoo-initramfs.cpio.gz \
+  out/volatoo-minimal-openrc.squashfs
+
+VOLATOO_TEST_INIT_SYSTEM=systemd \
+VOLATOO_TEST_ROOT_MODE=overlay \
+scripts/test-qemu-boot.sh \
+  /path/to/bzImage \
+  out/volatoo-initramfs.cpio.gz \
+  out/volatoo-minimal-systemd.squashfs
+```
+
+`shell` remains the default `VOLATOO_TEST_INIT_SYSTEM` value. The init-system
+mode checks both BIOS and UEFI. It is intentionally separate from the
+interactive persistence-policy and shutdown-sync tests.
 
 The full-copy root is the default. To boot the comparison layout, which keeps
 the squashfs mounted and stores only changes in a tmpfs write layer:

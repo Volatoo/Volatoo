@@ -1,0 +1,83 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/portage-engine-job-v1.schema.json",
+  "title": "Volatoo Portage Engine job receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_id",
+    "build_context_digest",
+    "build_spec_digest",
+    "engine_target_digest",
+    "request_digest",
+    "job_id",
+    "status",
+    "profile_id",
+    "image_digest",
+    "mirror_bundle_digest",
+    "binhost_path",
+    "required_features",
+    "artifacts"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.portage-engine-job/v1"
+    },
+    "target_id": {
+      "type": "string"
+    },
+    "build_context_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "build_spec_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "engine_target_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "request_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "job_id": {
+      "type": "string"
+    },
+    "status": {
+      "const": "succeeded"
+    },
+    "profile_id": {
+      "type": "string"
+    },
+    "image_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "mirror_bundle_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "binhost_path": {
+      "type": "string",
+      "pattern": "^/binpkgs/volatoo/"
+    },
+    "required_features": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "type": "string"
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

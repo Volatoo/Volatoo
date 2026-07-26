@@ -1,5 +1,4 @@
 # Runtime packages for the first console image.
-app-admin/sysklogd
 net-misc/dhcpcd
 net-misc/openssh
 net-misc/rsync

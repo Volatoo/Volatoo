@@ -1,0 +1,5 @@
+{
+  "schema": "org.volatoo.tombstones/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "paths": []
+}

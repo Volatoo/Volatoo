@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/package-source-query-v1.schema.json",
+  "title": "Volatoo package source query v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_id",
+    "build_context_digest",
+    "build_spec_digest"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.package-source-query/v1"
+    },
+    "target_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "build_context_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "build_spec_digest": {
+      "$ref": "#/$defs/digest"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 192,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*(/[a-z0-9][a-z0-9._+-]*)+$"
+    }
+  }
+}

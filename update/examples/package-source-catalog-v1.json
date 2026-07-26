@@ -1,0 +1,16 @@
+{
+  "schema": "org.volatoo.package-source-catalog/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "sources": [
+    {
+      "id": "local",
+      "kind": "local",
+      "priority": 100,
+      "location": "/var/lib/volatoo/local-binpkgs/volatoo/amd64/glibc/openrc/23.0/base-v1",
+      "signature_policy": "machine-local",
+      "compatibility": "portage-resolved",
+      "gpg_home": "",
+      "trusted_fingerprints": []
+    }
+  ]
+}

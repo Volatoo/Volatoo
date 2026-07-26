@@ -46,8 +46,34 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Publish the Volatoo sources and pass live `emerge` installation tests
 - [x] Kernel config baseline (tmpfs, squashfs+zstd, overlayfs built-in)
 - [x] CI pipeline building a weekly minimal image
-- [ ] Image variants: `minimal` (console) first; `desktop` later
+- [ ] Init-system targets: build and test matching OpenRC and systemd base images
+  - [x] Parameterize signed stage3 resolution and Catalyst spec rendering
+  - [x] Add init-specific persistence integration to both image roots
+  - [x] Complete the first systemd Catalyst build and overlay-root BIOS/UEFI boot
+  - [ ] Complete the default full-copy systemd boot performance Gate
+- [ ] Let installers and image tooling select `openrc` or `systemd` explicitly
+- [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
+- [ ] Run the image, boot, update and rollback CI matrix against both init systems
+- [ ] Package-set variants: `minimal` (console) first; `desktop` later
 - [ ] In-place image update: download new image to state partition, reboot into it (A/B slots)
+
+### Phase 3U — Atomic package updates
+
+Keep package maintenance granular while preserving immutable, rollback-capable
+system generations. See `docs/design/atomic-package-updates.md`.
+
+- [x] Define the local-build/binhost/Portage Engine architecture and trust boundary
+- [x] P3U-0: versioned build-context and generation manifest contracts, including OpenRC/systemd target identity
+- [x] P3U-1: local Portage planner producing a canonical BuildSpec
+- [x] P3U-2: local binpkg and target-specific remote binhost acquisition for both init systems
+- [x] P3U-3: binary-only staged installation and SquashFS layer composer
+- [x] P3U-4: atomic generation selection, rollback and OpenRC/systemd QEMU boot coverage
+- [ ] P3U-5: service activation policies, garbage collection and base compaction
+  - [x] Add fail-closed live service activation with config and health checks
+  - [x] Add generation pinning, inspection and mark-and-sweep garbage collection
+  - [x] Add verified Docker base compaction and compaction receipts
+  - [x] Add the canonical Portage Engine adapter and mocked control-plane Gate
+  - [ ] Publish stable OpenRC/systemd Engine targets and run the real signed E2E
 
 ## Phase 4 — Installable release
 
@@ -59,8 +85,6 @@ Reproducible image builds instead of hand-rolled squashfs.
 
 ## Later / explore
 
-- systemd variant alongside OpenRC
-- `binpkg` host so users can `emerge` into the running tmpfs quickly, then bake
 - Encrypted state partition (LUKS) unlocked in initramfs
 - arm64 support
 - "dirty diff" tool: show what changed in tmpfs vs the image, to help decide what to persist or bake

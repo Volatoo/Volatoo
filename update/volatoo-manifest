@@ -1,0 +1,1576 @@
+#!/usr/bin/env python3
+
+"""Validate and identify immutable Volatoo update manifests."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import re
+import sys
+from pathlib import Path
+from urllib.parse import urlsplit
+from typing import Any, Callable
+
+
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
+GENERATION_SCHEMA = "org.volatoo.generation/v1"
+LAYER_PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
+LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
+PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
+PACKAGE_SOURCE_CATALOG_SCHEMA = "org.volatoo.package-source-catalog/v1"
+PACKAGE_SOURCE_QUERY_SCHEMA = "org.volatoo.package-source-query/v1"
+TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
+MAX_MANIFEST_SIZE = 1024 * 1024
+MAX_INTEGER = (1 << 63) - 1
+
+SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+REVISION_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._+-]{0,63}$")
+VALUE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$")
+CHOST_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+-]{2,127}$")
+TOKEN_RE = re.compile(r"^[A-Za-z0-9*~-][A-Za-z0-9._+@*~-]{0,255}$")
+FINGERPRINT_RE = re.compile(r"^[0-9A-F]{40}(?:[0-9A-F]{24})?$")
+STORE_PATH_RE = re.compile(r"^sha256/[0-9a-f]{64}\.gpkg\.tar$")
+
+
+class ManifestError(RuntimeError):
+    pass
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ManifestError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+
+def reject_nonstandard_constant(token: str) -> None:
+    raise ManifestError(f"unsupported JSON value: {token}")
+
+
+def read_manifest(path_text: str) -> dict[str, Any]:
+    try:
+        if path_text == "-":
+            raw = sys.stdin.buffer.read(MAX_MANIFEST_SIZE + 1)
+        else:
+            with Path(path_text).open("rb") as stream:
+                raw = stream.read(MAX_MANIFEST_SIZE + 1)
+        if len(raw) > MAX_MANIFEST_SIZE:
+            raise ManifestError(
+                f"manifest exceeds {MAX_MANIFEST_SIZE} bytes"
+            )
+        text = raw.decode("utf-8")
+    except (OSError, UnicodeError) as error:
+        raise ManifestError(f"cannot read {path_text}: {error}") from error
+
+    try:
+        value = json.loads(
+            text,
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except ManifestError:
+        raise
+    except json.JSONDecodeError as error:
+        raise ManifestError(
+            f"invalid JSON at line {error.lineno}, column {error.colno}: "
+            f"{error.msg}"
+        ) from error
+
+    if not isinstance(value, dict):
+        raise ManifestError("manifest root must be a JSON object")
+    return value
+
+
+def require_object(
+    value: Any,
+    path: str,
+    required: set[str],
+    optional: set[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ManifestError(f"{path} must be an object")
+    allowed = required | (optional or set())
+    missing = sorted(required - value.keys())
+    unknown = sorted(value.keys() - allowed)
+    if missing:
+        raise ManifestError(f"{path} is missing: {', '.join(missing)}")
+    if unknown:
+        raise ManifestError(f"{path} has unknown fields: {', '.join(unknown)}")
+    return value
+
+
+def require_string(
+    value: Any,
+    path: str,
+    pattern: re.Pattern[str] | None = None,
+    maximum: int = 256,
+) -> str:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        raise ManifestError(
+            f"{path} must be a non-empty string of at most {maximum} characters"
+        )
+    if pattern is not None and pattern.fullmatch(value) is None:
+        raise ManifestError(f"{path} has an invalid value: {value}")
+    return value
+
+
+def require_text(value: Any, path: str, maximum: int = 65536) -> str:
+    if not isinstance(value, str) or len(value) > maximum:
+        raise ManifestError(
+            f"{path} must be a string of at most {maximum} characters"
+        )
+    if any(
+        ord(character) < 32 and character not in "\t\n"
+        for character in value
+    ):
+        raise ManifestError(f"{path} contains unsupported control characters")
+    return value
+
+
+def require_ascii_token(value: Any, path: str, maximum: int = 512) -> str:
+    result = require_string(value, path, maximum=maximum)
+    if not result.isascii() or any(
+        character.isspace() or ord(character) < 33 for character in result
+    ):
+        raise ManifestError(f"{path} must be one printable ASCII token")
+    return result
+
+
+def require_digest(value: Any, path: str) -> str:
+    return require_string(value, path, SHA256_RE, 71)
+
+
+def require_revision(value: Any, path: str) -> str:
+    return require_string(value, path, REVISION_RE, 64)
+
+
+def require_identifier(value: Any, path: str) -> str:
+    result = require_string(value, path, maximum=192)
+    components = result.split("/")
+    if len(components) < 2 or any(
+        component in ("", ".", "..") or NAME_RE.fullmatch(component) is None
+        for component in components
+    ):
+        raise ManifestError(
+            f"{path} must be a slash-separated stable identifier: {result}"
+        )
+    return result
+
+
+def require_absolute_path(value: Any, path: str) -> str:
+    result = require_string(value, path, maximum=4096)
+    candidate = Path(result)
+    if (
+        not result.startswith("/")
+        or result == "/"
+        or "//" in result
+        or result.endswith("/")
+        or any(part in ("", ".", "..") for part in candidate.parts[1:])
+        or any(ord(character) < 32 for character in result)
+    ):
+        raise ManifestError(f"{path} must be a normalized absolute path")
+    return result
+
+
+def require_positive_integer(value: Any, path: str) -> int:
+    if type(value) is not int or value <= 0 or value > MAX_INTEGER:
+        raise ManifestError(
+            f"{path} must be a positive signed 64-bit integer"
+        )
+    return value
+
+
+def require_nonnegative_integer(
+    value: Any,
+    path: str,
+    maximum: int = MAX_INTEGER,
+) -> int:
+    if type(value) is not int or value < 0 or value > maximum:
+        raise ManifestError(
+            f"{path} must be a non-negative integer at most {maximum}"
+        )
+    return value
+
+
+def require_sorted_unique(
+    values: Any,
+    path: str,
+    validator: Callable[[Any, str], str],
+) -> list[str]:
+    if not isinstance(values, list) or not values:
+        raise ManifestError(f"{path} must be a non-empty array")
+    checked = [
+        validator(value, f"{path}[{index}]") for index, value in enumerate(values)
+    ]
+    if checked != sorted(set(checked)):
+        raise ManifestError(f"{path} must be sorted and contain no duplicates")
+    return checked
+
+
+def require_sorted_unique_or_empty(
+    values: Any,
+    path: str,
+    validator: Callable[[Any, str], str],
+) -> list[str]:
+    if not isinstance(values, list):
+        raise ManifestError(f"{path} must be an array")
+    checked = [
+        validator(value, f"{path}[{index}]") for index, value in enumerate(values)
+    ]
+    if checked != sorted(set(checked)):
+        raise ManifestError(f"{path} must be sorted and contain no duplicates")
+    return checked
+
+
+def validate_target(value: Any, path: str) -> str:
+    target = require_object(
+        value,
+        path,
+        {
+            "id",
+            "arch",
+            "chost",
+            "libc",
+            "abi",
+            "init",
+            "profile_id",
+            "profile_revision",
+            "cpu_class",
+        },
+    )
+    target_id = require_identifier(target["id"], f"{path}.id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError(f"{path}.id must use the volatoo/ namespace")
+    require_string(target["arch"], f"{path}.arch", NAME_RE, 64)
+    require_string(target["chost"], f"{path}.chost", CHOST_RE, 128)
+    if target["libc"] not in ("glibc", "musl"):
+        raise ManifestError(f"{path}.libc must be glibc or musl")
+    if target["init"] not in ("openrc", "systemd"):
+        raise ManifestError(f"{path}.init must be openrc or systemd")
+    profile_id = require_identifier(
+        target["profile_id"], f"{path}.profile_id"
+    )
+    require_revision(target["profile_revision"], f"{path}.profile_revision")
+    require_string(target["cpu_class"], f"{path}.cpu_class", NAME_RE, 64)
+    for field in ("arch", "libc", "init"):
+        expected = target[field]
+        if expected not in target_id.split("/"):
+            raise ManifestError(
+                f"{path}.id must include its {field} value: {expected}"
+            )
+    if target["init"] not in profile_id.split("/"):
+        raise ManifestError(
+            f"{path}.profile_id must include its init value: {target['init']}"
+        )
+
+    abi = require_object(
+        target["abi"],
+        f"{path}.abi",
+        {"mode", "values"},
+    )
+    if abi["mode"] not in ("multilib", "no-multilib"):
+        raise ManifestError(
+            f"{path}.abi.mode must be multilib or no-multilib"
+        )
+    require_sorted_unique(
+        abi["values"],
+        f"{path}.abi.values",
+        lambda item, item_path: require_string(
+            item, item_path, NAME_RE, 64
+        ),
+    )
+    return target_id
+
+
+def validate_build_context(manifest: dict[str, Any]) -> str:
+    context = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target",
+            "sources",
+            "base",
+            "toolchain",
+            "config_digest",
+            "world_digest",
+        },
+    )
+    if context["schema"] != BUILD_CONTEXT_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {BUILD_CONTEXT_SCHEMA}"
+        )
+    target_id = validate_target(context["target"], "manifest.target")
+
+    sources = context["sources"]
+    if not isinstance(sources, list) or not sources:
+        raise ManifestError("manifest.sources must be a non-empty array")
+    source_names: list[str] = []
+    for index, value in enumerate(sources):
+        path = f"manifest.sources[{index}]"
+        source = require_object(
+            value,
+            path,
+            {"name", "revision", "tree_digest"},
+        )
+        source_names.append(
+            require_string(source["name"], f"{path}.name", NAME_RE, 64)
+        )
+        require_revision(source["revision"], f"{path}.revision")
+        require_digest(source["tree_digest"], f"{path}.tree_digest")
+    if source_names != sorted(set(source_names)):
+        raise ManifestError(
+            "manifest.sources must be sorted by name and contain no duplicates"
+        )
+
+    base = require_object(
+        context["base"],
+        "manifest.base",
+        {"generation", "rootfs_digest"},
+    )
+    require_string(base["generation"], "manifest.base.generation", NAME_RE, 64)
+    require_digest(base["rootfs_digest"], "manifest.base.rootfs_digest")
+
+    toolchain = require_object(
+        context["toolchain"],
+        "manifest.toolchain",
+        {"portage_version", "digest"},
+    )
+    require_string(
+        toolchain["portage_version"],
+        "manifest.toolchain.portage_version",
+        VALUE_RE,
+        128,
+    )
+    require_digest(toolchain["digest"], "manifest.toolchain.digest")
+    require_digest(context["config_digest"], "manifest.config_digest")
+    require_digest(context["world_digest"], "manifest.world_digest")
+    return target_id
+
+
+def validate_build_spec(manifest: dict[str, Any]) -> str:
+    spec = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "request",
+            "resolver",
+            "packages",
+        },
+    )
+    if spec["schema"] != BUILD_SPEC_SCHEMA:
+        raise ManifestError(f"manifest.schema must be {BUILD_SPEC_SCHEMA}")
+    target_id = require_identifier(spec["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    require_digest(
+        spec["build_context_digest"],
+        "manifest.build_context_digest",
+    )
+
+    request = require_object(
+        spec["request"],
+        "manifest.request",
+        {"atoms", "selection"},
+    )
+    require_sorted_unique(
+        request["atoms"],
+        "manifest.request.atoms",
+        lambda item, item_path: require_ascii_token(item, item_path, 512),
+    )
+    if request["selection"] not in ("oneshot", "world"):
+        raise ManifestError(
+            "manifest.request.selection must be oneshot or world"
+        )
+
+    resolver = require_object(
+        spec["resolver"],
+        "manifest.resolver",
+        {"name", "version", "adapter", "options"},
+    )
+    if resolver["name"] != "portage":
+        raise ManifestError("manifest.resolver.name must be portage")
+    require_string(
+        resolver["version"],
+        "manifest.resolver.version",
+        VALUE_RE,
+        128,
+    )
+    require_string(
+        resolver["adapter"],
+        "manifest.resolver.adapter",
+        VALUE_RE,
+        128,
+    )
+    require_sorted_unique(
+        resolver["options"],
+        "manifest.resolver.options",
+        lambda item, item_path: require_ascii_token(item, item_path, 256),
+    )
+
+    packages = spec["packages"]
+    if not isinstance(packages, list):
+        raise ManifestError("manifest.packages must be an array")
+    package_ids: set[str] = set()
+    for index, value in enumerate(packages):
+        path = f"manifest.packages[{index}]"
+        package = require_object(
+            value,
+            path,
+            {
+                "sequence",
+                "cpv",
+                "repository",
+                "slot",
+                "subslot",
+                "eapi",
+                "operation",
+                "source_type",
+                "use",
+                "acceptance",
+                "build_flags",
+                "dependencies",
+                "metadata",
+            },
+        )
+        sequence = package["sequence"]
+        if type(sequence) is not int or sequence != index:
+            raise ManifestError(f"{path}.sequence must equal {index}")
+        cpv = require_ascii_token(package["cpv"], f"{path}.cpv", 512)
+        repository = require_string(
+            package["repository"],
+            f"{path}.repository",
+            NAME_RE,
+            64,
+        )
+        slot = require_string(package["slot"], f"{path}.slot", TOKEN_RE, 256)
+        subslot = require_string(
+            package["subslot"],
+            f"{path}.subslot",
+            TOKEN_RE,
+            256,
+        )
+        package_id = f"{cpv}:{slot}/{subslot}::{repository}"
+        if package_id in package_ids:
+            raise ManifestError(f"{path} duplicates package {package_id}")
+        package_ids.add(package_id)
+        require_string(package["eapi"], f"{path}.eapi", TOKEN_RE, 64)
+        if package["operation"] != "merge":
+            raise ManifestError(f"{path}.operation must be merge")
+        if package["source_type"] not in ("ebuild", "binary"):
+            raise ManifestError(
+                f"{path}.source_type must be ebuild or binary"
+            )
+
+        use = require_object(
+            package["use"],
+            f"{path}.use",
+            {"enabled", "iuse"},
+        )
+        for field in ("enabled", "iuse"):
+            require_sorted_unique_or_empty(
+                use[field],
+                f"{path}.use.{field}",
+                lambda item, item_path: require_string(
+                    item, item_path, TOKEN_RE, 256
+                ),
+            )
+
+        acceptance = require_object(
+            package["acceptance"],
+            f"{path}.acceptance",
+            {"keywords", "licenses"},
+        )
+        for field in ("keywords", "licenses"):
+            require_sorted_unique_or_empty(
+                acceptance[field],
+                f"{path}.acceptance.{field}",
+                lambda item, item_path: require_string(
+                    item, item_path, TOKEN_RE, 256
+                ),
+            )
+
+        build_flags = require_object(
+            package["build_flags"],
+            f"{path}.build_flags",
+            {
+                "cflags",
+                "cxxflags",
+                "fflags",
+                "fcflags",
+                "ldflags",
+                "features",
+            },
+        )
+        for field in ("cflags", "cxxflags", "fflags", "fcflags", "ldflags"):
+            require_text(
+                build_flags[field],
+                f"{path}.build_flags.{field}",
+                4096,
+            )
+        require_sorted_unique_or_empty(
+            build_flags["features"],
+            f"{path}.build_flags.features",
+            lambda item, item_path: require_string(
+                item, item_path, TOKEN_RE, 256
+            ),
+        )
+
+        dependencies = require_object(
+            package["dependencies"],
+            f"{path}.dependencies",
+            {"bdepend", "depend", "idepend", "pdepend", "rdepend"},
+        )
+        for field in ("bdepend", "depend", "idepend", "pdepend", "rdepend"):
+            require_text(
+                dependencies[field],
+                f"{path}.dependencies.{field}",
+            )
+
+        metadata = require_object(
+            package["metadata"],
+            f"{path}.metadata",
+            {"keywords", "license", "properties", "required_use", "restrict"},
+        )
+        for field in (
+            "keywords",
+            "license",
+            "properties",
+            "required_use",
+            "restrict",
+        ):
+            require_text(metadata[field], f"{path}.metadata.{field}")
+    return target_id
+
+
+def validate_package_source_query(manifest: dict[str, Any]) -> str:
+    query = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "build_spec_digest",
+        },
+    )
+    if query["schema"] != PACKAGE_SOURCE_QUERY_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {PACKAGE_SOURCE_QUERY_SCHEMA}"
+        )
+    target_id = require_identifier(query["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    require_digest(
+        query["build_context_digest"],
+        "manifest.build_context_digest",
+    )
+    require_digest(
+        query["build_spec_digest"],
+        "manifest.build_spec_digest",
+    )
+    return target_id
+
+
+def validate_source_trust(
+    source: dict[str, Any],
+    path: str,
+) -> None:
+    signature_policy = source["signature_policy"]
+    if signature_policy not in ("required", "machine-local"):
+        raise ManifestError(
+            f"{path}.signature_policy must be required or machine-local"
+        )
+    fingerprints = require_sorted_unique_or_empty(
+        source["trusted_fingerprints"],
+        f"{path}.trusted_fingerprints",
+        lambda item, item_path: require_string(
+            item, item_path, FINGERPRINT_RE, 64
+        ),
+    )
+    gpg_home = require_text(source["gpg_home"], f"{path}.gpg_home", 1024)
+    if signature_policy == "required":
+        if not fingerprints:
+            raise ManifestError(
+                f"{path}.trusted_fingerprints must not be empty"
+            )
+        if not gpg_home.startswith("/"):
+            raise ManifestError(f"{path}.gpg_home must be an absolute path")
+    elif source["kind"] != "local":
+        raise ManifestError(
+            f"{path}.machine-local policy requires a local source"
+        )
+    elif fingerprints or gpg_home:
+        raise ManifestError(
+            f"{path}.machine-local policy must not configure GPG trust"
+        )
+
+
+def validate_source_location(
+    kind: str,
+    location: str,
+    target_id: str,
+    path: str,
+) -> None:
+    target_suffix = "/" + target_id
+    if kind == "local":
+        if not location.startswith("/"):
+            raise ManifestError(f"{path}.location must be an absolute path")
+        normalized = str(Path(location))
+        if normalized != location.rstrip("/") or ".." in Path(location).parts:
+            raise ManifestError(f"{path}.location is not normalized")
+        if not normalized.endswith(target_suffix):
+            raise ManifestError(f"{path}.location must end with target_id")
+        return
+
+    parsed = urlsplit(location)
+    if (
+        parsed.scheme != "https"
+        or not parsed.netloc
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or ".." in Path(parsed.path).parts
+    ):
+        raise ManifestError(
+            f"{path}.location must be a credential-free HTTPS URL"
+        )
+    if not parsed.path.rstrip("/").endswith(target_suffix):
+        raise ManifestError(f"{path}.location path must end with target_id")
+
+
+def validate_package_source(
+    value: Any,
+    path: str,
+    target_id: str,
+) -> str:
+    source = require_object(
+        value,
+        path,
+        {
+            "id",
+            "kind",
+            "priority",
+            "location",
+            "signature_policy",
+            "compatibility",
+            "gpg_home",
+            "trusted_fingerprints",
+        },
+    )
+    source_id = require_string(source["id"], f"{path}.id", NAME_RE, 64)
+    if source["kind"] not in ("local", "remote"):
+        raise ManifestError(f"{path}.kind must be local or remote")
+    require_nonnegative_integer(source["priority"], f"{path}.priority", 1000)
+    location = require_string(
+        source["location"],
+        f"{path}.location",
+        maximum=2048,
+    )
+    if source["compatibility"] not in (
+        "volatoo-attested",
+        "portage-resolved",
+    ):
+        raise ManifestError(
+            f"{path}.compatibility must be volatoo-attested "
+            "or portage-resolved"
+        )
+    validate_source_trust(source, path)
+    validate_source_location(source["kind"], location, target_id, path)
+    return source_id
+
+
+def validate_package_source_catalog(manifest: dict[str, Any]) -> str:
+    catalog = require_object(
+        manifest,
+        "manifest",
+        {"schema", "target_id", "sources"},
+    )
+    if catalog["schema"] != PACKAGE_SOURCE_CATALOG_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {PACKAGE_SOURCE_CATALOG_SCHEMA}"
+        )
+    target_id = require_identifier(catalog["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+
+    sources = catalog["sources"]
+    if not isinstance(sources, list) or not sources:
+        raise ManifestError("manifest.sources must be a non-empty array")
+    source_ids: list[str] = []
+    for index, value in enumerate(sources):
+        path = f"manifest.sources[{index}]"
+        source_ids.append(
+            validate_package_source(value, path, target_id)
+        )
+
+    if source_ids != sorted(set(source_ids)):
+        raise ManifestError(
+            "manifest.sources must be sorted by id and contain no duplicates"
+        )
+    return target_id
+
+
+def validate_acquired_package(
+    value: Any,
+    path: str,
+    package_sequences: set[int],
+    store_paths: set[str],
+) -> int:
+    package = require_object(
+        value,
+        path,
+        {
+            "sequence",
+            "cpv",
+            "package_digest",
+            "source_id",
+            "source_kind",
+            "build_id",
+            "artifact_digest",
+            "artifact_size",
+            "store_path",
+            "signature",
+            "compatibility",
+        },
+    )
+    sequence = require_nonnegative_integer(
+        package["sequence"],
+        f"{path}.sequence",
+    )
+    if sequence in package_sequences:
+        raise ManifestError(f"{path}.sequence is duplicated")
+    package_sequences.add(sequence)
+    require_ascii_token(package["cpv"], f"{path}.cpv", 512)
+    require_digest(package["package_digest"], f"{path}.package_digest")
+    require_string(package["source_id"], f"{path}.source_id", NAME_RE, 64)
+    if package["source_kind"] not in ("local", "remote"):
+        raise ManifestError(f"{path}.source_kind must be local or remote")
+    require_text(package["build_id"], f"{path}.build_id", 128)
+    require_digest(package["artifact_digest"], f"{path}.artifact_digest")
+    require_positive_integer(package["artifact_size"], f"{path}.artifact_size")
+    store_path = require_string(
+        package["store_path"],
+        f"{path}.store_path",
+        STORE_PATH_RE,
+        96,
+    )
+    if store_path in store_paths:
+        raise ManifestError(f"{path}.store_path is duplicated")
+    store_paths.add(store_path)
+    if package["signature"] not in ("verified", "machine-local"):
+        raise ManifestError(
+            f"{path}.signature must be verified or machine-local"
+        )
+    if package["compatibility"] not in (
+        "volatoo-attested",
+        "portage-resolved",
+    ):
+        raise ManifestError(
+            f"{path}.compatibility must be volatoo-attested "
+            "or portage-resolved"
+        )
+    return sequence
+
+
+def validate_missing_package(
+    value: Any,
+    path: str,
+    missing_action: str,
+    occupied_sequences: set[int],
+) -> int:
+    item = require_object(value, path, {"sequence", "cpv", "action"})
+    sequence = require_nonnegative_integer(item["sequence"], f"{path}.sequence")
+    if sequence in occupied_sequences:
+        raise ManifestError(f"{path}.sequence is duplicated")
+    occupied_sequences.add(sequence)
+    require_ascii_token(item["cpv"], f"{path}.cpv", 512)
+    if item["action"] != missing_action:
+        raise ManifestError(f"{path}.action must equal manifest.missing_action")
+    return sequence
+
+
+def validate_package_acquisition(manifest: dict[str, Any]) -> str:
+    receipt = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "build_spec_digest",
+            "source_catalog_digest",
+            "complete",
+            "missing_action",
+            "packages",
+            "missing",
+        },
+    )
+    if receipt["schema"] != PACKAGE_ACQUISITION_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {PACKAGE_ACQUISITION_SCHEMA}"
+        )
+    target_id = require_identifier(receipt["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    for field in (
+        "build_context_digest",
+        "build_spec_digest",
+        "source_catalog_digest",
+    ):
+        require_digest(receipt[field], f"manifest.{field}")
+    if type(receipt["complete"]) is not bool:
+        raise ManifestError("manifest.complete must be a boolean")
+    if receipt["missing_action"] not in (
+        "fail",
+        "local-build",
+        "remote-build",
+    ):
+        raise ManifestError(
+            "manifest.missing_action must be fail, local-build or remote-build"
+        )
+
+    packages = receipt["packages"]
+    if not isinstance(packages, list):
+        raise ManifestError("manifest.packages must be an array")
+    package_sequences: set[int] = set()
+    package_sequence_order: list[int] = []
+    store_paths: set[str] = set()
+    for index, value in enumerate(packages):
+        path = f"manifest.packages[{index}]"
+        package_sequence_order.append(
+            validate_acquired_package(
+                value,
+                path,
+                package_sequences,
+                store_paths,
+            )
+        )
+    if package_sequence_order != sorted(package_sequence_order):
+        raise ManifestError("manifest.packages must be sorted by sequence")
+
+    missing = receipt["missing"]
+    if not isinstance(missing, list):
+        raise ManifestError("manifest.missing must be an array")
+    missing_sequences: set[int] = set()
+    missing_sequence_order: list[int] = []
+    occupied_sequences = package_sequences | missing_sequences
+    for index, value in enumerate(missing):
+        path = f"manifest.missing[{index}]"
+        sequence = validate_missing_package(
+            value,
+            path,
+            receipt["missing_action"],
+            occupied_sequences,
+        )
+        missing_sequences.add(sequence)
+        missing_sequence_order.append(sequence)
+    if missing_sequence_order != sorted(missing_sequence_order):
+        raise ManifestError("manifest.missing must be sorted by sequence")
+    if receipt["complete"] != (not missing):
+        raise ManifestError(
+            "manifest.complete must be true exactly when missing is empty"
+        )
+    return target_id
+
+
+def validate_path_manifest(
+    manifest: dict[str, Any],
+    expected_schema: str,
+) -> str:
+    value = require_object(
+        manifest,
+        "manifest",
+        {"schema", "target_id", "paths"},
+    )
+    if value["schema"] != expected_schema:
+        raise ManifestError(f"manifest.schema must be {expected_schema}")
+    target_id = require_identifier(value["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    paths = value["paths"]
+    if not isinstance(paths, list):
+        raise ManifestError("manifest.paths must be an array")
+    validated = [
+        require_absolute_path(item, f"manifest.paths[{index}]")
+        for index, item in enumerate(paths)
+    ]
+    if validated != sorted(set(validated)):
+        raise ManifestError(
+            "manifest.paths must be sorted and contain no duplicates"
+        )
+    if expected_schema == TOMBSTONES_SCHEMA:
+        selected = set(validated)
+        for path in validated:
+            parent = Path(path).parent
+            while str(parent) != "/":
+                if str(parent) in selected:
+                    raise ManifestError(
+                        "manifest.paths tombstones must be prefix-minimal"
+                    )
+                parent = parent.parent
+    return target_id
+
+
+def validate_layer_transaction(manifest: dict[str, Any]) -> str:
+    transaction = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "build_spec_digest",
+            "acquisition_digest",
+            "parent_generation_digest",
+            "portage",
+            "packages",
+            "filesystem",
+            "world_digest",
+        },
+    )
+    if transaction["schema"] != LAYER_TRANSACTION_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {LAYER_TRANSACTION_SCHEMA}"
+        )
+    target_id = require_identifier(
+        transaction["target_id"],
+        "manifest.target_id",
+    )
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    for field in (
+        "build_context_digest",
+        "build_spec_digest",
+        "acquisition_digest",
+        "parent_generation_digest",
+        "world_digest",
+    ):
+        require_digest(transaction[field], f"manifest.{field}")
+
+    portage = require_object(
+        transaction["portage"],
+        "manifest.portage",
+        {"version", "adapter", "options"},
+    )
+    require_string(portage["version"], "manifest.portage.version", VALUE_RE, 128)
+    if portage["adapter"] != "emerge-binary-only-v1":
+        raise ManifestError(
+            "manifest.portage.adapter must be emerge-binary-only-v1"
+        )
+    require_sorted_unique_or_empty(
+        portage["options"],
+        "manifest.portage.options",
+        lambda item, item_path: require_string(
+            item,
+            item_path,
+            maximum=256,
+        ),
+    )
+
+    packages = transaction["packages"]
+    if not isinstance(packages, list) or not packages:
+        raise ManifestError("manifest.packages must be a non-empty array")
+    sequences: list[int] = []
+    for index, value in enumerate(packages):
+        path = f"manifest.packages[{index}]"
+        package = require_object(
+            value,
+            path,
+            {
+                "sequence",
+                "cpv",
+                "package_digest",
+                "artifact_digest",
+                "build_id",
+            },
+        )
+        sequences.append(
+            require_nonnegative_integer(
+                package["sequence"],
+                f"{path}.sequence",
+            )
+        )
+        require_ascii_token(package["cpv"], f"{path}.cpv", 512)
+        require_digest(package["package_digest"], f"{path}.package_digest")
+        require_digest(package["artifact_digest"], f"{path}.artifact_digest")
+        require_text(package["build_id"], f"{path}.build_id", 128)
+    if sequences != sorted(set(sequences)):
+        raise ManifestError(
+            "manifest.packages must be sorted by unique sequence"
+        )
+
+    filesystem = require_object(
+        transaction["filesystem"],
+        "manifest.filesystem",
+        {
+            "changed_paths_digest",
+            "changed_paths_count",
+            "tombstones_digest",
+            "tombstones_count",
+            "rootfs_digest",
+            "rootfs_size",
+            "format",
+            "builder",
+        },
+    )
+    for field in (
+        "changed_paths_digest",
+        "tombstones_digest",
+        "rootfs_digest",
+    ):
+        require_digest(filesystem[field], f"manifest.filesystem.{field}")
+    require_positive_integer(
+        filesystem["changed_paths_count"],
+        "manifest.filesystem.changed_paths_count",
+    )
+    require_nonnegative_integer(
+        filesystem["tombstones_count"],
+        "manifest.filesystem.tombstones_count",
+    )
+    require_positive_integer(
+        filesystem["rootfs_size"],
+        "manifest.filesystem.rootfs_size",
+    )
+    if filesystem["format"] != "squashfs":
+        raise ManifestError("manifest.filesystem.format must be squashfs")
+    builder = require_object(
+        filesystem["builder"],
+        "manifest.filesystem.builder",
+        {
+            "implementation",
+            "version",
+            "compression",
+            "level",
+            "block_size",
+            "reproducible",
+        },
+    )
+    expected_builder = {
+        "implementation": "squashfs-tools",
+        "version": "4.7.5",
+        "compression": "zstd",
+        "level": 19,
+        "block_size": 1048576,
+        "reproducible": True,
+    }
+    if builder != expected_builder:
+        raise ManifestError("manifest.filesystem.builder is unsupported")
+    return target_id
+
+
+def validate_generation(manifest: dict[str, Any]) -> str:
+    generation = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "base",
+            "layers",
+        },
+    )
+    if generation["schema"] != GENERATION_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {GENERATION_SCHEMA}"
+        )
+    target_id = require_identifier(
+        generation["target_id"], "manifest.target_id"
+    )
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    require_digest(
+        generation["build_context_digest"],
+        "manifest.build_context_digest",
+    )
+
+    base = require_object(
+        generation["base"],
+        "manifest.base",
+        {"rootfs_digest", "rootfs_size", "format"},
+    )
+    require_digest(base["rootfs_digest"], "manifest.base.rootfs_digest")
+    require_positive_integer(base["rootfs_size"], "manifest.base.rootfs_size")
+    if base["format"] != "squashfs":
+        raise ManifestError("manifest.base.format must be squashfs")
+
+    layers = generation["layers"]
+    if not isinstance(layers, list):
+        raise ManifestError("manifest.layers must be an array")
+    rootfs_digests: set[str] = set()
+    transaction_digests: set[str] = set()
+    for index, value in enumerate(layers):
+        path = f"manifest.layers[{index}]"
+        layer = require_object(
+            value,
+            path,
+            {
+                "rootfs_digest",
+                "rootfs_size",
+                "format",
+                "tombstones_digest",
+                "transaction_digest",
+            },
+        )
+        rootfs_digest = require_digest(
+            layer["rootfs_digest"], f"{path}.rootfs_digest"
+        )
+        transaction_digest = require_digest(
+            layer["transaction_digest"], f"{path}.transaction_digest"
+        )
+        if rootfs_digest in rootfs_digests:
+            raise ManifestError(f"{path}.rootfs_digest is duplicated")
+        if transaction_digest in transaction_digests:
+            raise ManifestError(f"{path}.transaction_digest is duplicated")
+        rootfs_digests.add(rootfs_digest)
+        transaction_digests.add(transaction_digest)
+        require_positive_integer(layer["rootfs_size"], f"{path}.rootfs_size")
+        if layer["format"] != "squashfs":
+            raise ManifestError(f"{path}.format must be squashfs")
+        require_digest(
+            layer["tombstones_digest"], f"{path}.tombstones_digest"
+        )
+    return target_id
+
+
+def validate_manifest(manifest: dict[str, Any]) -> str:
+    schema = manifest.get("schema")
+    if schema == BUILD_CONTEXT_SCHEMA:
+        validate_build_context(manifest)
+    elif schema == BUILD_SPEC_SCHEMA:
+        validate_build_spec(manifest)
+    elif schema == GENERATION_SCHEMA:
+        validate_generation(manifest)
+    elif schema == LAYER_PATHS_SCHEMA:
+        validate_path_manifest(manifest, LAYER_PATHS_SCHEMA)
+    elif schema == LAYER_TRANSACTION_SCHEMA:
+        validate_layer_transaction(manifest)
+    elif schema == PACKAGE_ACQUISITION_SCHEMA:
+        validate_package_acquisition(manifest)
+    elif schema == PACKAGE_SOURCE_CATALOG_SCHEMA:
+        validate_package_source_catalog(manifest)
+    elif schema == PACKAGE_SOURCE_QUERY_SCHEMA:
+        validate_package_source_query(manifest)
+    elif schema == TOMBSTONES_SCHEMA:
+        validate_path_manifest(manifest, TOMBSTONES_SCHEMA)
+    else:
+        raise ManifestError(f"unsupported manifest schema: {schema!r}")
+    return schema
+
+
+def encode_canonical(value: dict[str, Any]) -> bytes:
+    encoded = json.dumps(
+        value,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return (encoded + "\n").encode("utf-8")
+
+
+def canonical_bytes(manifest: dict[str, Any]) -> bytes:
+    validate_manifest(manifest)
+    return encode_canonical(manifest)
+
+
+def manifest_digest(manifest: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(canonical_bytes(manifest)).hexdigest()
+
+
+def package_build_digest(
+    spec: dict[str, Any],
+    package: dict[str, Any],
+) -> str:
+    identity = {
+        "schema": "org.volatoo.package-build-identity/v1",
+        "target_id": spec["target_id"],
+        "build_context_digest": spec["build_context_digest"],
+        "package": package,
+    }
+    return "sha256:" + hashlib.sha256(encode_canonical(identity)).hexdigest()
+
+
+def command_validate(arguments: argparse.Namespace) -> None:
+    manifest = read_manifest(arguments.manifest)
+    schema = validate_manifest(manifest)
+    print(f"valid {schema}")
+
+
+def command_canonicalize(arguments: argparse.Namespace) -> None:
+    manifest = read_manifest(arguments.manifest)
+    sys.stdout.buffer.write(canonical_bytes(manifest))
+
+
+def command_digest(arguments: argparse.Namespace) -> None:
+    manifest = read_manifest(arguments.manifest)
+    print(manifest_digest(manifest))
+
+
+def command_verify_generation(arguments: argparse.Namespace) -> None:
+    generation = read_manifest(arguments.generation)
+    context = read_manifest(arguments.build_context)
+    generation_target = validate_generation(generation)
+    context_target = validate_build_context(context)
+    if generation_target != context_target:
+        raise ManifestError(
+            "generation target_id does not match build context target.id"
+        )
+    expected_digest = manifest_digest(context)
+    if generation["build_context_digest"] != expected_digest:
+        raise ManifestError(
+            "generation build_context_digest does not match build context"
+        )
+    if (
+        generation["base"]["rootfs_digest"]
+        != context["base"]["rootfs_digest"]
+    ):
+        raise ManifestError(
+            "generation base rootfs_digest does not match build context"
+        )
+    print(f"valid {GENERATION_SCHEMA} with {BUILD_CONTEXT_SCHEMA}")
+
+
+def command_verify_build_spec(arguments: argparse.Namespace) -> None:
+    spec = read_manifest(arguments.build_spec)
+    context = read_manifest(arguments.build_context)
+    spec_target = validate_build_spec(spec)
+    context_target = validate_build_context(context)
+    if spec_target != context_target:
+        raise ManifestError(
+            "BuildSpec target_id does not match build context target.id"
+        )
+    expected_digest = manifest_digest(context)
+    if spec["build_context_digest"] != expected_digest:
+        raise ManifestError(
+            "BuildSpec build_context_digest does not match build context"
+        )
+    if (
+        spec["resolver"]["version"]
+        != context["toolchain"]["portage_version"]
+    ):
+        raise ManifestError(
+            "BuildSpec resolver.version does not match build context Portage"
+        )
+    print(f"valid {BUILD_SPEC_SCHEMA} with {BUILD_CONTEXT_SCHEMA}")
+
+
+def command_verify_package_source_query(
+    arguments: argparse.Namespace,
+) -> None:
+    query = read_manifest(arguments.query)
+    spec = read_manifest(arguments.build_spec)
+    context = read_manifest(arguments.build_context)
+    query_target = validate_package_source_query(query)
+    spec_target = validate_build_spec(spec)
+    context_target = validate_build_context(context)
+    if not query_target == spec_target == context_target:
+        raise ManifestError(
+            "package-source query, BuildSpec and build context targets differ"
+        )
+    expected_context_digest = manifest_digest(context)
+    if query["build_context_digest"] != expected_context_digest:
+        raise ManifestError(
+            "package-source query build_context_digest does not match context"
+        )
+    if spec["build_context_digest"] != expected_context_digest:
+        raise ManifestError(
+            "BuildSpec build_context_digest does not match build context"
+        )
+    if query["build_spec_digest"] != manifest_digest(spec):
+        raise ManifestError(
+            "package-source query build_spec_digest does not match BuildSpec"
+        )
+    if (
+        spec["resolver"]["version"]
+        != context["toolchain"]["portage_version"]
+    ):
+        raise ManifestError(
+            "BuildSpec resolver.version does not match build context Portage"
+        )
+    print(
+        f"valid {PACKAGE_SOURCE_QUERY_SCHEMA} with "
+        f"{BUILD_SPEC_SCHEMA} and {BUILD_CONTEXT_SCHEMA}"
+    )
+
+
+def command_verify_acquisition(arguments: argparse.Namespace) -> None:
+    receipt = read_manifest(arguments.receipt)
+    spec = read_manifest(arguments.build_spec)
+    context = read_manifest(arguments.build_context)
+    catalog = read_manifest(arguments.source_catalog)
+    receipt_target = validate_package_acquisition(receipt)
+    spec_target = validate_build_spec(spec)
+    context_target = validate_build_context(context)
+    catalog_target = validate_package_source_catalog(catalog)
+    if not receipt_target == spec_target == context_target == catalog_target:
+        raise ManifestError(
+            "acquisition, BuildSpec, build context and source targets differ"
+        )
+    expected_context_digest = manifest_digest(context)
+    expected_spec_digest = manifest_digest(spec)
+    expected_catalog_digest = manifest_digest(catalog)
+    if receipt["build_context_digest"] != expected_context_digest:
+        raise ManifestError(
+            "acquisition build_context_digest does not match context"
+        )
+    if spec["build_context_digest"] != expected_context_digest:
+        raise ManifestError(
+            "BuildSpec build_context_digest does not match build context"
+        )
+    if receipt["build_spec_digest"] != expected_spec_digest:
+        raise ManifestError(
+            "acquisition build_spec_digest does not match BuildSpec"
+        )
+    if receipt["source_catalog_digest"] != expected_catalog_digest:
+        raise ManifestError(
+            "acquisition source_catalog_digest does not match catalog"
+        )
+
+    sources = {source["id"]: source for source in catalog["sources"]}
+    covered: dict[int, str] = {}
+    for package in receipt["packages"]:
+        sequence = package["sequence"]
+        if sequence >= len(spec["packages"]):
+            raise ManifestError(
+                f"acquisition package sequence {sequence} is out of range"
+            )
+        expected = spec["packages"][sequence]
+        if package["cpv"] != expected["cpv"]:
+            raise ManifestError(
+                f"acquisition package {sequence} CPV does not match BuildSpec"
+            )
+        if package["package_digest"] != package_build_digest(spec, expected):
+            raise ManifestError(
+                f"acquisition package {sequence} digest does not match BuildSpec"
+            )
+        source = sources.get(package["source_id"])
+        if source is None:
+            raise ManifestError(
+                f"acquisition package {sequence} uses an unknown source"
+            )
+        if package["source_kind"] != source["kind"]:
+            raise ManifestError(
+                f"acquisition package {sequence} source kind differs"
+            )
+        expected_signature = (
+            "verified"
+            if source["signature_policy"] == "required"
+            else "machine-local"
+        )
+        if package["signature"] != expected_signature:
+            raise ManifestError(
+                f"acquisition package {sequence} signature policy differs"
+            )
+        if package["compatibility"] != source["compatibility"]:
+            raise ManifestError(
+                f"acquisition package {sequence} compatibility differs"
+            )
+        covered[sequence] = package["cpv"]
+
+    for item in receipt["missing"]:
+        sequence = item["sequence"]
+        if sequence >= len(spec["packages"]):
+            raise ManifestError(
+                f"acquisition missing sequence {sequence} is out of range"
+            )
+        expected = spec["packages"][sequence]
+        if item["cpv"] != expected["cpv"]:
+            raise ManifestError(
+                f"acquisition missing {sequence} CPV does not match BuildSpec"
+            )
+        covered[sequence] = item["cpv"]
+
+    if sorted(covered) != list(range(len(spec["packages"]))):
+        raise ManifestError(
+            "acquisition does not cover every BuildSpec package exactly once"
+        )
+    print(
+        f"valid {PACKAGE_ACQUISITION_SCHEMA} with "
+        f"{BUILD_SPEC_SCHEMA}, {BUILD_CONTEXT_SCHEMA} and "
+        f"{PACKAGE_SOURCE_CATALOG_SCHEMA}"
+    )
+
+
+def command_verify_layer_transaction(arguments: argparse.Namespace) -> None:
+    transaction = read_manifest(arguments.transaction)
+    generation = read_manifest(arguments.generation)
+    parent = read_manifest(arguments.parent_generation)
+    context = read_manifest(arguments.build_context)
+    spec = read_manifest(arguments.build_spec)
+    acquisition = read_manifest(arguments.acquisition)
+    changed = read_manifest(arguments.changed_paths)
+    tombstones = read_manifest(arguments.tombstones)
+
+    targets = {
+        validate_layer_transaction(transaction),
+        validate_generation(generation),
+        validate_generation(parent),
+        validate_build_context(context),
+        validate_build_spec(spec),
+        validate_package_acquisition(acquisition),
+        validate_path_manifest(changed, LAYER_PATHS_SCHEMA),
+        validate_path_manifest(tombstones, TOMBSTONES_SCHEMA),
+    }
+    if len(targets) != 1:
+        raise ManifestError("layer transaction contract targets differ")
+
+    context_digest = manifest_digest(context)
+    spec_digest = manifest_digest(spec)
+    acquisition_digest = manifest_digest(acquisition)
+    parent_digest = manifest_digest(parent)
+    references = {
+        "build_context_digest": context_digest,
+        "build_spec_digest": spec_digest,
+        "acquisition_digest": acquisition_digest,
+        "parent_generation_digest": parent_digest,
+    }
+    for field, expected in references.items():
+        if transaction[field] != expected:
+            raise ManifestError(f"layer transaction {field} mismatch")
+    if spec["build_context_digest"] != context_digest:
+        raise ManifestError("BuildSpec does not reference build context")
+    if acquisition["build_context_digest"] != context_digest:
+        raise ManifestError("acquisition does not reference build context")
+    if acquisition["build_spec_digest"] != spec_digest:
+        raise ManifestError("acquisition does not reference BuildSpec")
+    if not acquisition["complete"] or acquisition["missing"]:
+        raise ManifestError("layer transaction requires complete acquisition")
+    if transaction["portage"]["version"] != context["toolchain"][
+        "portage_version"
+    ]:
+        raise ManifestError("layer transaction Portage version mismatch")
+
+    expected_packages = [
+        {
+            "sequence": package["sequence"],
+            "cpv": package["cpv"],
+            "package_digest": package["package_digest"],
+            "artifact_digest": package["artifact_digest"],
+            "build_id": package["build_id"],
+        }
+        for package in acquisition["packages"]
+    ]
+    if transaction["packages"] != expected_packages:
+        raise ManifestError(
+            "layer transaction packages differ from acquisition"
+        )
+    filesystem = transaction["filesystem"]
+    if filesystem["changed_paths_digest"] != manifest_digest(changed):
+        raise ManifestError("layer transaction changed paths digest mismatch")
+    if filesystem["changed_paths_count"] != len(changed["paths"]):
+        raise ManifestError("layer transaction changed paths count mismatch")
+    if filesystem["tombstones_digest"] != manifest_digest(tombstones):
+        raise ManifestError("layer transaction tombstones digest mismatch")
+    if filesystem["tombstones_count"] != len(tombstones["paths"]):
+        raise ManifestError("layer transaction tombstones count mismatch")
+
+    expected_layer = {
+        "rootfs_digest": filesystem["rootfs_digest"],
+        "rootfs_size": filesystem["rootfs_size"],
+        "format": filesystem["format"],
+        "tombstones_digest": filesystem["tombstones_digest"],
+        "transaction_digest": manifest_digest(transaction),
+    }
+    if generation["base"] != parent["base"]:
+        raise ManifestError("generation candidate changes parent base")
+    if generation["build_context_digest"] != context_digest:
+        raise ManifestError("generation candidate context digest mismatch")
+    if generation["layers"] != [*parent["layers"], expected_layer]:
+        raise ManifestError(
+            "generation candidate does not append exactly one transaction"
+        )
+    print(
+        f"valid {LAYER_TRANSACTION_SCHEMA} and generation candidate"
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Validate and identify immutable Volatoo manifests."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    for name, handler in (
+        ("validate", command_validate),
+        ("canonicalize", command_canonicalize),
+        ("digest", command_digest),
+    ):
+        command = subparsers.add_parser(name)
+        command.add_argument("manifest", help="manifest path, or - for stdin")
+        command.set_defaults(handler=handler)
+
+    verify = subparsers.add_parser(
+        "verify-generation",
+        help="verify that a generation references a build context",
+    )
+    verify.add_argument("generation")
+    verify.add_argument("build_context")
+    verify.set_defaults(handler=command_verify_generation)
+
+    verify_spec = subparsers.add_parser(
+        "verify-build-spec",
+        help="verify that a BuildSpec references a build context",
+    )
+    verify_spec.add_argument("build_spec")
+    verify_spec.add_argument("build_context")
+    verify_spec.set_defaults(handler=command_verify_build_spec)
+
+    verify_query = subparsers.add_parser(
+        "verify-package-source-query",
+        help="verify a package-source query, BuildSpec and build context",
+    )
+    verify_query.add_argument("query")
+    verify_query.add_argument("build_spec")
+    verify_query.add_argument("build_context")
+    verify_query.set_defaults(handler=command_verify_package_source_query)
+
+    verify_acquisition = subparsers.add_parser(
+        "verify-acquisition",
+        help="verify an acquisition receipt and all referenced contracts",
+    )
+    verify_acquisition.add_argument("receipt")
+    verify_acquisition.add_argument("build_spec")
+    verify_acquisition.add_argument("build_context")
+    verify_acquisition.add_argument("source_catalog")
+    verify_acquisition.set_defaults(handler=command_verify_acquisition)
+
+    verify_layer = subparsers.add_parser(
+        "verify-layer-transaction",
+        help="verify a layer transaction and generation candidate",
+    )
+    verify_layer.add_argument("transaction")
+    verify_layer.add_argument("generation")
+    verify_layer.add_argument("parent_generation")
+    verify_layer.add_argument("build_context")
+    verify_layer.add_argument("build_spec")
+    verify_layer.add_argument("acquisition")
+    verify_layer.add_argument("changed_paths")
+    verify_layer.add_argument("tombstones")
+    verify_layer.set_defaults(handler=command_verify_layer_transaction)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        arguments.handler(arguments)
+    except ManifestError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

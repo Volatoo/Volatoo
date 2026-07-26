@@ -12,7 +12,9 @@
 - **A pristine system on every boot** — the running system is disposable by construction. Reboot and you are back to a known-good image. Configuration drift, leftover state, and half-finished experiments evaporate.
 - **Practical immutability without read-only pain** — unlike image-based immutable distros, `/` stays fully writable. You can `emerge` packages, edit anything, break anything. It just doesn't survive a reboot unless you ask it to.
 - **Zero disk wear, optional disk at all** — the storage device is only touched to load the image and to sync explicitly persisted state. A Volatoo machine can run diskless from PXE.
-- **Gentoo underneath** — full Portage, your USE flags, your kernel. Volatoo is a boot/lifecycle layer on top of Gentoo, not a fork of it.
+- **Gentoo underneath** — full Portage, your USE flags, your kernel and your
+  choice of OpenRC or systemd. Volatoo is a boot/lifecycle layer on top of
+  Gentoo, not a fork of it.
 
 ## How it works (design)
 
@@ -21,13 +23,14 @@ bootloader
    └─ kernel + volatoo-initramfs
         ├─ locate system image (disk / USB / PXE)
         ├─ discover the optional VOLATOO-STATE filesystem
-        ├─ verify its configured SHA-256 digest
+        ├─ select and verify current (or previous) system generation
+        ├─ verify the base, ordered layers, tombstones, and provenance objects
         ├─ mount tmpfs on /newroot
-        ├─ copy the squashfs contents into tmpfs
+        ├─ materialize the base plus system layers
         ├─ apply persistence policies (/etc, /var, /home …)
         ├─ restore machine identity and persistent logs
         └─ switch_root into RAM
-             └─ OpenRC boots a normal Gentoo — from memory
+             └─ the selected init system boots a normal Gentoo — from memory
 ```
 
 Three cooperating pieces:
@@ -47,10 +50,18 @@ Additional persistence is opt-in and declarative:
 
 - **bind/overlay paths** — e.g. `/home`, `/var/lib` mounted from real storage at boot
 - **sync-on-demand / sync-on-shutdown** — e.g. `/etc` snapshots written back to the state partition
-- **rebuild into the image** — the "correct" way to make a change permanent: bake it into the next system image
+- **promote into a system generation** — package transactions become small,
+  immutable system layers; complete image rebuilds are reserved for releases
+  and layer compaction
 
 See [`docs/design/machine-identity.md`](docs/design/machine-identity.md) for
 the machine-id, SSH host-key, log, and opt-out semantics.
+The atomic package update and Portage Engine boundary is specified in
+[`docs/design/atomic-package-updates.md`](docs/design/atomic-package-updates.md).
+OpenRC and systemd minimal images both pass the overlay-root BIOS and UEFI
+boot gates. They are separate, first-class release targets; users select one
+during image installation or generation selection rather than converting the
+init system with an ordinary package layer.
 
 ## Requirements (target)
 
@@ -65,6 +76,7 @@ initramfs/   standalone volatoo-initramfs sources and default configuration
 image/       image build specs (catalyst specs, package sets, profiles)
 kernel/      amd64 kernel baseline and build guidance
 persist/     volatoo-persist tool and default policies
+update/      atomic update contracts, binpkg acquisition and layer composition
 docs/        design notes and user documentation
 ```
 

@@ -1,0 +1,1325 @@
+#!/usr/bin/env python3
+
+"""Publish, select and inspect immutable Volatoo system generations."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import re
+import runpy
+import shutil
+import stat
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+GENERATION_SCHEMA = "org.volatoo.generation/v1"
+LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
+TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
+COMPACTION_SCHEMA = "org.volatoo.compaction-receipt/v1"
+DIGEST_PREFIX = "sha256:"
+BOOT_PLAN_HEADER = "VOLATOO_GENERATION_V1"
+PIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+class GenerationError(RuntimeError):
+    pass
+
+
+def load_contracts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-manifest")))
+
+
+def digest_bytes(value: bytes) -> str:
+    return DIGEST_PREFIX + hashlib.sha256(value).hexdigest()
+
+
+def digest_file(path: Path) -> tuple[str, int]:
+    if path.is_symlink() or not path.is_file():
+        raise GenerationError(f"object must be a regular file: {path}")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+    except OSError as error:
+        raise GenerationError(f"cannot hash {path}: {error}") from error
+    return DIGEST_PREFIX + digest.hexdigest(), size
+
+
+def digest_name(digest: str) -> str:
+    if (
+        not digest.startswith(DIGEST_PREFIX)
+        or len(digest) != 71
+        or any(character not in "0123456789abcdef" for character in digest[7:])
+    ):
+        raise GenerationError(f"invalid SHA-256 digest: {digest}")
+    return digest[7:]
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, value: bytes, mode: int = 0o644) -> None:
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.tmp-",
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise GenerationError(f"cannot atomically write {path}: {error}") from error
+
+
+@contextmanager
+def mutation_lock(system: Path) -> Any:
+    lock_path = system / "lock"
+    try:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        with os.fdopen(descriptor, "r+b") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise GenerationError("system generation lock is not a regular file")
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            yield
+    except OSError as error:
+        raise GenerationError(f"cannot lock system generation state: {error}") from error
+
+
+def require_directory(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise GenerationError(f"{description} is missing or unsafe: {path}")
+
+
+def ensure_safe_directory(
+    path: Path,
+    description: str,
+    create: bool = False,
+) -> None:
+    if path.is_symlink():
+        raise GenerationError(f"{description} must not be a symbolic link: {path}")
+    if path.exists():
+        if not path.is_dir():
+            raise GenerationError(f"{description} is not a directory: {path}")
+        return
+    if not create:
+        raise GenerationError(f"{description} is missing: {path}")
+    try:
+        path.mkdir()
+    except OSError as error:
+        raise GenerationError(f"cannot create {description}: {error}") from error
+
+
+def require_regular_file(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise GenerationError(f"{description} is missing or unsafe: {path}")
+
+
+def state_system(state: Path) -> Path:
+    state = state.resolve()
+    volatoo = state / "volatoo"
+    require_directory(volatoo, "Volatoo state root")
+    marker = volatoo / "layout-version"
+    require_regular_file(marker, "state layout marker")
+    try:
+        version = marker.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read state layout marker: {error}") from error
+    if version != "1":
+        raise GenerationError(
+            f"system generations require state layout version 1, found {version!r}"
+        )
+    system = volatoo / "system"
+    system_marker = system / "layout-version"
+    require_regular_file(system_marker, "system layout marker")
+    try:
+        system_version = system_marker.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read system layout marker: {error}") from error
+    if system_version != "1":
+        raise GenerationError(f"unsupported system layout version: {system_version!r}")
+    for relative in (
+        "objects/sha256",
+        "manifests",
+        "plans",
+        "pins",
+        "activations",
+        "compactions",
+        "staging",
+    ):
+        require_directory(system / relative, f"system/{relative}")
+    return system
+
+
+def migrate_state(arguments: argparse.Namespace) -> None:
+    state = arguments.state.resolve()
+    volatoo = state / "volatoo"
+    require_directory(volatoo, "Volatoo state root")
+    marker = volatoo / "layout-version"
+    require_regular_file(marker, "state layout marker")
+    try:
+        version = marker.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read state layout marker: {error}") from error
+    if version != "1":
+        raise GenerationError(f"unsupported state layout version: {version!r}")
+    for relative in (
+        "config",
+        "data/bind",
+        "data/identity",
+        "data/overlay",
+        "data/sync",
+        "snapshots",
+    ):
+        require_directory(volatoo / relative, f"state/{relative}")
+    system = volatoo / "system"
+    if system.exists() or system.is_symlink():
+        require_directory(system, "state/system")
+    else:
+        temporary = volatoo / ".system-migration"
+        try:
+            ensure_safe_directory(
+                temporary,
+                "state layout migration directory",
+                create=True,
+            )
+            ensure_safe_directory(
+                temporary / "objects",
+                "state layout object directory",
+                create=True,
+            )
+            for relative in (
+                "objects/sha256",
+                "manifests",
+                "plans",
+                "pins",
+                "activations",
+                "compactions",
+                "staging",
+            ):
+                ensure_safe_directory(
+                    temporary / relative,
+                    f"state layout {relative}",
+                    create=True,
+                )
+            atomic_write(temporary / "layout-version", b"1\n", 0o644)
+            os.chmod(temporary, 0o700)
+            os.chmod(temporary / "staging", 0o700)
+            fsync_directory(temporary / "objects")
+            fsync_directory(temporary)
+            os.replace(temporary, system)
+            fsync_directory(volatoo)
+        except OSError as error:
+            raise GenerationError(f"cannot create system layout: {error}") from error
+    for relative in (
+        "objects/sha256",
+        "manifests",
+        "plans",
+        "pins",
+        "activations",
+        "compactions",
+        "staging",
+    ):
+        ensure_safe_directory(
+            system / relative,
+            f"state/system/{relative}",
+            create=True,
+        )
+    system_marker = system / "layout-version"
+    if system_marker.exists() or system_marker.is_symlink():
+        require_regular_file(system_marker, "system layout marker")
+        if system_marker.read_text(encoding="ascii").strip() != "1":
+            raise GenerationError("unsupported system layout version")
+    else:
+        atomic_write(system_marker, b"1\n", 0o644)
+    print("enabled system layout version 1")
+
+
+def read_contract(
+    contracts: dict[str, Any],
+    path: Path,
+    expected_schema: str,
+) -> dict[str, Any]:
+    try:
+        value = contracts["read_manifest"](str(path))
+        contracts["validate_manifest"](value)
+    except RuntimeError as error:
+        raise GenerationError(str(error)) from error
+    if value["schema"] != expected_schema:
+        raise GenerationError(f"{path} must use {expected_schema}")
+    return value
+
+
+def read_canonical_contract(
+    contracts: dict[str, Any],
+    path: Path,
+    expected_schema: str,
+) -> tuple[dict[str, Any], bytes]:
+    value = read_contract(contracts, path, expected_schema)
+    canonical = contracts["canonical_bytes"](value)
+    try:
+        actual = path.read_bytes()
+    except OSError as error:
+        raise GenerationError(f"cannot read {path}: {error}") from error
+    if actual != canonical:
+        raise GenerationError(f"contract is not canonical JSON: {path}")
+    return value, canonical
+
+
+def object_path(system: Path, digest: str) -> Path:
+    return system / "objects/sha256" / digest_name(digest)
+
+
+def publish_object(
+    system: Path,
+    source: Path,
+    content: bytes | None = None,
+) -> tuple[str, int, Path]:
+    if content is None:
+        digest, size = digest_file(source)
+    else:
+        digest = digest_bytes(content)
+        size = len(content)
+    destination = object_path(system, digest)
+    if destination.exists() or destination.is_symlink():
+        require_regular_file(destination, "existing content-addressed object")
+        existing_digest, existing_size = digest_file(destination)
+        if existing_digest != digest or existing_size != size:
+            raise GenerationError(f"existing object is corrupt: {destination}")
+        return digest, size, destination
+
+    temporary = system / "staging" / (
+        f".object-{digest_name(digest)}-{os.getpid()}"
+    )
+    try:
+        with temporary.open("xb") as output_stream:
+            if content is None:
+                with source.open("rb") as input_stream:
+                    shutil.copyfileobj(input_stream, output_stream, 1024 * 1024)
+            else:
+                output_stream.write(content)
+            output_stream.flush()
+            os.fsync(output_stream.fileno())
+        os.chmod(temporary, 0o444)
+        copied_digest, copied_size = digest_file(temporary)
+        if copied_digest != digest or copied_size != size:
+            raise GenerationError(f"object changed while being copied: {source}")
+        os.replace(temporary, destination)
+        fsync_directory(destination.parent)
+    except (OSError, GenerationError) as error:
+        temporary.unlink(missing_ok=True)
+        if isinstance(error, GenerationError):
+            raise
+        raise GenerationError(f"cannot publish object {source}: {error}") from error
+    return digest, size, destination
+
+
+def publish_supplied_object(
+    contracts: dict[str, Any],
+    system: Path,
+    source: Path,
+) -> tuple[str, int, Path]:
+    try:
+        value = contracts["read_manifest"](str(source))
+        contracts["validate_manifest"](value)
+    except RuntimeError:
+        return publish_object(system, source)
+    canonical = contracts["canonical_bytes"](value)
+    return publish_object(system, source, canonical)
+
+
+def resolve_object(
+    system: Path,
+    supplied: dict[str, Path],
+    digest: str,
+) -> Path:
+    path = supplied.get(digest, object_path(system, digest))
+    require_regular_file(path, f"object {digest}")
+    actual_digest, _ = digest_file(path)
+    if actual_digest != digest:
+        raise GenerationError(f"object digest mismatch: {path}")
+    return path
+
+
+def require_squashfs(path: Path, expected_size: int) -> None:
+    _, size = digest_file(path)
+    if size != expected_size:
+        raise GenerationError(
+            f"SquashFS size mismatch for {path}: expected {expected_size}, got {size}"
+        )
+    try:
+        with path.open("rb") as stream:
+            magic = stream.read(4)
+    except OSError as error:
+        raise GenerationError(f"cannot inspect SquashFS {path}: {error}") from error
+    if magic != b"hsqs":
+        raise GenerationError(f"object is not a SquashFS filesystem: {path}")
+
+
+def boot_plan(
+    generation_digest: str,
+    generation: dict[str, Any],
+    tombstones: list[dict[str, Any]],
+) -> bytes:
+    lines = [
+        BOOT_PLAN_HEADER,
+        f"generation {generation_digest}",
+        f"target {generation['target_id']}",
+        f"context {generation['build_context_digest']}",
+        "base "
+        f"{generation['base']['rootfs_digest']} "
+        f"{generation['base']['rootfs_size']}",
+    ]
+    for layer, tombstone in zip(generation["layers"], tombstones):
+        lines.append(
+            "layer "
+            f"{layer['rootfs_digest']} "
+            f"{layer['rootfs_size']} "
+            f"{layer['tombstones_digest']} "
+            f"{layer['transaction_digest']}"
+        )
+        lines.extend(f"remove {path}" for path in tombstone["paths"])
+        lines.append("endlayer")
+    lines.append("end")
+    return ("\n".join(lines) + "\n").encode("utf-8")
+
+
+def _publish_generation(arguments: argparse.Namespace) -> None:
+    contracts = load_contracts()
+    system = state_system(arguments.state)
+    generation, generation_bytes = read_canonical_contract(
+        contracts,
+        arguments.generation,
+        GENERATION_SCHEMA,
+    )
+    generation_digest = digest_bytes(generation_bytes)
+
+    supplied: dict[str, Path] = {}
+    for source in arguments.object:
+        digest, _, destination = publish_supplied_object(
+            contracts,
+            system,
+            source,
+        )
+        if digest in supplied:
+            raise GenerationError(f"duplicate object digest supplied: {digest}")
+        supplied[digest] = destination
+
+    context_path = resolve_object(
+        system,
+        supplied,
+        generation["build_context_digest"],
+    )
+    context = read_contract(contracts, context_path, BUILD_CONTEXT_SCHEMA)
+    if context["target"]["id"] != generation["target_id"]:
+        raise GenerationError("generation and build context targets differ")
+
+    base = generation["base"]
+    base_path = resolve_object(system, supplied, base["rootfs_digest"])
+    require_squashfs(base_path, base["rootfs_size"])
+
+    tombstone_values: list[dict[str, Any]] = []
+    for number, layer in enumerate(generation["layers"]):
+        rootfs_path = resolve_object(system, supplied, layer["rootfs_digest"])
+        require_squashfs(rootfs_path, layer["rootfs_size"])
+        tombstone_path = resolve_object(
+            system,
+            supplied,
+            layer["tombstones_digest"],
+        )
+        tombstone = read_contract(
+            contracts,
+            tombstone_path,
+            TOMBSTONES_SCHEMA,
+        )
+        transaction_path = resolve_object(
+            system,
+            supplied,
+            layer["transaction_digest"],
+        )
+        transaction = read_contract(
+            contracts,
+            transaction_path,
+            LAYER_TRANSACTION_SCHEMA,
+        )
+        if transaction["target_id"] != generation["target_id"]:
+            raise GenerationError(
+                f"layer {number} transaction target differs from generation"
+            )
+        filesystem = transaction["filesystem"]
+        if (
+            filesystem["rootfs_digest"] != layer["rootfs_digest"]
+            or filesystem["rootfs_size"] != layer["rootfs_size"]
+            or filesystem["tombstones_digest"] != layer["tombstones_digest"]
+        ):
+            raise GenerationError(
+                f"layer {number} transaction filesystem references differ"
+            )
+        if filesystem["tombstones_count"] != len(tombstone["paths"]):
+            raise GenerationError(
+                f"layer {number} transaction tombstone count differs"
+            )
+        tombstone_values.append(tombstone)
+
+    manifest_path = (
+        system / "manifests" / f"{digest_name(generation_digest)}.json"
+    )
+    if manifest_path.exists() or manifest_path.is_symlink():
+        require_regular_file(manifest_path, "generation manifest")
+        if manifest_path.read_bytes() != generation_bytes:
+            raise GenerationError(f"generation manifest collision: {manifest_path}")
+    else:
+        atomic_write(manifest_path, generation_bytes, 0o444)
+
+    plan = boot_plan(generation_digest, generation, tombstone_values)
+    plan_digest = digest_bytes(plan)
+    plan_object = object_path(system, plan_digest)
+    if plan_object.exists() or plan_object.is_symlink():
+        require_regular_file(plan_object, "boot plan object")
+        if plan_object.read_bytes() != plan:
+            raise GenerationError(f"boot plan object collision: {plan_object}")
+    else:
+        atomic_write(plan_object, plan, 0o444)
+    plan_pointer = system / "plans" / digest_name(generation_digest)
+    pointer_value = f"{plan_digest}\n".encode("ascii")
+    if plan_pointer.exists() or plan_pointer.is_symlink():
+        require_regular_file(plan_pointer, "boot plan pointer")
+        if plan_pointer.read_bytes() != pointer_value:
+            raise GenerationError(f"boot plan pointer collision: {plan_pointer}")
+    else:
+        atomic_write(plan_pointer, pointer_value, 0o444)
+
+    if arguments.activate:
+        select_digest(system, generation_digest)
+    print(f"published generation {generation_digest}")
+
+
+def publish_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        _publish_generation(arguments)
+
+
+def read_pointer(system: Path, name: str, required: bool = True) -> str | None:
+    path = system / name
+    if not path.exists() and not path.is_symlink() and not required:
+        return None
+    require_regular_file(path, f"{name} generation pointer")
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read {name} pointer: {error}") from error
+    digest_name(value)
+    return value
+
+
+def validate_published_generation(system: Path, digest: str) -> None:
+    contracts = load_contracts()
+    manifest = system / "manifests" / f"{digest_name(digest)}.json"
+    require_regular_file(manifest, "generation manifest")
+    actual_digest, _ = digest_file(manifest)
+    if actual_digest != digest:
+        raise GenerationError(f"generation manifest digest mismatch: {manifest}")
+    generation = read_contract(contracts, manifest, GENERATION_SCHEMA)
+
+    plan_pointer = system / "plans" / digest_name(digest)
+    require_regular_file(plan_pointer, "generation boot plan pointer")
+    try:
+        plan_digest = plan_pointer.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read boot plan pointer: {error}") from error
+    plan = object_path(system, plan_digest)
+    require_regular_file(plan, "generation boot plan")
+    actual_plan_digest, _ = digest_file(plan)
+    if actual_plan_digest != plan_digest:
+        raise GenerationError(f"boot plan digest mismatch: {plan}")
+
+    context_path = object_path(system, generation["build_context_digest"])
+    context = read_contract(contracts, context_path, BUILD_CONTEXT_SCHEMA)
+    if context["target"]["id"] != generation["target_id"]:
+        raise GenerationError("published generation target mismatch")
+
+    base = generation["base"]
+    base_path = object_path(system, base["rootfs_digest"])
+    require_squashfs(base_path, base["rootfs_size"])
+    tombstone_values = []
+    for number, layer in enumerate(generation["layers"]):
+        layer_path = object_path(system, layer["rootfs_digest"])
+        require_squashfs(layer_path, layer["rootfs_size"])
+        tombstone_path = object_path(system, layer["tombstones_digest"])
+        tombstone = read_contract(
+            contracts,
+            tombstone_path,
+            TOMBSTONES_SCHEMA,
+        )
+        transaction_path = object_path(system, layer["transaction_digest"])
+        transaction = read_contract(
+            contracts,
+            transaction_path,
+            LAYER_TRANSACTION_SCHEMA,
+        )
+        if transaction["target_id"] != generation["target_id"]:
+            raise GenerationError(f"layer {number} target mismatch")
+        filesystem = transaction["filesystem"]
+        if (
+            filesystem["rootfs_digest"] != layer["rootfs_digest"]
+            or filesystem["rootfs_size"] != layer["rootfs_size"]
+            or filesystem["tombstones_digest"] != layer["tombstones_digest"]
+            or filesystem["tombstones_count"] != len(tombstone["paths"])
+        ):
+            raise GenerationError(f"layer {number} closure mismatch")
+        tombstone_values.append(tombstone)
+    expected_plan = boot_plan(digest, generation, tombstone_values)
+    if plan.read_bytes() != expected_plan:
+        raise GenerationError("published boot plan differs from generation")
+
+
+def select_digest(system: Path, digest: str) -> None:
+    validate_published_generation(system, digest)
+    current = read_pointer(system, "current", required=False)
+    if current == digest:
+        print(f"generation already selected: {digest}")
+        return
+    if current is not None:
+        try:
+            validate_published_generation(system, current)
+        except GenerationError as error:
+            print(
+                f"warning: current generation is invalid; "
+                f"preserving previous: {error}",
+                file=sys.stderr,
+            )
+        else:
+            atomic_write(
+                system / "previous",
+                f"{current}\n".encode("ascii"),
+                0o644,
+            )
+    atomic_write(system / "current", f"{digest}\n".encode("ascii"), 0o644)
+    print(f"selected generation {digest}")
+
+
+def select_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        select_digest(system, arguments.digest)
+
+
+def rollback_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        current = read_pointer(system, "current")
+        previous = read_pointer(system, "previous")
+        assert current is not None and previous is not None
+        validate_published_generation(system, previous)
+        atomic_write(
+            system / "previous",
+            f"{current}\n".encode("ascii"),
+            0o644,
+        )
+        atomic_write(
+            system / "current",
+            f"{previous}\n".encode("ascii"),
+            0o644,
+        )
+        print(f"rolled back to generation {previous}")
+
+
+def forget_previous(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        previous = read_pointer(system, "previous")
+        assert previous is not None
+        if arguments.confirm != previous:
+            raise GenerationError(
+                "--confirm must exactly match the previous generation digest"
+            )
+        path = system / "previous"
+        try:
+            path.unlink()
+            fsync_directory(system)
+        except OSError as error:
+            raise GenerationError(f"cannot remove previous pointer: {error}") from error
+    print(f"forgot previous generation {previous}")
+
+
+def resolve_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    errors = []
+    for name in ("current", "previous"):
+        try:
+            digest = read_pointer(system, name, required=False)
+            if digest is None:
+                continue
+            validate_published_generation(system, digest)
+            print(digest)
+            if name == "previous":
+                print(
+                    f"warning: current is unbootable; selected previous {digest}",
+                    file=sys.stderr,
+                )
+            return
+        except GenerationError as error:
+            errors.append(f"{name}: {error}")
+    raise GenerationError(
+        "no bootable selected generation"
+        + (f" ({'; '.join(errors)})" if errors else "")
+    )
+
+
+def status(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    for name in ("current", "previous"):
+        try:
+            digest = read_pointer(system, name, required=False)
+            if digest is None:
+                print(f"{name}\tnone")
+                continue
+            validate_published_generation(system, digest)
+            print(f"{name}\t{digest}\tvalid")
+        except GenerationError as error:
+            print(f"{name}\tinvalid\t{error}")
+
+    pins = system / "pins"
+    for path in sorted(pins.iterdir(), key=lambda item: item.name):
+        if path.is_symlink() or not path.is_file():
+            print(f"pin:{path.name}\tinvalid\tunsafe pin entry")
+            continue
+        try:
+            digest = read_named_pointer(path, f"pin {path.name}")
+            validate_published_generation(system, digest)
+            print(f"pin:{path.name}\t{digest}\tvalid")
+        except GenerationError as error:
+            print(f"pin:{path.name}\tinvalid\t{error}")
+
+
+def require_pin_name(name: str) -> str:
+    if PIN_NAME_RE.fullmatch(name) is None:
+        raise GenerationError(
+            "pin name must use 1-64 lowercase letters, digits, dot, dash or underscore"
+        )
+    return name
+
+
+def read_named_pointer(path: Path, description: str) -> str:
+    require_regular_file(path, description)
+    try:
+        value = path.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise GenerationError(f"cannot read {description}: {error}") from error
+    digest_name(value)
+    return value
+
+
+def resolve_digest_argument(system: Path, value: str | None) -> str:
+    if value is None or value == "current":
+        digest = read_pointer(system, "current")
+    elif value == "previous":
+        digest = read_pointer(system, "previous")
+    else:
+        digest_name(value)
+        digest = value
+    assert digest is not None
+    return digest
+
+
+def pin_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    name = require_pin_name(arguments.name)
+    with mutation_lock(system):
+        digest = resolve_digest_argument(system, arguments.digest)
+        validate_published_generation(system, digest)
+        atomic_write(
+            system / "pins" / name,
+            f"{digest}\n".encode("ascii"),
+            0o644,
+        )
+    print(f"pinned generation {digest} as {name}")
+
+
+def unpin_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    name = require_pin_name(arguments.name)
+    path = system / "pins" / name
+    with mutation_lock(system):
+        require_regular_file(path, f"pin {name}")
+        try:
+            path.unlink()
+            fsync_directory(path.parent)
+        except OSError as error:
+            raise GenerationError(f"cannot remove pin {name}: {error}") from error
+    print(f"removed pin {name}")
+
+
+def generation_roles(system: Path, digest: str) -> list[str]:
+    roles = []
+    for name in ("current", "previous"):
+        try:
+            if read_pointer(system, name, required=False) == digest:
+                roles.append(name)
+        except GenerationError:
+            pass
+    for path in sorted((system / "pins").iterdir(), key=lambda item: item.name):
+        try:
+            if read_named_pointer(path, f"pin {path.name}") == digest:
+                roles.append(f"pin:{path.name}")
+        except GenerationError:
+            pass
+    return roles
+
+
+def inspect_generation(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    digest = resolve_digest_argument(system, arguments.digest)
+    validate_published_generation(system, digest)
+    contracts = load_contracts()
+    manifest_path = system / "manifests" / f"{digest_name(digest)}.json"
+    generation = read_contract(contracts, manifest_path, GENERATION_SCHEMA)
+    result = {
+        "generation_digest": digest,
+        "roles": generation_roles(system, digest),
+        "target_id": generation["target_id"],
+        "build_context_digest": generation["build_context_digest"],
+        "base": generation["base"],
+        "layer_count": len(generation["layers"]),
+        "layers": generation["layers"],
+        "compressed_size": generation["base"]["rootfs_size"]
+        + sum(layer["rootfs_size"] for layer in generation["layers"]),
+        "valid": True,
+    }
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
+def list_generations(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    for path in sorted((system / "manifests").iterdir(), key=lambda item: item.name):
+        if (
+            path.is_symlink()
+            or not path.is_file()
+            or not path.name.endswith(".json")
+            or len(path.name) != 69
+        ):
+            print(f"invalid\t{path.name}\tunsafe manifest entry")
+            continue
+        digest = DIGEST_PREFIX + path.name[:-5]
+        try:
+            validate_published_generation(system, digest)
+            contracts = load_contracts()
+            generation = read_contract(contracts, path, GENERATION_SCHEMA)
+            roles = ",".join(generation_roles(system, digest)) or "-"
+            print(
+                f"{digest}\tvalid\tlayers={len(generation['layers'])}"
+                f"\tbytes={generation['base']['rootfs_size'] + sum(layer['rootfs_size'] for layer in generation['layers'])}"
+                f"\troles={roles}\ttarget={generation['target_id']}"
+            )
+        except GenerationError as error:
+            print(f"{digest}\tinvalid\t{error}")
+
+
+def iter_digests(value: Any, field: str = "") -> Any:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from iter_digests(item, key)
+    elif isinstance(value, list):
+        for item in value:
+            yield from iter_digests(item, field)
+    elif isinstance(value, str) and value.startswith(DIGEST_PREFIX):
+        try:
+            digest_name(value)
+        except GenerationError:
+            return
+        yield field, value
+
+
+def load_json_object(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 1024 * 1024:
+            return None
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def garbage_roots(system: Path) -> set[str]:
+    roots: set[str] = set()
+    for name in ("current", "previous"):
+        digest = read_pointer(system, name, required=False)
+        if digest is not None:
+            validate_published_generation(system, digest)
+            roots.add(digest)
+    for path in sorted((system / "pins").iterdir(), key=lambda item: item.name):
+        if require_pin_name(path.name) != path.name:
+            raise AssertionError("unreachable")
+        digest = read_named_pointer(path, f"pin {path.name}")
+        validate_published_generation(system, digest)
+        roots.add(digest)
+    return roots
+
+
+def mark_reachable(
+    system: Path,
+    roots: set[str],
+) -> tuple[set[str], set[str]]:
+    reachable_generations: set[str] = set()
+    reachable_objects: set[str] = set()
+    generation_queue = list(sorted(roots))
+    object_queue: list[str] = []
+
+    def queue_digest(field: str, digest: str) -> None:
+        object_candidate = object_path(system, digest)
+        if object_candidate.exists() or object_candidate.is_symlink():
+            object_queue.append(digest)
+        if field.endswith("generation_digest"):
+            manifest_candidate = (
+                system / "manifests" / f"{digest_name(digest)}.json"
+            )
+            if manifest_candidate.exists() or manifest_candidate.is_symlink():
+                generation_queue.append(digest)
+
+    while generation_queue:
+        digest = generation_queue.pop()
+        if digest in reachable_generations:
+            continue
+        validate_published_generation(system, digest)
+        reachable_generations.add(digest)
+        manifest = (
+            system / "manifests" / f"{digest_name(digest)}.json"
+        )
+        value = load_json_object(manifest)
+        if value is None:
+            raise GenerationError(f"cannot parse reachable manifest: {manifest}")
+        for field, reference in iter_digests(value):
+            queue_digest(field, reference)
+        plan_pointer = system / "plans" / digest_name(digest)
+        plan_digest = read_named_pointer(
+            plan_pointer,
+            f"boot plan for {digest}",
+        )
+        object_queue.append(plan_digest)
+
+    while object_queue:
+        digest = object_queue.pop()
+        if digest in reachable_objects:
+            continue
+        path = object_path(system, digest)
+        require_regular_file(path, f"reachable object {digest}")
+        actual, _ = digest_file(path)
+        if actual != digest:
+            raise GenerationError(f"reachable object is corrupt: {path}")
+        reachable_objects.add(digest)
+        value = load_json_object(path)
+        if value is None:
+            continue
+        for field, reference in iter_digests(value):
+            queue_digest(field, reference)
+        while generation_queue:
+            generation_digest = generation_queue.pop()
+            if generation_digest in reachable_generations:
+                continue
+            validate_published_generation(system, generation_digest)
+            reachable_generations.add(generation_digest)
+            manifest = (
+                system
+                / "manifests"
+                / f"{digest_name(generation_digest)}.json"
+            )
+            manifest_value = load_json_object(manifest)
+            if manifest_value is None:
+                raise GenerationError(
+                    f"cannot parse reachable manifest: {manifest}"
+                )
+            for field, reference in iter_digests(manifest_value):
+                queue_digest(field, reference)
+            plan_digest = read_named_pointer(
+                system / "plans" / digest_name(generation_digest),
+                f"boot plan for {generation_digest}",
+            )
+            object_queue.append(plan_digest)
+
+    return reachable_generations, reachable_objects
+
+
+def digest_entries(
+    directory: Path,
+    suffix: str = "",
+) -> dict[str, Path]:
+    entries: dict[str, Path] = {}
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        name = path.name
+        raw = name.removesuffix(suffix) if suffix and name.endswith(suffix) else name
+        if len(raw) != 64 or any(character not in "0123456789abcdef" for character in raw):
+            raise GenerationError(f"unsafe entry in {directory}: {name}")
+        require_regular_file(path, f"entry in {directory}")
+        entries[DIGEST_PREFIX + raw] = path
+    return entries
+
+
+def garbage_collection(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        roots = garbage_roots(system)
+        if not roots and arguments.delete and not arguments.allow_empty:
+            raise GenerationError(
+                "refusing destructive garbage collection without a selected or pinned generation"
+            )
+        reachable_generations, reachable_objects = mark_reachable(system, roots)
+        manifests = digest_entries(system / "manifests", ".json")
+        plans = digest_entries(system / "plans")
+        objects = digest_entries(system / "objects/sha256")
+        activations = digest_entries(system / "activations", ".json")
+        compactions = digest_entries(system / "compactions", ".json")
+        garbage = {
+            "manifests": sorted(set(manifests) - reachable_generations),
+            "plans": sorted(set(plans) - reachable_generations),
+            "objects": sorted(set(objects) - reachable_objects),
+            "activations": sorted(set(activations) - reachable_generations),
+            "compactions": sorted(set(compactions) - reachable_generations),
+        }
+        staging = sorted((system / "staging").iterdir(), key=lambda item: item.name)
+        for path in staging:
+            require_regular_file(path, "staging entry")
+
+        if arguments.delete:
+            mappings = {
+                "manifests": manifests,
+                "plans": plans,
+                "objects": objects,
+                "activations": activations,
+                "compactions": compactions,
+            }
+            for category, digests in garbage.items():
+                for digest in digests:
+                    mappings[category][digest].unlink()
+                if digests:
+                    fsync_directory(next(iter(mappings[category].values())).parent)
+            for path in staging:
+                path.unlink()
+            if staging:
+                fsync_directory(system / "staging")
+
+    result = {
+        "mode": "delete" if arguments.delete else "dry-run",
+        "roots": sorted(roots),
+        "reachable_generations": len(reachable_generations),
+        "reachable_objects": len(reachable_objects),
+        "garbage": {key: len(value) for key, value in garbage.items()},
+        "staging": len(staging),
+    }
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+
+
+def compact_manifest(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    digest = resolve_digest_argument(system, arguments.digest)
+    validate_published_generation(system, digest)
+    contracts = load_contracts()
+    source_path = system / "manifests" / f"{digest_name(digest)}.json"
+    source = read_contract(contracts, source_path, GENERATION_SCHEMA)
+    base_digest, base_size = digest_file(arguments.base)
+    require_squashfs(arguments.base, base_size)
+    compacted = {
+        "schema": GENERATION_SCHEMA,
+        "target_id": source["target_id"],
+        "build_context_digest": source["build_context_digest"],
+        "base": {
+            "rootfs_digest": base_digest,
+            "rootfs_size": base_size,
+            "format": "squashfs",
+        },
+        "layers": [],
+    }
+    content = contracts["canonical_bytes"](compacted)
+    if arguments.output.exists() or arguments.output.is_symlink():
+        raise GenerationError(f"output already exists: {arguments.output}")
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(arguments.output, content)
+    compacted_digest = digest_bytes(content)
+    if arguments.receipt is not None:
+        if arguments.receipt.exists() or arguments.receipt.is_symlink():
+            raise GenerationError(f"output already exists: {arguments.receipt}")
+        digest_name(arguments.tree_digest)
+        receipt = {
+            "schema": COMPACTION_SCHEMA,
+            "source_generation_digest": digest,
+            "compacted_generation_digest": compacted_digest,
+            "target_id": source["target_id"],
+            "source_layer_count": len(source["layers"]),
+            "source_compressed_size": source["base"]["rootfs_size"]
+            + sum(layer["rootfs_size"] for layer in source["layers"]),
+            "compacted_base_digest": base_digest,
+            "compacted_base_size": base_size,
+            "tree_digest": arguments.tree_digest,
+            "builder": {
+                "implementation": "squashfs-tools",
+                "version": "4.7.5",
+                "compression": "zstd",
+                "level": 19,
+                "block_size": 1048576,
+                "reproducible": True,
+            },
+        }
+        receipt_content = (
+            json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n"
+        ).encode("utf-8")
+        arguments.receipt.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write(arguments.receipt, receipt_content)
+    print(f"compacted generation candidate: {compacted_digest}")
+
+
+def validate_compaction_receipt(
+    system: Path,
+    path: Path,
+) -> tuple[str, bytes]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise GenerationError(f"cannot read compaction receipt: {error}") from error
+    required = {
+        "schema",
+        "source_generation_digest",
+        "compacted_generation_digest",
+        "target_id",
+        "source_layer_count",
+        "source_compressed_size",
+        "compacted_base_digest",
+        "compacted_base_size",
+        "tree_digest",
+        "builder",
+    }
+    if not isinstance(value, dict) or set(value) != required:
+        raise GenerationError("compaction receipt fields are invalid")
+    if value["schema"] != COMPACTION_SCHEMA:
+        raise GenerationError("unsupported compaction receipt schema")
+    for field in (
+        "source_generation_digest",
+        "compacted_generation_digest",
+        "compacted_base_digest",
+        "tree_digest",
+    ):
+        if not isinstance(value[field], str):
+            raise GenerationError(f"compaction receipt {field} is invalid")
+        digest_name(value[field])
+    for field in (
+        "source_layer_count",
+        "source_compressed_size",
+        "compacted_base_size",
+    ):
+        if type(value[field]) is not int or value[field] < 0:
+            raise GenerationError(f"compaction receipt {field} is invalid")
+    expected_builder = {
+        "implementation": "squashfs-tools",
+        "version": "4.7.5",
+        "compression": "zstd",
+        "level": 19,
+        "block_size": 1048576,
+        "reproducible": True,
+    }
+    if value["builder"] != expected_builder:
+        raise GenerationError("compaction receipt builder is unsupported")
+    canonical = (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    if raw != canonical:
+        raise GenerationError("compaction receipt is not canonical JSON")
+
+    source_digest = value["source_generation_digest"]
+    compacted_digest = value["compacted_generation_digest"]
+    validate_published_generation(system, source_digest)
+    validate_published_generation(system, compacted_digest)
+    contracts = load_contracts()
+    source = read_contract(
+        contracts,
+        system / "manifests" / f"{digest_name(source_digest)}.json",
+        GENERATION_SCHEMA,
+    )
+    compacted = read_contract(
+        contracts,
+        system / "manifests" / f"{digest_name(compacted_digest)}.json",
+        GENERATION_SCHEMA,
+    )
+    if (
+        value["target_id"] != source["target_id"]
+        or compacted["target_id"] != source["target_id"]
+        or value["source_layer_count"] != len(source["layers"])
+        or value["source_compressed_size"]
+        != source["base"]["rootfs_size"]
+        + sum(layer["rootfs_size"] for layer in source["layers"])
+        or compacted["layers"]
+        or value["compacted_base_digest"]
+        != compacted["base"]["rootfs_digest"]
+        or value["compacted_base_size"] != compacted["base"]["rootfs_size"]
+    ):
+        raise GenerationError("compaction receipt does not match its generations")
+    return compacted_digest, canonical
+
+
+def record_compaction(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        digest, content = validate_compaction_receipt(system, arguments.receipt)
+        destination = system / "compactions" / f"{digest_name(digest)}.json"
+        if destination.exists() or destination.is_symlink():
+            require_regular_file(destination, "compaction receipt")
+            if destination.read_bytes() != content:
+                raise GenerationError(f"compaction receipt collision: {destination}")
+        else:
+            atomic_write(destination, content, 0o444)
+    print(f"recorded compaction for {digest}")
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="volatoo-generation")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    migrate = subparsers.add_parser("migrate-state")
+    migrate.add_argument("--state", type=Path, required=True)
+    migrate.set_defaults(handler=migrate_state)
+
+    publish = subparsers.add_parser("publish")
+    publish.add_argument("--state", type=Path, required=True)
+    publish.add_argument("--generation", type=Path, required=True)
+    publish.add_argument(
+        "--object",
+        action="append",
+        type=Path,
+        default=[],
+        help="referenced object to verify and publish; repeat as needed",
+    )
+    publish.add_argument("--activate", action="store_true")
+    publish.set_defaults(handler=publish_generation)
+
+    select = subparsers.add_parser("select")
+    select.add_argument("--state", type=Path, required=True)
+    select.add_argument("digest")
+    select.set_defaults(handler=select_generation)
+
+    rollback = subparsers.add_parser("rollback")
+    rollback.add_argument("--state", type=Path, required=True)
+    rollback.set_defaults(handler=rollback_generation)
+
+    forget = subparsers.add_parser("forget-previous")
+    forget.add_argument("--state", type=Path, required=True)
+    forget.add_argument("--confirm", required=True)
+    forget.set_defaults(handler=forget_previous)
+
+    resolve = subparsers.add_parser("resolve")
+    resolve.add_argument("--state", type=Path, required=True)
+    resolve.set_defaults(handler=resolve_generation)
+
+    show = subparsers.add_parser("status")
+    show.add_argument("--state", type=Path, required=True)
+    show.set_defaults(handler=status)
+
+    pin = subparsers.add_parser("pin")
+    pin.add_argument("--state", type=Path, required=True)
+    pin.add_argument("name")
+    pin.add_argument(
+        "digest",
+        nargs="?",
+        help="generation digest, current (default), or previous",
+    )
+    pin.set_defaults(handler=pin_generation)
+
+    unpin = subparsers.add_parser("unpin")
+    unpin.add_argument("--state", type=Path, required=True)
+    unpin.add_argument("name")
+    unpin.set_defaults(handler=unpin_generation)
+
+    inspect = subparsers.add_parser("inspect")
+    inspect.add_argument("--state", type=Path, required=True)
+    inspect.add_argument(
+        "digest",
+        nargs="?",
+        help="generation digest, current (default), or previous",
+    )
+    inspect.set_defaults(handler=inspect_generation)
+
+    generation_list = subparsers.add_parser("list")
+    generation_list.add_argument("--state", type=Path, required=True)
+    generation_list.set_defaults(handler=list_generations)
+
+    gc = subparsers.add_parser("gc")
+    gc.add_argument("--state", type=Path, required=True)
+    gc.add_argument(
+        "--delete",
+        action="store_true",
+        help="delete unreachable data; the default is a dry run",
+    )
+    gc.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="allow --delete when no selected or pinned generation exists",
+    )
+    gc.set_defaults(handler=garbage_collection)
+
+    compact = subparsers.add_parser("compact-manifest")
+    compact.add_argument("--state", type=Path, required=True)
+    compact.add_argument(
+        "--generation",
+        dest="digest",
+        default="current",
+        help="generation digest, current (default), or previous",
+    )
+    compact.add_argument("--base", type=Path, required=True)
+    compact.add_argument("--output", type=Path, required=True)
+    compact.add_argument("--receipt", type=Path)
+    compact.add_argument(
+        "--tree-digest",
+        help="verified reconstructed tree digest; required with --receipt",
+    )
+    compact.set_defaults(handler=compact_manifest)
+
+    record = subparsers.add_parser("record-compaction")
+    record.add_argument("--state", type=Path, required=True)
+    record.add_argument("--receipt", type=Path, required=True)
+    record.set_defaults(handler=record_compaction)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        if arguments.command == "compact-manifest":
+            if (arguments.receipt is None) != (arguments.tree_digest is None):
+                raise GenerationError(
+                    "--receipt and --tree-digest must be provided together"
+                )
+        arguments.handler(arguments)
+    except GenerationError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -2,10 +2,10 @@
 subarch: amd64
 target: stage4
 version_stamp: @VERSION@
-rel_type: volatoo
-profile: default/linux/amd64/23.0
+rel_type: @REL_TYPE@
+profile: @PROFILE@
 snapshot_treeish: @SNAPSHOT@
-source_subpath: volatoo/@SOURCE@
+source_subpath: @REL_TYPE@/@SOURCE@
 
 # The dedicated builder extends pyDeComp's compressor map to create a
 # 1 MiB-block SquashFS with Zstd at the measured Volatoo level 19.
@@ -17,5 +17,5 @@ stage4/packages:
 
 stage4/root_overlay: /config/overlay
 stage4/fsscript: /config/finalize.sh
-stage4/rcadd: sysklogd|default volatoo-persist|default
+@INIT_SETTINGS@
 stage4/empty: /var/cache/binpkgs /var/cache/distfiles /var/tmp/portage

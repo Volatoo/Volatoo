@@ -21,6 +21,13 @@ Optional environment variables:
   VOLATOO_TEST_IDENTITY   Verify default identity and logs: yes or no
   VOLATOO_TEST_SHUTDOWN_SYNC
                             Use normal OpenRC shutdown for the BIOS sync: yes or no
+  VOLATOO_TEST_INIT_SYSTEM
+                            Boot shell, openrc, or systemd (default: shell)
+  VOLATOO_TEST_GENERATION Expected selected sha256:<digest> (default: none)
+  VOLATOO_TEST_GENERATION_PAYLOAD
+                            Verify the P3U-4 fixture layer: yes or no
+  VOLATOO_TEST_GENERATION_FALLBACK
+                            Require current-to-previous fallback: yes or no
   VOLATOO_TEST_ROOT_MODE  Root layout: copy or overlay (default: copy)
   VOLATOO_TEST_TIMEOUT    Per-VM timeout in seconds (default: 900)
   VOLATOO_VM_MEMORY       QEMU memory (default: 8G)
@@ -49,6 +56,10 @@ state_required=${VOLATOO_STATE_REQUIRED:-}
 test_policies=${VOLATOO_TEST_POLICIES:-no}
 test_identity=${VOLATOO_TEST_IDENTITY:-no}
 test_shutdown_sync=${VOLATOO_TEST_SHUTDOWN_SYNC:-no}
+test_init_system=${VOLATOO_TEST_INIT_SYSTEM:-shell}
+test_generation=${VOLATOO_TEST_GENERATION:-}
+test_generation_payload=${VOLATOO_TEST_GENERATION_PAYLOAD:-no}
+test_generation_fallback=${VOLATOO_TEST_GENERATION_FALLBACK:-no}
 
 for input_path in "$kernel_path" "$initramfs_path" "$image_path"; do
 	if [[ ! -f $input_path ]]; then
@@ -83,6 +94,43 @@ fi
 
 if [[ $test_shutdown_sync != yes && $test_shutdown_sync != no ]]; then
 	echo "error: VOLATOO_TEST_SHUTDOWN_SYNC must be yes or no" >&2
+	exit 1
+fi
+
+if [[ $test_init_system != shell && \
+	$test_init_system != openrc && \
+	$test_init_system != systemd ]]; then
+	echo "error: VOLATOO_TEST_INIT_SYSTEM must be shell, openrc, or systemd" >&2
+	exit 1
+fi
+
+if [[ $test_init_system != shell && $test_shutdown_sync == yes ]]; then
+	echo "error: init-system boot and shutdown-sync modes cannot be combined" >&2
+	exit 1
+fi
+
+if [[ -n $test_generation && \
+	! $test_generation =~ ^sha256:[0-9a-f]{64}$ ]]; then
+	echo "error: VOLATOO_TEST_GENERATION must be a sha256:<digest>" >&2
+	exit 1
+fi
+
+if [[ $test_generation_payload != yes && \
+	$test_generation_payload != no ]]; then
+	echo "error: VOLATOO_TEST_GENERATION_PAYLOAD must be yes or no" >&2
+	exit 1
+fi
+if [[ $test_generation_payload == yes && -z $test_generation ]]; then
+	echo "error: generation payload verification requires a generation digest" >&2
+	exit 1
+fi
+if [[ $test_generation_fallback != yes && \
+	$test_generation_fallback != no ]]; then
+	echo "error: VOLATOO_TEST_GENERATION_FALLBACK must be yes or no" >&2
+	exit 1
+fi
+if [[ $test_generation_fallback == yes && -z $test_generation ]]; then
+	echo "error: generation fallback verification requires a generation digest" >&2
 	exit 1
 fi
 
@@ -206,7 +254,8 @@ run_boot_test() {
 	success_marker="[volatoo-test] $mode userspace verified"
 	failure_marker="[volatoo-test] $mode userspace verification failed"
 	guest_init=/bin/bash
-	if [[ $test_shutdown_sync == yes && $mode == bios ]]; then
+	if [[ $test_init_system != shell ]] || \
+		[[ $test_shutdown_sync == yes && $mode == bios ]]; then
 		guest_init=/sbin/init
 	fi
 
@@ -252,6 +301,80 @@ run_boot_test() {
 		sleep 1
 	done
 
+	if [[ $test_generation_fallback == yes ]] && \
+		! grep -Fq \
+			"[volatoo] warning: booting verified previous generation" \
+			"$console_log"; then
+		echo "error: $mode did not report generation fallback" >&2
+		tail -80 "$console_log" >&2
+		return 1
+	fi
+
+	if [[ $test_init_system != shell ]]; then
+		while ! grep -Fq " login:" "$console_log"; do
+			if grep -Fq "=== Volatoo boot failure ===" "$console_log"; then
+				echo "error: $mode boot entered the rescue environment" >&2
+				tail -80 "$console_log" >&2
+				return 1
+			fi
+			if ! kill -0 "$qemu_pid" 2>/dev/null; then
+				wait "$qemu_pid" || qemu_status=$?
+				echo "error: $mode QEMU exited before the login prompt" >&2
+				echo "QEMU exit status: ${qemu_status:-0}" >&2
+				tail -80 "$console_log" >&2
+				return 1
+			fi
+			test_now=$(date +%s)
+			if (( test_now - test_started >= test_timeout )); then
+				echo "error: $mode $test_init_system boot exceeded ${test_timeout}s" >&2
+				tail -80 "$console_log" >&2
+				return 1
+			fi
+			sleep 1
+		done
+
+		case $test_init_system in
+			openrc)
+				init_pattern='OpenRC'
+				if grep -Fq "ERROR: sysklogd failed to start" "$console_log"; then
+					echo "error: $mode OpenRC sysklogd service failed" >&2
+					tail -80 "$console_log" >&2
+					return 1
+				fi
+				;;
+			systemd)
+				init_pattern='systemd[1]'
+				;;
+		esac
+		if ! grep -Fq "$init_pattern" "$console_log"; then
+			echo "error: $mode did not show the expected $test_init_system PID 1" >&2
+			tail -80 "$console_log" >&2
+			return 1
+		fi
+		if [[ -n $test_generation ]] && \
+			! grep -Fq \
+				"[volatoo] generation verified: $test_generation" \
+				"$console_log"; then
+			echo "error: $mode did not verify the expected generation" >&2
+			tail -80 "$console_log" >&2
+			return 1
+		fi
+
+		# QEMU's Ctrl-a x escape terminates a successful non-interactive boot
+		# without requiring a test password or modifying the release image.
+		printf '\001x' >&3
+		if ! wait "$qemu_pid"; then
+			echo "error: $mode QEMU reported a failed exit" >&2
+			tail -80 "$console_log" >&2
+			return 1
+		fi
+		qemu_pid=
+		exec 3>&-
+		test_finished=$(date +%s)
+		echo "$mode $test_init_system boot passed in $((test_finished - test_started))s"
+		return
+	fi
+
 	if [[ $test_shutdown_sync == yes && $mode == bios ]]; then
 		while ! grep -Fq "login: root (automatic login)" "$console_log"; do
 			if ! kill -0 "$qemu_pid" 2>/dev/null; then
@@ -280,6 +403,12 @@ run_boot_test() {
 	state_test=
 	if [[ -n $state_image_path ]]; then
 		state_test=" && grep -q ' /.volatoo/state ' /proc/mounts && grep -qx '1' /.volatoo/state/volatoo/layout-version"
+	fi
+	if [[ -n $test_generation ]]; then
+		state_test="$state_test && grep -qx '$test_generation' /.volatoo/generation-id"
+	fi
+	if [[ $test_generation_payload == yes ]]; then
+		state_test="$state_test && test ! -e /etc/volatoo-layer-one && grep -qx 'replacement-v2' /etc/volatoo-replaced && grep -qx 'layer-two' /etc/volatoo-layer-two"
 	fi
 	policy_test=
 	policy_action=

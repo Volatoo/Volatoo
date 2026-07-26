@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/activation-receipt-v1.schema.json",
+  "title": "Volatoo service activation receipt v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "generation_digest",
+    "parent_generation_digest",
+    "transaction_digest",
+    "policy_digest",
+    "service",
+    "activation_type",
+    "result"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.activation-receipt/v1"
+    },
+    "generation_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "parent_generation_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "transaction_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "policy_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "service": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$"
+    },
+    "activation_type": {
+      "enum": [
+        "reload",
+        "restart",
+        "external"
+      ]
+    },
+    "result": {
+      "const": "healthy"
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  }
+}

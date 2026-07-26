@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/package-source-catalog-v1.schema.json",
+  "title": "Volatoo package source catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_id",
+    "sources"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.package-source-catalog/v1"
+    },
+    "target_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "sources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "kind",
+          "priority",
+          "location",
+          "signature_policy",
+          "compatibility",
+          "gpg_home",
+          "trusted_fingerprints"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/name"
+          },
+          "kind": {
+            "enum": [
+              "local",
+              "remote"
+            ]
+          },
+          "priority": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "location": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 2048
+          },
+          "signature_policy": {
+            "enum": [
+              "required",
+              "machine-local"
+            ]
+          },
+          "compatibility": {
+            "enum": [
+              "volatoo-attested",
+              "portage-resolved"
+            ]
+          },
+          "gpg_home": {
+            "type": "string",
+            "maxLength": 1024
+          },
+          "trusted_fingerprints": {
+            "type": "array",
+            "uniqueItems": true,
+            "items": {
+              "type": "string",
+              "pattern": "^[0-9A-F]{40}([0-9A-F]{24})?$"
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 192,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*(/[a-z0-9][a-z0-9._+-]*)+$"
+    }
+  }
+}

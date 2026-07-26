@@ -1,0 +1,6 @@
+{
+  "schema": "org.volatoo.package-source-query/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "build_context_digest": "sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd9932d36ff6ac9bc25",
+  "build_spec_digest": "sha256:f7c5327de13f08dcdda9918617d7c942ddb04d72a8cefa8db8ae9dc7c0f115e2"
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Synchronize Volatoo state before shutdown
+After=local-fs.target
+Before=umount.target
+ConditionPathExists=/.volatoo/state/volatoo/layout-version
+ConditionPathExists=/.volatoo/image-id
+
+[Service]
+Type=oneshot
+ExecStart=/bin/true
+ExecStop=/usr/sbin/volatoo-persist sync
+RemainAfterExit=yes
+TimeoutStopSec=5min
+
+[Install]
+WantedBy=multi-user.target

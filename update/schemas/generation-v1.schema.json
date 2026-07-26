@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://volatoo.org/schemas/generation-v1.schema.json",
+  "title": "Volatoo generation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema",
+    "target_id",
+    "build_context_digest",
+    "base",
+    "layers"
+  ],
+  "properties": {
+    "schema": {
+      "const": "org.volatoo.generation/v1"
+    },
+    "target_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "build_context_digest": {
+      "$ref": "#/$defs/digest"
+    },
+    "base": {
+      "$ref": "#/$defs/rootfs"
+    },
+    "layers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "rootfs_digest",
+          "rootfs_size",
+          "format",
+          "tombstones_digest",
+          "transaction_digest"
+        ],
+        "properties": {
+          "rootfs_digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "rootfs_size": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9223372036854775807
+          },
+          "format": {
+            "const": "squashfs"
+          },
+          "tombstones_digest": {
+            "$ref": "#/$defs/digest"
+          },
+          "transaction_digest": {
+            "$ref": "#/$defs/digest"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 192,
+      "pattern": "^[a-z0-9][a-z0-9._+-]*(/[a-z0-9][a-z0-9._+-]*)+$"
+    },
+    "rootfs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "rootfs_digest",
+        "rootfs_size",
+        "format"
+      ],
+      "properties": {
+        "rootfs_digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "rootfs_size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807
+        },
+        "format": {
+          "const": "squashfs"
+        }
+      }
+    }
+  }
+}

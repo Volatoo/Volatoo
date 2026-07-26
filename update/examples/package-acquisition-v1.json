@@ -1,0 +1,25 @@
+{
+  "schema": "org.volatoo.package-acquisition/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "build_context_digest": "sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd9932d36ff6ac9bc25",
+  "build_spec_digest": "sha256:f7c5327de13f08dcdda9918617d7c942ddb04d72a8cefa8db8ae9dc7c0f115e2",
+  "source_catalog_digest": "sha256:bcb6ba139b29b2e730d7ed118c1128ce3f06201e686876d19bfca7aab8fa8247",
+  "complete": true,
+  "missing_action": "fail",
+  "packages": [
+    {
+      "sequence": 0,
+      "cpv": "app-misc/jq-1.8.1",
+      "package_digest": "sha256:abc3ad6be29527b90e787e0c8988affef3b9031504bcc20053f6101101be5f31",
+      "source_id": "local",
+      "source_kind": "local",
+      "build_id": "1",
+      "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "artifact_size": 123456,
+      "store_path": "sha256/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.gpkg.tar",
+      "signature": "machine-local",
+      "compatibility": "portage-resolved"
+    }
+  ],
+  "missing": []
+}

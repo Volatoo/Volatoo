@@ -1,0 +1,2 @@
+# OpenRC-specific runtime packages.
+app-admin/sysklogd

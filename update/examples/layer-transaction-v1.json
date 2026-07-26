@@ -1,0 +1,52 @@
+{
+  "schema": "org.volatoo.layer-transaction/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "build_context_digest": "sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd9932d36ff6ac9bc25",
+  "build_spec_digest": "sha256:f7c5327de13f08dcdda9918617d7c942ddb04d72a8cefa8db8ae9dc7c0f115e2",
+  "acquisition_digest": "sha256:ef431844d169fde38543fa95e62cd98a1885013b04f2dad6ade449b57c6e1501",
+  "parent_generation_digest": "sha256:23ba4c06024b23aa7bf48a9fef42cf5f6659aeb128e4c7182829507da01d4031",
+  "portage": {
+    "version": "3.0.77",
+    "adapter": "emerge-binary-only-v1",
+    "options": [
+      "--ask=n",
+      "--autounmask=n",
+      "--backtrack=30",
+      "--binpkg-changed-deps=y",
+      "--binpkg-respect-use=y",
+      "--complete-graph=y",
+      "--keep-going=n",
+      "--newuse",
+      "--oneshot",
+      "--usepkgonly",
+      "--with-bdeps=y"
+    ]
+  },
+  "packages": [
+    {
+      "sequence": 0,
+      "cpv": "app-misc/jq-1.8.1",
+      "package_digest": "sha256:abc3ad6be29527b90e787e0c8988affef3b9031504bcc20053f6101101be5f31",
+      "artifact_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "build_id": "1"
+    }
+  ],
+  "filesystem": {
+    "changed_paths_digest": "sha256:7353fc8b64fedb5bc26f726d813979e8a412e893ae6da92bd136d6f92640f339",
+    "changed_paths_count": 2,
+    "tombstones_digest": "sha256:2c6ae75643fccfe6de1618d14b9900d24e61514f4f86c986476f4ef3805965f3",
+    "tombstones_count": 0,
+    "rootfs_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rootfs_size": 524288,
+    "format": "squashfs",
+    "builder": {
+      "implementation": "squashfs-tools",
+      "version": "4.7.5",
+      "compression": "zstd",
+      "level": 19,
+      "block_size": 1048576,
+      "reproducible": true
+    }
+  },
+  "world_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+}

@@ -1,0 +1,8 @@
+{
+  "schema": "org.volatoo.layer-paths/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "paths": [
+    "/usr/bin/jq",
+    "/var/db/pkg/app-misc/jq-1.8.1"
+  ]
+}

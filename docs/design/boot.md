@@ -79,6 +79,22 @@ localmount, hostname, and local reached the started state, and
 The 8 GiB test VM reported a 6.3 GiB root tmpfs at 45% usage, leaving 3.5 GiB
 available. A normal OpenRC shutdown also completed and powered off the VM.
 
+## systemd result
+
+The first Catalyst systemd image was built on 2026-07-23 from the official
+amd64 systemd stage3 and the stable
+`default/linux/amd64/23.0/systemd` profile. Its SquashFS was 598,507,520 bytes
+and contained the expected `/usr/bin/init` link to systemd, the selected
+profile link, and the enabled Volatoo persistence unit. The OpenRC persistence
+script and sysklogd package were absent.
+
+With the root image mounted as the lower layer, the rebuilt OpenRC image
+reached a serial login under BIOS and UEFI in QEMU TCG in 23 and 35 seconds.
+The systemd r2 image passed in 34 and 36 seconds. A full-copy systemd attempt
+spent the validation window expanding the roughly 2.6 GiB root before PID 1
+started. This is evidence for the existing copy-mode performance problem, not
+an init-system failure; full-copy performance remains a separate release Gate.
+
 The temporary Alpine test kernel does not leave its module tree in the Gentoo
 root after `switch_root`, so DHCP reported no valid network interfaces. This is
 a test-kernel limitation; the target kernel baseline will build the required

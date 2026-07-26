@@ -1,6 +1,6 @@
 # State filesystem layout
 
-Status: Phase 2 layout version 1.
+Status: Phase 2 layout version 1 with system-generation sublayout version 1.
 
 ## Discovery and boot policy
 
@@ -34,7 +34,19 @@ tools must prepare it explicitly.
 │   ├── identity/         # default machine identity and logs
 │   ├── overlay/          # persistent OverlayFS upper/work trees
 │   └── sync/             # synchronized path contents
-└── snapshots/            # versioned recovery snapshots
+├── snapshots/            # versioned recovery snapshots
+└── system/
+    ├── layout-version    # contains exactly "1"
+    ├── objects/sha256/   # immutable base, layer and metadata objects
+    ├── manifests/        # canonical generation manifests
+    ├── plans/            # generation-to-boot-plan digest bindings
+    ├── pins/             # named generation retention roots
+    ├── activations/      # successful live service activation receipts
+    ├── compactions/      # verified base-compaction receipts
+    ├── staging/          # unpublished temporary objects
+    ├── lock               # advisory mutation/GC exclusion lock
+    ├── current           # selected generation digest, once activated
+    └── previous          # rollback digest, after a second selection
 ```
 
 Each policy storage key creates its data below the matching policy directory:
@@ -73,6 +85,26 @@ identity/
 These entries are created on first boot with state and do not require a
 `persist.conf` policy. Their behavior and opt-out configuration are documented
 in [`machine-identity.md`](machine-identity.md).
+
+The system directory is an additive, independently versioned extension. Its
+presence does not change the top-level layout marker, so Phase 2 persistence
+and identity tools continue to accept the filesystem. `current` and `previous`
+contain complete `sha256:<hex>` generation digests. All closure objects and
+the canonical manifest are durable before selection changes. The boot plan is
+a derived, content-addressed early-userspace representation; the canonical
+JSON manifest remains the generation identity.
+
+`current`, `previous`, and every safe file in `pins/` are garbage-collection
+roots. Collection recursively marks their manifests, boot plans and all
+content-addressed objects referenced by stored metadata. It refuses a corrupt
+root and defaults to a dry run. `previous` can be removed only by explicitly
+confirming its complete digest, preserving an intentional rollback window.
+Activation and compaction receipts follow the generation they describe and do
+not independently retain an otherwise unreachable generation.
+
+`update/volatoo-generation migrate-state --state /mountpoint` creates this
+sublayout explicitly and is safe to resume after interruption. It does not
+format the filesystem or alter existing persistence data.
 
 The data policy subdirectories and snapshot directory are mode `0700`;
 configuration and the layout marker are readable but only root may modify

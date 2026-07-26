@@ -8,17 +8,19 @@ Usage:
   scripts/build-catalyst-squashfs.sh [OPTIONS] OUTPUT
   scripts/build-catalyst-squashfs.sh --validate-only
 
-Build the amd64 Volatoo minimal SquashFS with Catalyst in Docker.
+Build an amd64 Volatoo minimal SquashFS with Catalyst in Docker.
 
 Required build options:
-  --stage3 PATH       Official Gentoo amd64 OpenRC stage3 archive
+  --stage3 PATH       Official Gentoo amd64 stage3 archive matching --init-system
   --snapshot PATH     Matching Gentoo Catalyst repository snapshot (.sqfs)
   --snapshot-id ID    Snapshot treeish used in gentoo-ID.sqfs
 
 Other options:
+  --init-system NAME  Select openrc or systemd (default: openrc)
   --version STAMP     Image version stamp (default: current UTC date)
   --work-volume NAME  Docker volume for Catalyst work/cache
-                      (default: volatoo-catalyst-work)
+                      (defaults: volatoo-catalyst-work for OpenRC,
+                      volatoo-catalyst-work-systemd for systemd)
   --validate-only     Build the builder and validate the rendered spec only
   -h, --help          Show this help
 
@@ -36,8 +38,9 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 stage3_path=
 snapshot_path=
 snapshot_id=
+init_system=openrc
 version_stamp=$(date -u +%Y%m%d)
-work_volume=${VOLATOO_CATALYST_VOLUME:-volatoo-catalyst-work}
+work_volume=
 output_path=
 validate_only=no
 
@@ -56,6 +59,11 @@ while (( $# > 0 )); do
 		--snapshot-id)
 			(( $# >= 2 )) || { echo "error: --snapshot-id requires a value" >&2; exit 2; }
 			snapshot_id=$2
+			shift 2
+			;;
+		--init-system)
+			(( $# >= 2 )) || { echo "error: --init-system requires a value" >&2; exit 2; }
+			init_system=$2
 			shift 2
 			;;
 		--version)
@@ -92,6 +100,21 @@ while (( $# > 0 )); do
 	esac
 done
 
+if [[ $init_system != openrc && $init_system != systemd ]]; then
+	echo "error: --init-system must be openrc or systemd" >&2
+	exit 2
+fi
+if [[ -z $work_volume ]]; then
+	if [[ -n ${VOLATOO_CATALYST_VOLUME:-} ]]; then
+		work_volume=$VOLATOO_CATALYST_VOLUME
+	elif [[ $init_system == openrc ]]; then
+		# Preserve the existing OpenRC cache volume.
+		work_volume=volatoo-catalyst-work
+	else
+		work_volume=volatoo-catalyst-work-systemd
+	fi
+fi
+
 if ! [[ $version_stamp =~ ^[A-Za-z0-9._+-]+$ ]]; then
 	echo "error: version stamp contains unsupported characters" >&2
 	exit 1
@@ -109,7 +132,7 @@ if [[ $validate_only = no ]]; then
 	[[ -n $stage3_path ]] || { echo "error: --stage3 is required" >&2; exit 2; }
 	[[ -n $snapshot_path ]] || { echo "error: --snapshot is required" >&2; exit 2; }
 	[[ -n $snapshot_id ]] || { echo "error: --snapshot-id is required" >&2; exit 2; }
-	[[ -n $output_path ]] || output_path=$repo_root/out/volatoo-minimal-${version_stamp}.squashfs
+	[[ -n $output_path ]] || output_path=$repo_root/out/volatoo-minimal-${init_system}-${version_stamp}.squashfs
 	[[ -f $stage3_path ]] || { echo "error: stage3 not found: $stage3_path" >&2; exit 1; }
 	[[ -f $snapshot_path ]] || { echo "error: snapshot not found: $snapshot_path" >&2; exit 1; }
 else
@@ -149,7 +172,7 @@ trap cleanup EXIT
 
 mkdir -p "$runtime_dir/overlay/usr/sbin" \
 	"$runtime_dir/overlay/usr/libexec" \
-	"$runtime_dir/overlay/etc/init.d"
+	"$runtime_dir/overlay/etc/volatoo"
 cp -R "$repo_root/image/catalyst/overlay/." "$runtime_dir/overlay/"
 cp "$repo_root/persist/volatoo-persist" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-persist"
@@ -157,45 +180,72 @@ cp "$repo_root/persist/volatoo-identity" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-identity"
 cp "$repo_root/persist/volatoo-persist-early" \
 	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early"
-cp "$repo_root/persist/volatoo-persist.initd" \
-	"$runtime_dir/overlay/etc/init.d/volatoo-persist"
 chmod 0755 \
 	"$runtime_dir/overlay/usr/sbin/volatoo-persist" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-identity" \
-	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early" \
-	"$runtime_dir/overlay/etc/init.d/volatoo-persist"
+	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early"
+printf '%s\n' "$init_system" \
+	>"$runtime_dir/overlay/etc/volatoo/init-system"
+if [[ $init_system == openrc ]]; then
+	mkdir -p "$runtime_dir/overlay/etc/init.d"
+	cp "$repo_root/persist/volatoo-persist.initd" \
+		"$runtime_dir/overlay/etc/init.d/volatoo-persist"
+	chmod 0755 "$runtime_dir/overlay/etc/init.d/volatoo-persist"
+else
+	mkdir -p "$runtime_dir/overlay/usr/lib/systemd/system"
+	cp "$repo_root/persist/volatoo-persist.service" \
+		"$runtime_dir/overlay/usr/lib/systemd/system/volatoo-persist.service"
+	chmod 0644 \
+		"$runtime_dir/overlay/usr/lib/systemd/system/volatoo-persist.service"
+fi
 cp "$repo_root/image/catalyst/finalize.sh" "$runtime_dir/finalize.sh"
 chmod 0755 "$runtime_dir/finalize.sh"
 
-source_name=stage3.tar.xz
+source_name=stage3-amd64-${init_system}-validate.tar.xz
 if [[ $validate_only = no ]]; then
 	source_name=$(basename -- "$stage3_path")
-	if ! [[ $source_name =~ ^[A-Za-z0-9._+-]+\.(tar\.(bz2|gz|xz|zst|zstd)|squashfs|sfs)$ ]]; then
-		echo "error: unsupported or unsafe stage3 filename: $source_name" >&2
+	if ! [[ $source_name =~ ^stage3-amd64-${init_system}-[0-9]{8}T[0-9]{6}Z\.tar\.xz$ ]]; then
+		echo "error: stage3 filename does not match $init_system target: $source_name" >&2
 		exit 1
 	fi
 fi
 
-package_file=$repo_root/image/catalyst/package-sets/minimal
+if [[ $init_system == openrc ]]; then
+	profile=default/linux/amd64/23.0
+	rel_type=volatoo
+	init_settings="stage4/rcadd: sysklogd|default volatoo-persist|default"
+else
+	profile=default/linux/amd64/23.0/systemd
+	rel_type=volatoo-systemd
+	init_settings=
+fi
+
 rendered_packages=$runtime_dir/packages
-while IFS= read -r package || [[ -n $package ]]; do
-	package=${package%%#*}
-	package=${package#"${package%%[![:space:]]*}"}
-	package=${package%"${package##*[![:space:]]}"}
-	[[ -n $package ]] || continue
-	if [[ $package == *[[:space:]]* ]] \
-		|| ! [[ $package =~ ^[A-Za-z0-9+_.@/-]+$ ]]; then
-		echo "error: invalid package atom in $package_file: $package" >&2
-		exit 1
-	fi
-	printf '%s\n' "$package" >> "$rendered_packages"
-done < "$package_file"
+for package_file in \
+	"$repo_root/image/catalyst/package-sets/minimal" \
+	"$repo_root/image/catalyst/package-sets/minimal-${init_system}"; do
+	while IFS= read -r package || [[ -n $package ]]; do
+		package=${package%%#*}
+		package=${package#"${package%%[![:space:]]*}"}
+		package=${package%"${package##*[![:space:]]}"}
+		[[ -n $package ]] || continue
+		if [[ $package == *[[:space:]]* ]] \
+			|| ! [[ $package =~ ^[A-Za-z0-9+_.@/-]+$ ]]; then
+			echo "error: invalid package atom in $package_file: $package" >&2
+			exit 1
+		fi
+		printf '%s\n' "$package" >> "$rendered_packages"
+	done < "$package_file"
+done
 [[ -s $rendered_packages ]] || { echo "error: minimal package set is empty" >&2; exit 1; }
 
 awk \
 	-v version="$version_stamp" \
 	-v snapshot="$snapshot_id" \
 	-v source="$source_name" \
+	-v profile="$profile" \
+	-v rel_type="$rel_type" \
+	-v init_settings="$init_settings" \
 	-v packages="$rendered_packages" '
 		$0 == "@PACKAGES@" {
 			while ((getline package < packages) > 0)
@@ -203,10 +253,17 @@ awk \
 			close(packages)
 			next
 		}
+		$0 == "@INIT_SETTINGS@" {
+			if (init_settings != "")
+				print init_settings
+			next
+		}
 		{
 			gsub(/@VERSION@/, version)
 			gsub(/@SNAPSHOT@/, snapshot)
 			gsub(/@SOURCE@/, source)
+			gsub(/@PROFILE@/, profile)
+			gsub(/@REL_TYPE@/, rel_type)
 			print
 		}
 	' "$repo_root/image/catalyst/specs/minimal.spec.in" \
@@ -236,6 +293,7 @@ if [[ $validate_only = yes ]]; then
 	docker run --rm \
 		--platform linux/amd64 \
 		--env VOLATOO_VALIDATE_ONLY=yes \
+		--env "VOLATOO_INIT_SYSTEM=$init_system" \
 		--volume "$runtime_dir:/config:ro" \
 		"$builder_image"
 	exit
@@ -249,6 +307,8 @@ docker volume create "$work_volume" >/dev/null
 docker run --rm \
 	--privileged \
 	--platform linux/amd64 \
+	--env "VOLATOO_INIT_SYSTEM=$init_system" \
+	--env "VOLATOO_REL_TYPE=$rel_type" \
 	--env "VOLATOO_SOURCE_NAME=$source_name" \
 	--env "VOLATOO_SNAPSHOT_ID=$snapshot_id" \
 	--volume "$runtime_dir:/config:ro" \
@@ -260,7 +320,7 @@ docker run --rm \
 mkdir -p "$(dirname -- "$output_path")"
 output_path=$(cd -- "$(dirname -- "$output_path")" && pwd)/$(basename -- "$output_path")
 temporary_output=$output_path.tmp.$$
-artifact=/work/catalyst/builds/volatoo/stage4-amd64-${version_stamp}.squashfs
+artifact=/work/catalyst/builds/${rel_type}/stage4-amd64-${version_stamp}.squashfs
 docker run --rm \
 	--platform linux/amd64 \
 	--user "$(id -u):$(id -g)" \

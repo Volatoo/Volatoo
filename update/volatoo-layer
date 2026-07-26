@@ -1,0 +1,1005 @@
+#!/usr/bin/env python3
+
+"""Stage a binary-only Portage transaction and finalize a SquashFS layer."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import runpy
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
+GENERATION_SCHEMA = "org.volatoo.generation/v1"
+LAYER_PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
+LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
+PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
+TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
+PORTAGE_ADAPTER = "emerge-binary-only-v1"
+INSTALL_OPTIONS = (
+    "--ask=n",
+    "--autounmask=n",
+    "--backtrack=30",
+    "--binpkg-changed-deps=y",
+    "--binpkg-respect-use=y",
+    "--complete-graph=y",
+    "--keep-going=n",
+    "--newuse",
+    "--usepkgonly",
+    "--with-bdeps=y",
+)
+EXCLUDED_ROOT_PATHS = {
+    "dev",
+    "inputs",
+    "output",
+    "proc",
+    "result",
+    "run",
+    "store",
+    "sys",
+    "tmp",
+    "work",
+}
+EXCLUDED_PATH_PREFIXES = (
+    "/var/cache/edb",
+    "/var/db/repos",
+    "/var/lib/gentoo/news",
+    "/var/log",
+    "/var/tmp",
+)
+
+
+class LayerError(RuntimeError):
+    pass
+
+
+def load_contracts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-manifest")))
+
+
+def read_contract(
+    contracts: dict[str, Any],
+    path: Path,
+    schema: str,
+) -> dict[str, Any]:
+    try:
+        value = contracts["read_manifest"](str(path))
+        contracts["validate_manifest"](value)
+    except RuntimeError as error:
+        raise LayerError(str(error)) from error
+    if value.get("schema") != schema:
+        raise LayerError(f"{path} must use {schema}")
+    return value
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    def reject_duplicates(
+        pairs: list[tuple[str, Any]],
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {}
+        for key, item in pairs:
+            if key in value:
+                raise LayerError(f"duplicate JSON key in {path}: {key}")
+            value[key] = item
+        return value
+
+    try:
+        raw = path.read_bytes()
+        if len(raw) > 1024 * 1024:
+            raise LayerError(f"{path} exceeds 1048576 bytes")
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise LayerError(f"cannot read {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise LayerError(f"{path} must contain a JSON object")
+    return value
+
+
+def digest_file(path: Path) -> tuple[str, int]:
+    if path.is_symlink() or not path.is_file():
+        raise LayerError(f"{path} must be a regular file")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+    except OSError as error:
+        raise LayerError(f"cannot hash {path}: {error}") from error
+    return "sha256:" + digest.hexdigest(), size
+
+
+def require_squashfs(path: Path) -> None:
+    try:
+        with path.open("rb") as stream:
+            header = stream.read(96)
+    except OSError as error:
+        raise LayerError(f"cannot inspect SquashFS {path}: {error}") from error
+    if len(header) != 96 or header[:4] != b"hsqs":
+        raise LayerError(f"{path} is not a SquashFS filesystem")
+
+
+def write_contract(
+    contracts: dict[str, Any],
+    path: Path,
+    value: dict[str, Any],
+) -> None:
+    try:
+        encoded = contracts["canonical_bytes"](value)
+    except RuntimeError as error:
+        raise LayerError(str(error)) from error
+    write_bytes(path, encoded)
+
+
+def write_internal_json(path: Path, value: dict[str, Any]) -> None:
+    encoded = (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+    write_bytes(path, encoded)
+
+
+def write_bytes(path: Path, value: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise LayerError(f"cannot write {path}: {error}") from error
+
+
+def verify_references(
+    contracts: dict[str, Any],
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    acquisition: dict[str, Any],
+    parent: dict[str, Any],
+) -> None:
+    targets = {
+        context["target"]["id"],
+        spec["target_id"],
+        acquisition["target_id"],
+        parent["target_id"],
+    }
+    if len(targets) != 1:
+        raise LayerError(
+            "build context, BuildSpec, acquisition and parent targets differ"
+        )
+    context_digest = contracts["manifest_digest"](context)
+    if spec["build_context_digest"] != context_digest:
+        raise LayerError("BuildSpec does not reference the build context")
+    if acquisition["build_context_digest"] != context_digest:
+        raise LayerError("acquisition does not reference the build context")
+    if parent["build_context_digest"] != context_digest:
+        raise LayerError("parent generation does not reference the build context")
+    if acquisition["build_spec_digest"] != contracts["manifest_digest"](spec):
+        raise LayerError("acquisition does not reference the BuildSpec")
+    if not acquisition["complete"] or acquisition["missing"]:
+        raise LayerError("acquisition must contain a complete package closure")
+    if len(acquisition["packages"]) != len(spec["packages"]):
+        raise LayerError("acquisition package count differs from BuildSpec")
+
+
+def verify_runtime(context: dict[str, Any]) -> tuple[Any, Any]:
+    try:
+        import portage
+    except ImportError as error:
+        raise LayerError(
+            "Portage Python modules are unavailable in the staging root"
+        ) from error
+    planner = runpy.run_path(str(Path(__file__).with_name("volatoo-plan")))
+    try:
+        planner["verify_target"](
+            portage,
+            portage.settings,
+            portage.db,
+            context,
+        )
+    except RuntimeError as error:
+        raise LayerError(str(error)) from error
+    return portage, portage.settings
+
+
+def verify_artifacts(
+    store: Path,
+    acquisition: dict[str, Any],
+) -> list[Path]:
+    artifacts: list[Path] = []
+    store_root = store.resolve()
+    for package in acquisition["packages"]:
+        artifact = (store_root / package["store_path"]).resolve()
+        try:
+            artifact.relative_to(store_root)
+        except ValueError as error:
+            raise LayerError("acquisition artifact escapes the store") from error
+        actual_digest, actual_size = digest_file(artifact)
+        if actual_digest != package["artifact_digest"]:
+            raise LayerError(f"artifact digest mismatch for {package['cpv']}")
+        if actual_size != package["artifact_size"]:
+            raise LayerError(f"artifact size mismatch for {package['cpv']}")
+        artifacts.append(artifact)
+    return artifacts
+
+
+def metadata_text(metadata: dict[str, bytes], key: str) -> str:
+    value = metadata.get(key, b"")
+    try:
+        return value.decode("utf-8").rstrip("\n")
+    except UnicodeError as error:
+        raise LayerError(f"GPKG metadata {key} is not UTF-8") from error
+
+
+def create_pkgdir(
+    portage: Any,
+    settings: Any,
+    temporary: Path,
+    acquisition: dict[str, Any],
+    artifacts: list[Path],
+) -> Path:
+    try:
+        from portage.gpkg import gpkg
+    except ImportError as error:
+        raise LayerError("Portage GPKG support is unavailable") from error
+
+    pkgdir = temporary / "pkgdir"
+    entries: list[dict[str, str]] = []
+    for package, artifact in zip(
+        acquisition["packages"],
+        artifacts,
+        strict=True,
+    ):
+        split = portage.catpkgsplit(package["cpv"])
+        if split is None:
+            raise LayerError(f"invalid CPV in acquisition: {package['cpv']}")
+        category, package_name, _version, _revision = split
+        package_file = gpkg(
+            settings,
+            basename=package["cpv"],
+            gpkg_file=str(artifact),
+            verify_signature=False,
+        )
+        try:
+            metadata = package_file.get_metadata()
+        except Exception as error:
+            raise LayerError(
+                f"cannot inspect acquired GPKG {package['cpv']}: {error}"
+            ) from error
+        cpv = (
+            metadata_text(metadata, "CATEGORY")
+            + "/"
+            + metadata_text(metadata, "PF")
+        )
+        if cpv != package["cpv"]:
+            raise LayerError(f"GPKG CPV mismatch for {package['cpv']}")
+        suffix = (
+            f"-{package['build_id']}"
+            if package["build_id"]
+            else ""
+        )
+        relative = (
+            Path(category)
+            / package_name
+            / f"{split[1]}-{split[2]}{('-' + split[3]) if split[3] != 'r0' else ''}"
+        )
+        relative = relative.with_name(relative.name + suffix + ".gpkg.tar")
+        destination = pkgdir / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(artifact, destination)
+        artifact_sha1 = hashlib.sha1(usedforsecurity=False)
+        artifact_md5 = hashlib.md5(usedforsecurity=False)
+        with destination.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                artifact_sha1.update(block)
+                artifact_md5.update(block)
+        entry = {
+            "BUILD_ID": package["build_id"],
+            "BUILD_TIME": metadata_text(metadata, "BUILD_TIME"),
+            "CHOST": metadata_text(metadata, "CHOST"),
+            "CPV": package["cpv"],
+            "EAPI": metadata_text(metadata, "EAPI"),
+            "IUSE": metadata_text(metadata, "IUSE"),
+            "MD5": artifact_md5.hexdigest(),
+            "PATH": relative.as_posix(),
+            "REPO": metadata_text(metadata, "repository"),
+            "SHA1": artifact_sha1.hexdigest(),
+            "SIZE": str(package["artifact_size"]),
+            "SLOT": metadata_text(metadata, "SLOT"),
+            "USE": metadata_text(metadata, "USE"),
+        }
+        for field in (
+            "BDEPEND",
+            "DEPEND",
+            "IDEPEND",
+            "KEYWORDS",
+            "LICENSE",
+            "PDEPEND",
+            "PROPERTIES",
+            "RDEPEND",
+            "REQUIRED_USE",
+            "RESTRICT",
+        ):
+            value = metadata_text(metadata, field)
+            if value:
+                entry[field] = value
+        entries.append(entry)
+
+    lines = [
+        f"PACKAGES: {len(entries)}",
+        "TIMESTAMP: 0",
+        "VERSION: 0",
+        "",
+    ]
+    for entry in entries:
+        lines.extend(
+            f"{key}: {entry[key]}"
+            for key in sorted(entry)
+            if entry[key]
+        )
+        lines.append("")
+    write_bytes(pkgdir / "Packages", ("\n".join(lines) + "\n").encode())
+    return pkgdir
+
+
+def path_is_excluded(path: str) -> bool:
+    return any(
+        path == prefix or path.startswith(prefix + "/")
+        for prefix in EXCLUDED_PATH_PREFIXES
+    )
+
+
+def xattr_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        names = sorted(os.listxattr(path, follow_symlinks=False))
+    except OSError:
+        names = []
+    for name in names:
+        try:
+            value = os.getxattr(path, name, follow_symlinks=False)
+        except OSError as error:
+            raise LayerError(f"cannot read xattr {name} from {path}") from error
+        encoded = name.encode("utf-8")
+        digest.update(len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+        digest.update(len(value).to_bytes(8, "big"))
+        digest.update(value)
+    return digest.hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+    except OSError as error:
+        raise LayerError(f"cannot hash staged path {path}: {error}") from error
+    return digest.hexdigest()
+
+
+def snapshot_root() -> dict[str, tuple[Any, ...]]:
+    snapshot: dict[str, tuple[Any, ...]] = {}
+
+    def visit(directory: Path, relative: Path) -> None:
+        try:
+            entries = sorted(os.scandir(directory), key=lambda item: item.name)
+        except OSError as error:
+            raise LayerError(f"cannot scan {directory}: {error}") from error
+        for entry in entries:
+            if relative == Path() and entry.name in EXCLUDED_ROOT_PATHS:
+                continue
+            child_relative = relative / entry.name
+            absolute_name = "/" + child_relative.as_posix()
+            if path_is_excluded(absolute_name):
+                continue
+            if any(
+                ord(character) < 32
+                for character in absolute_name
+            ):
+                raise LayerError(
+                    f"staged root contains unsupported path {absolute_name!r}"
+                )
+            path = Path(entry.path)
+            try:
+                information = entry.stat(follow_symlinks=False)
+            except OSError as error:
+                raise LayerError(f"cannot stat {path}: {error}") from error
+            common = (
+                stat.S_IFMT(information.st_mode),
+                stat.S_IMODE(information.st_mode),
+                information.st_uid,
+                information.st_gid,
+                xattr_digest(path),
+            )
+            if stat.S_ISREG(information.st_mode):
+                detail = (information.st_size, file_digest(path))
+            elif stat.S_ISLNK(information.st_mode):
+                detail = (os.readlink(path),)
+            elif stat.S_ISCHR(information.st_mode) or stat.S_ISBLK(
+                information.st_mode
+            ):
+                detail = (information.st_rdev,)
+            else:
+                detail = ()
+            snapshot[absolute_name] = common + detail
+            if stat.S_ISDIR(information.st_mode):
+                visit(path, child_relative)
+
+    visit(Path("/"), Path())
+    return snapshot
+
+
+def collapse_removed(paths: list[str]) -> list[str]:
+    selected: list[str] = []
+    selected_set: set[str] = set()
+    for path in sorted(paths, key=lambda value: (value.count("/"), value)):
+        parent = Path(path).parent
+        covered = False
+        while str(parent) != "/":
+            if str(parent) in selected_set:
+                covered = True
+                break
+            parent = parent.parent
+        if not covered:
+            selected.append(path)
+            selected_set.add(path)
+    return sorted(selected)
+
+
+def add_changed_parents(
+    paths: list[str],
+    snapshot: dict[str, tuple[Any, ...]],
+) -> list[str]:
+    expanded = set(paths)
+    for path in paths:
+        parent = Path(path).parent
+        while str(parent) != "/":
+            parent_text = str(parent)
+            if parent_text in snapshot:
+                expanded.add(parent_text)
+            parent = parent.parent
+    return sorted(expanded)
+
+
+def copy_changed_paths(
+    paths: list[str],
+    destination: Path,
+    temporary: Path,
+) -> None:
+    if destination.exists():
+        raise LayerError(f"layer root already exists: {destination}")
+    destination.mkdir(parents=True)
+    path_list = temporary / "changed-paths.bin"
+    with path_list.open("wb") as stream:
+        for path in paths:
+            stream.write(path.removeprefix("/").encode("utf-8") + b"\0")
+    archive = temporary / "layer-root.tar"
+    commands = (
+        [
+            "tar",
+            "-C",
+            "/",
+            "--create",
+            f"--file={archive}",
+            "--null",
+            "--no-recursion",
+            "--numeric-owner",
+            "--acls",
+            "--xattrs",
+            f"--files-from={path_list}",
+        ],
+        [
+            "tar",
+            "-C",
+            str(destination),
+            "--extract",
+            f"--file={archive}",
+            "--numeric-owner",
+            "--same-owner",
+            "--same-permissions",
+            "--acls",
+            "--xattrs",
+        ],
+    )
+    for command in commands:
+        try:
+            subprocess.run(command, check=True)
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise LayerError(f"cannot capture changed paths: {error}") from error
+
+
+def vdb_cpvs(portage: Any, settings: Any) -> set[str]:
+    vardb = portage.db[settings["EROOT"]]["vartree"].dbapi
+    return {str(cpv) for cpv in vardb.cpv_all()}
+
+
+def verify_installed(
+    portage: Any,
+    settings: Any,
+    spec: dict[str, Any],
+    acquisition: dict[str, Any],
+    before_cpvs: set[str],
+) -> None:
+    vardb = portage.db[settings["EROOT"]]["vartree"].dbapi
+    after_cpvs = vdb_cpvs(portage, settings)
+    expected_cpvs = {package["cpv"] for package in spec["packages"]}
+    expected_keys = {
+        portage.cpv_getkey(package["cpv"])
+        for package in spec["packages"]
+    }
+    unexpected_added = sorted(after_cpvs - before_cpvs - expected_cpvs)
+    unexpected_removed = sorted(
+        cpv
+        for cpv in before_cpvs - after_cpvs
+        if portage.cpv_getkey(cpv) not in expected_keys
+    )
+    if unexpected_added or unexpected_removed:
+        raise LayerError(
+            "binary transaction changed unexpected VDB packages: "
+            f"added={unexpected_added}, removed={unexpected_removed}"
+        )
+    receipt_packages = {
+        package["sequence"]: package
+        for package in acquisition["packages"]
+    }
+    for package in spec["packages"]:
+        if not vardb.cpv_exists(package["cpv"]):
+            raise LayerError(f"expected package is not installed: {package['cpv']}")
+        use_value, repository, slot, build_id = vardb.aux_get(
+            package["cpv"],
+            ["USE", "repository", "SLOT", "BUILD_ID"],
+        )
+        if sorted(set(use_value.split())) != package["use"]["enabled"]:
+            raise LayerError(f"installed USE mismatch for {package['cpv']}")
+        if repository != package["repository"]:
+            raise LayerError(
+                f"installed repository mismatch for {package['cpv']}"
+            )
+        expected_slot = (
+            package["slot"]
+            if package["slot"] == package["subslot"]
+            else f"{package['slot']}/{package['subslot']}"
+        )
+        if slot != expected_slot:
+            raise LayerError(f"installed SLOT mismatch for {package['cpv']}")
+        expected_build_id = receipt_packages[package["sequence"]]["build_id"]
+        if expected_build_id and build_id != expected_build_id:
+            raise LayerError(
+                f"installed BUILD_ID mismatch for {package['cpv']}"
+            )
+
+
+def run_emerge(
+    settings: Any,
+    pkgdir: Path,
+    spec: dict[str, Any],
+    temporary: Path,
+) -> list[str]:
+    selection = (
+        "--select"
+        if spec["request"]["selection"] == "world"
+        else "--oneshot"
+    )
+    options = sorted((*INSTALL_OPTIONS, selection))
+    arguments = [
+        "emerge",
+        *INSTALL_OPTIONS,
+        selection,
+        *spec["request"]["atoms"],
+    ]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "EMERGE_DEFAULT_OPTS": "",
+            "NOCOLOR": "true",
+            "PKGDIR": str(pkgdir),
+            "PORTAGE_BINHOST": "",
+            "PORTAGE_LOGDIR": str(temporary / "log"),
+            "PORTAGE_TMPDIR": str(temporary / "tmp"),
+        }
+    )
+    features = settings.get("FEATURES", "")
+    environment["FEATURES"] = (
+        features
+        + " pkgdir-index-trusted binpkg-ignore-signature"
+        + " -binpkg-request-signature"
+    )
+    (temporary / "log").mkdir()
+    (temporary / "tmp").mkdir()
+    for extra in (["--pretend"], []):
+        try:
+            subprocess.run(
+                [*arguments[:1], *extra, *arguments[1:]],
+                check=True,
+                env=environment,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            phase = "resolution" if extra else "installation"
+            raise LayerError(f"binary-only Portage {phase} failed") from error
+    return options
+
+
+def stage(arguments: argparse.Namespace) -> None:
+    contracts = load_contracts()
+    context = read_contract(
+        contracts,
+        arguments.build_context,
+        BUILD_CONTEXT_SCHEMA,
+    )
+    spec = read_contract(contracts, arguments.build_spec, BUILD_SPEC_SCHEMA)
+    acquisition = read_contract(
+        contracts,
+        arguments.acquisition,
+        PACKAGE_ACQUISITION_SCHEMA,
+    )
+    parent = read_contract(
+        contracts,
+        arguments.parent_generation,
+        GENERATION_SCHEMA,
+    )
+    verify_references(contracts, context, spec, acquisition, parent)
+    portage, settings = verify_runtime(context)
+    artifacts = verify_artifacts(arguments.store, acquisition)
+
+    output = arguments.output_dir
+    if not output.is_absolute():
+        raise LayerError("--output-dir must be absolute")
+    output.mkdir(parents=True, exist_ok=True)
+    expected_outputs = (
+        output / "layer-root",
+        output / "changed-paths.json",
+        output / "tombstones.json",
+        output / "stage-report.json",
+    )
+    if any(path.exists() for path in expected_outputs):
+        raise LayerError("stage output already exists")
+
+    with tempfile.TemporaryDirectory(prefix="volatoo-layer.", dir="/run") as name:
+        temporary = Path(name)
+        pkgdir = create_pkgdir(
+            portage,
+            settings,
+            temporary,
+            acquisition,
+            artifacts,
+        )
+        before_snapshot = snapshot_root()
+        before_cpvs = vdb_cpvs(portage, settings)
+        options = run_emerge(settings, pkgdir, spec, temporary)
+        portage.db[settings["EROOT"]]["vartree"].dbapi._clear_cache()
+        verify_installed(
+            portage,
+            settings,
+            spec,
+            acquisition,
+            before_cpvs,
+        )
+        after_snapshot = snapshot_root()
+
+        changed = sorted(
+            path
+            for path, value in after_snapshot.items()
+            if before_snapshot.get(path) != value
+        )
+        changed = add_changed_parents(changed, after_snapshot)
+        removed = collapse_removed(
+            sorted(set(before_snapshot) - set(after_snapshot))
+        )
+        if not changed:
+            raise LayerError("binary transaction produced no filesystem changes")
+        copy_changed_paths(changed, output / "layer-root", temporary)
+
+    changed_manifest = {
+        "schema": LAYER_PATHS_SCHEMA,
+        "target_id": spec["target_id"],
+        "paths": changed,
+    }
+    tombstones = {
+        "schema": TOMBSTONES_SCHEMA,
+        "target_id": spec["target_id"],
+        "paths": removed,
+    }
+    write_contract(
+        contracts,
+        output / "changed-paths.json",
+        changed_manifest,
+    )
+    write_contract(contracts, output / "tombstones.json", tombstones)
+    world = Path("/var/lib/portage/world")
+    if world.exists():
+        world_digest, _world_size = digest_file(world)
+    else:
+        world_digest = "sha256:" + hashlib.sha256(b"").hexdigest()
+    report = {
+        "schema": "org.volatoo.layer-stage-report/v1",
+        "target_id": spec["target_id"],
+        "build_context_digest": contracts["manifest_digest"](context),
+        "build_spec_digest": contracts["manifest_digest"](spec),
+        "acquisition_digest": contracts["manifest_digest"](acquisition),
+        "parent_generation_digest": contracts["manifest_digest"](parent),
+        "portage_version": portage.VERSION,
+        "portage_options": options,
+        "world_digest": world_digest,
+        "packages": [
+            {
+                "sequence": package["sequence"],
+                "cpv": package["cpv"],
+                "package_digest": package["package_digest"],
+                "artifact_digest": package["artifact_digest"],
+                "build_id": package["build_id"],
+            }
+            for package in acquisition["packages"]
+        ],
+    }
+    write_internal_json(output / "stage-report.json", report)
+    print(f"Staged layer root: {output / 'layer-root'}")
+
+
+def require_stage_report(
+    report: dict[str, Any],
+    contracts: dict[str, Any],
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    acquisition: dict[str, Any],
+    parent: dict[str, Any],
+) -> None:
+    expected_fields = {
+        "schema",
+        "target_id",
+        "build_context_digest",
+        "build_spec_digest",
+        "acquisition_digest",
+        "parent_generation_digest",
+        "portage_version",
+        "portage_options",
+        "world_digest",
+        "packages",
+    }
+    if set(report) != expected_fields:
+        raise LayerError("stage report fields are invalid")
+    expected = {
+        "schema": "org.volatoo.layer-stage-report/v1",
+        "target_id": spec["target_id"],
+        "build_context_digest": contracts["manifest_digest"](context),
+        "build_spec_digest": contracts["manifest_digest"](spec),
+        "acquisition_digest": contracts["manifest_digest"](acquisition),
+        "parent_generation_digest": contracts["manifest_digest"](parent),
+        "portage_version": context["toolchain"]["portage_version"],
+    }
+    for field, value in expected.items():
+        if report.get(field) != value:
+            raise LayerError(f"stage report {field} mismatch")
+    if report.get("portage_options") != sorted(
+        (*INSTALL_OPTIONS, (
+            "--select"
+            if spec["request"]["selection"] == "world"
+            else "--oneshot"
+        ))
+    ):
+        raise LayerError("stage report Portage options mismatch")
+    expected_packages = [
+        {
+            "sequence": package["sequence"],
+            "cpv": package["cpv"],
+            "package_digest": package["package_digest"],
+            "artifact_digest": package["artifact_digest"],
+            "build_id": package["build_id"],
+        }
+        for package in acquisition["packages"]
+    ]
+    if report.get("packages") != expected_packages:
+        raise LayerError("stage report packages differ from acquisition")
+    world_digest = report.get("world_digest")
+    if (
+        not isinstance(world_digest, str)
+        or not world_digest.startswith("sha256:")
+        or len(world_digest) != 71
+    ):
+        raise LayerError("stage report world digest is invalid")
+
+
+def finalize(arguments: argparse.Namespace) -> None:
+    contracts = load_contracts()
+    context = read_contract(
+        contracts,
+        arguments.build_context,
+        BUILD_CONTEXT_SCHEMA,
+    )
+    spec = read_contract(contracts, arguments.build_spec, BUILD_SPEC_SCHEMA)
+    acquisition = read_contract(
+        contracts,
+        arguments.acquisition,
+        PACKAGE_ACQUISITION_SCHEMA,
+    )
+    parent = read_contract(
+        contracts,
+        arguments.parent_generation,
+        GENERATION_SCHEMA,
+    )
+    changed = read_contract(
+        contracts,
+        arguments.changed_paths,
+        LAYER_PATHS_SCHEMA,
+    )
+    tombstones = read_contract(
+        contracts,
+        arguments.tombstones,
+        TOMBSTONES_SCHEMA,
+    )
+    verify_references(contracts, context, spec, acquisition, parent)
+    if changed["target_id"] != spec["target_id"]:
+        raise LayerError("changed paths target differs from BuildSpec")
+    if tombstones["target_id"] != spec["target_id"]:
+        raise LayerError("tombstones target differs from BuildSpec")
+    if not changed["paths"]:
+        raise LayerError("changed paths must not be empty")
+    report = read_json(arguments.stage_report)
+    require_stage_report(
+        report,
+        contracts,
+        context,
+        spec,
+        acquisition,
+        parent,
+    )
+    try:
+        compressor_version = arguments.compressor_version.read_text(
+            encoding="ascii"
+        ).strip()
+    except (OSError, UnicodeError) as error:
+        raise LayerError(f"cannot read compressor version: {error}") from error
+    if compressor_version != "4.7.5":
+        raise LayerError(
+            f"unsupported mksquashfs version: {compressor_version!r}"
+        )
+    require_squashfs(arguments.squashfs)
+    layer_digest, layer_size = digest_file(arguments.squashfs)
+    transaction = {
+        "schema": LAYER_TRANSACTION_SCHEMA,
+        "target_id": spec["target_id"],
+        "build_context_digest": contracts["manifest_digest"](context),
+        "build_spec_digest": contracts["manifest_digest"](spec),
+        "acquisition_digest": contracts["manifest_digest"](acquisition),
+        "parent_generation_digest": contracts["manifest_digest"](parent),
+        "portage": {
+            "version": report["portage_version"],
+            "adapter": PORTAGE_ADAPTER,
+            "options": report["portage_options"],
+        },
+        "packages": report["packages"],
+        "filesystem": {
+            "changed_paths_digest": contracts["manifest_digest"](changed),
+            "changed_paths_count": len(changed["paths"]),
+            "tombstones_digest": contracts["manifest_digest"](tombstones),
+            "tombstones_count": len(tombstones["paths"]),
+            "rootfs_digest": layer_digest,
+            "rootfs_size": layer_size,
+            "format": "squashfs",
+            "builder": {
+                "implementation": "squashfs-tools",
+                "version": compressor_version,
+                "compression": "zstd",
+                "level": 19,
+                "block_size": 1048576,
+                "reproducible": True,
+            },
+        },
+        "world_digest": report["world_digest"],
+    }
+    write_contract(contracts, arguments.transaction, transaction)
+    transaction_digest = contracts["manifest_digest"](transaction)
+    generation = {
+        **parent,
+        "layers": [
+            *parent["layers"],
+            {
+                "rootfs_digest": layer_digest,
+                "rootfs_size": layer_size,
+                "format": "squashfs",
+                "tombstones_digest": contracts["manifest_digest"](tombstones),
+                "transaction_digest": transaction_digest,
+            },
+        ],
+    }
+    write_contract(contracts, arguments.generation, generation)
+    print(f"Layer transaction: {arguments.transaction}")
+    print(f"Generation candidate: {arguments.generation}")
+
+
+def absolute_path(value: str) -> Path:
+    path = Path(value)
+    if not path.is_absolute():
+        raise argparse.ArgumentTypeError("path must be absolute")
+    return path
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Stage and finalize a Volatoo binary package layer."
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    stage_parser = subparsers.add_parser("stage")
+    stage_parser.add_argument("--build-context", required=True, type=Path)
+    stage_parser.add_argument("--build-spec", required=True, type=Path)
+    stage_parser.add_argument("--acquisition", required=True, type=Path)
+    stage_parser.add_argument("--parent-generation", required=True, type=Path)
+    stage_parser.add_argument("--store", required=True, type=absolute_path)
+    stage_parser.add_argument("--output-dir", required=True, type=absolute_path)
+    stage_parser.set_defaults(handler=stage)
+
+    finalize_parser = subparsers.add_parser("finalize")
+    finalize_parser.add_argument("--build-context", required=True, type=Path)
+    finalize_parser.add_argument("--build-spec", required=True, type=Path)
+    finalize_parser.add_argument("--acquisition", required=True, type=Path)
+    finalize_parser.add_argument(
+        "--parent-generation",
+        required=True,
+        type=Path,
+    )
+    finalize_parser.add_argument("--changed-paths", required=True, type=Path)
+    finalize_parser.add_argument("--tombstones", required=True, type=Path)
+    finalize_parser.add_argument("--stage-report", required=True, type=Path)
+    finalize_parser.add_argument("--squashfs", required=True, type=Path)
+    finalize_parser.add_argument(
+        "--compressor-version",
+        required=True,
+        type=Path,
+    )
+    finalize_parser.add_argument(
+        "--transaction",
+        required=True,
+        type=absolute_path,
+    )
+    finalize_parser.add_argument(
+        "--generation",
+        required=True,
+        type=absolute_path,
+    )
+    finalize_parser.set_defaults(handler=finalize)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        arguments.handler(arguments)
+    except LayerError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

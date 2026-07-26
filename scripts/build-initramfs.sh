@@ -108,7 +108,7 @@ install -m 0755 "$busybox_path" "$root_dir/bin/busybox"
 install -m 0755 "$repo_root/initramfs/init" "$root_dir/init"
 install -m 0644 "$config_path" "$root_dir/etc/volatoo/initramfs.conf"
 
-applets=(blkid cat cp date df dmesg losetup ls mkdir modprobe mount poweroff printf reboot setsid sh sha256sum sleep switch_root tail umount uname)
+applets=(blkid cat cp date df dmesg losetup ls mkdir modprobe mount poweroff printf reboot rm setsid sh sha256sum sleep switch_root tail umount uname wc)
 for applet in "${applets[@]}"; do
 	ln -s busybox "$root_dir/bin/$applet"
 done

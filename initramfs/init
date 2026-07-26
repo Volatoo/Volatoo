@@ -29,6 +29,10 @@ rescue_shell() {
 	echo "state required: ${state_required:-unset}"
 	echo "state device: ${state_device:-not found}"
 	echo "state mounted: ${state_mounted:-0}"
+	echo "system layout: ${system_layout_version:-none}"
+	echo "generation mode: ${generation_mode:-unset}"
+	echo "generation selected: ${generation_digest:-legacy image}"
+	echo "generation error: ${generation_error:-none}"
 	echo
 	echo "=== Block devices and filesystems ==="
 	if ! cat /proc/partitions 2>/dev/null; then
@@ -385,6 +389,457 @@ apply_persist_config() {
 	done <"$persist_config_path"
 }
 
+valid_generation_digest() {
+	candidate_digest=$1
+	if [ "${#candidate_digest}" -ne 71 ]; then
+		return 1
+	fi
+	case $candidate_digest in
+		sha256:*) ;;
+		*) return 1 ;;
+	esac
+	case ${candidate_digest#sha256:} in
+		'' | *[!0-9a-f]*) return 1 ;;
+	esac
+}
+
+verify_generation_file() {
+	verify_path=$1
+	verify_digest=$2
+	verify_size=${3:-}
+
+	if [ -L "$verify_path" ] || [ ! -f "$verify_path" ]; then
+		generation_error="missing or unsafe object: $verify_path"
+		return 1
+	fi
+	if ! verify_output=$(sha256sum "$verify_path" 2>/dev/null); then
+		generation_error="could not hash object: $verify_path"
+		return 1
+	fi
+	if [ "${verify_output%% *}" != "${verify_digest#sha256:}" ]; then
+		generation_error="object digest mismatch: $verify_path"
+		return 1
+	fi
+	if [ -n "$verify_size" ]; then
+		case $verify_size in
+			'' | *[!0-9]*)
+				generation_error="object has invalid declared size: $verify_path"
+				return 1
+				;;
+		esac
+		if [ "$verify_size" -lt 1 ]; then
+			generation_error="object has invalid declared size: $verify_path"
+			return 1
+		fi
+		actual_size=$(wc -c <"$verify_path")
+		if [ "$actual_size" -ne "$verify_size" ]; then
+			generation_error="object size mismatch: $verify_path"
+			return 1
+		fi
+	fi
+}
+
+generation_object_path() {
+	object_digest=$1
+	printf '/state/volatoo/system/objects/sha256/%s\n' \
+		"${object_digest#sha256:}"
+}
+
+valid_generation_path() {
+	candidate_path=$1
+	case $candidate_path in
+		/*) ;;
+		*) return 1 ;;
+	esac
+	if [ "$candidate_path" = / ] || \
+		[ "${candidate_path%/}" != "$candidate_path" ]; then
+		return 1
+	fi
+	case "/${candidate_path#/}/" in
+		*//* | */../* | */./*) return 1 ;;
+	esac
+	case "$candidate_path/" in
+		/dev/* | /proc/* | /run/* | /sys/* | /.volatoo/*) return 1 ;;
+	esac
+}
+
+prepare_generation() {
+	candidate_generation=$1
+	generation_error=
+	generation_selected=0
+	generation_layer_count=0
+	generation_target_id=
+	generation_context_digest=
+	generation_base_digest=
+	generation_base_size=
+	generation_base_path=
+	rm -f /generation/layers
+	for stale_tombstones in /generation/tombstones.*; do
+		if [ -e "$stale_tombstones" ] || [ -L "$stale_tombstones" ]; then
+			rm -f "$stale_tombstones"
+		fi
+	done
+
+	if ! valid_generation_digest "$candidate_generation"; then
+		generation_error="malformed generation digest: $candidate_generation"
+		return 1
+	fi
+	generation_name=${candidate_generation#sha256:}
+	generation_manifest=/state/volatoo/system/manifests/$generation_name.json
+	if ! verify_generation_file \
+		"$generation_manifest" "$candidate_generation"; then
+		return 1
+	fi
+
+	generation_plan_pointer=/state/volatoo/system/plans/$generation_name
+	if [ -L "$generation_plan_pointer" ] || \
+		[ ! -f "$generation_plan_pointer" ]; then
+		generation_error="missing or unsafe boot plan pointer"
+		return 1
+	fi
+	plan_pointer_lines=$(wc -l <"$generation_plan_pointer")
+	if [ "$plan_pointer_lines" -ne 1 ] || \
+		! IFS= read -r generation_plan_digest \
+			<"$generation_plan_pointer" || \
+		! valid_generation_digest "$generation_plan_digest"; then
+		generation_error="malformed boot plan pointer"
+		return 1
+	fi
+	generation_plan=$(generation_object_path "$generation_plan_digest")
+	if ! verify_generation_file \
+		"$generation_plan" "$generation_plan_digest"; then
+		return 1
+	fi
+
+	exec 4<"$generation_plan"
+	if ! IFS= read -r plan_line <&4 || \
+		[ "$plan_line" != VOLATOO_GENERATION_V1 ]; then
+		generation_error="boot plan has an invalid header"
+		exec 4<&-
+		return 1
+	fi
+	if ! IFS= read -r plan_line <&4; then
+		generation_error="boot plan has no generation record"
+		exec 4<&-
+		return 1
+	fi
+	set -f
+	# Intentional splitting parses the token-only boot-plan records.
+	# shellcheck disable=SC2086
+	set -- $plan_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != generation ] || \
+		[ "$2" != "$candidate_generation" ]; then
+		generation_error="boot plan generation record differs"
+		exec 4<&-
+		return 1
+	fi
+
+	if ! IFS= read -r plan_line <&4; then
+		generation_error="boot plan has no target record"
+		exec 4<&-
+		return 1
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $plan_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != target ]; then
+		generation_error="boot plan target record is malformed"
+		exec 4<&-
+		return 1
+	fi
+	generation_target_id=$2
+	case $generation_target_id in
+		*/*) ;;
+		*)
+			generation_error="boot plan target is not an identifier"
+			exec 4<&-
+			return 1
+			;;
+	esac
+	case $generation_target_id in
+		*[!abcdefghijklmnopqrstuvwxyz0123456789._+/-]*)
+			generation_error="boot plan target contains unsupported characters"
+			exec 4<&-
+			return 1
+			;;
+	esac
+
+	if ! IFS= read -r plan_line <&4; then
+		generation_error="boot plan has no context record"
+		exec 4<&-
+		return 1
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $plan_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != context ] || \
+		! valid_generation_digest "$2"; then
+		generation_error="boot plan context record is malformed"
+		exec 4<&-
+		return 1
+	fi
+	generation_context_digest=$2
+	context_object=$(generation_object_path "$generation_context_digest")
+	if ! verify_generation_file \
+		"$context_object" "$generation_context_digest"; then
+		exec 4<&-
+		return 1
+	fi
+
+	if ! IFS= read -r plan_line <&4; then
+		generation_error="boot plan has no base record"
+		exec 4<&-
+		return 1
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $plan_line
+	set +f
+	if [ "$#" -ne 3 ] || [ "$1" != base ] || \
+		! valid_generation_digest "$2"; then
+		generation_error="boot plan base record is malformed"
+		exec 4<&-
+		return 1
+	fi
+	generation_base_digest=$2
+	generation_base_size=$3
+	generation_base_path=$(generation_object_path "$generation_base_digest")
+	if ! verify_generation_file \
+		"$generation_base_path" \
+		"$generation_base_digest" \
+		"$generation_base_size"; then
+		exec 4<&-
+		return 1
+	fi
+
+	while IFS= read -r plan_line <&4; do
+		if [ "$plan_line" = end ]; then
+			if IFS= read -r _ <&4; then
+				generation_error="boot plan contains records after end"
+				exec 4<&-
+				return 1
+			fi
+			exec 4<&-
+			generation_digest=$candidate_generation
+			generation_selected=1
+			image_sha256=${candidate_generation#sha256:}
+			echo "[volatoo] generation verified: $generation_digest"
+			return 0
+		fi
+
+		set -f
+		# shellcheck disable=SC2086
+		set -- $plan_line
+		set +f
+		if [ "$#" -ne 5 ] || [ "$1" != layer ] || \
+			! valid_generation_digest "$2" || \
+			! valid_generation_digest "$4" || \
+			! valid_generation_digest "$5"; then
+			generation_error="boot plan layer record is malformed"
+			exec 4<&-
+			return 1
+		fi
+		generation_layer_digest=$2
+		generation_layer_size=$3
+		generation_tombstones_digest=$4
+		generation_transaction_digest=$5
+		generation_layer_path=$(
+			generation_object_path "$generation_layer_digest"
+		)
+		if ! verify_generation_file \
+			"$generation_layer_path" \
+			"$generation_layer_digest" \
+			"$generation_layer_size"; then
+			exec 4<&-
+			return 1
+		fi
+		generation_tombstones_path=$(
+			generation_object_path "$generation_tombstones_digest"
+		)
+		if ! verify_generation_file \
+			"$generation_tombstones_path" \
+			"$generation_tombstones_digest"; then
+			exec 4<&-
+			return 1
+		fi
+		generation_transaction_path=$(
+			generation_object_path "$generation_transaction_digest"
+		)
+		if ! verify_generation_file \
+			"$generation_transaction_path" \
+			"$generation_transaction_digest"; then
+			exec 4<&-
+			return 1
+		fi
+
+		generation_layer_count=$((generation_layer_count + 1))
+		if [ "$generation_layer_count" -gt 128 ]; then
+			generation_error="boot plan exceeds 128 layers"
+			exec 4<&-
+			return 1
+		fi
+		printf '%s %s %s %s %s\n' \
+			"$generation_layer_count" \
+			"$generation_layer_digest" \
+			"$generation_layer_size" \
+			"$generation_tombstones_digest" \
+			"$generation_transaction_digest" \
+			>>/generation/layers
+
+		while IFS= read -r plan_line <&4; do
+			if [ "$plan_line" = endlayer ]; then
+				break
+			fi
+			case $plan_line in
+				remove\ *) generation_remove_path=${plan_line#remove } ;;
+				*)
+					generation_error="boot plan layer body is malformed"
+					exec 4<&-
+					return 1
+					;;
+			esac
+			if ! valid_generation_path "$generation_remove_path"; then
+				generation_error="boot plan has unsafe tombstone: $generation_remove_path"
+				exec 4<&-
+				return 1
+			fi
+			printf '%s\n' "$generation_remove_path" \
+				>>"/generation/tombstones.$generation_layer_count"
+		done
+		if [ "$plan_line" != endlayer ]; then
+			generation_error="boot plan layer is not terminated"
+			exec 4<&-
+			return 1
+		fi
+	done
+
+	generation_error="boot plan has no end record"
+	exec 4<&-
+	return 1
+}
+
+prepare_generation_pointer() {
+	pointer_name=$1
+	pointer_path=/state/volatoo/system/$pointer_name
+	if [ -L "$pointer_path" ] || [ ! -f "$pointer_path" ]; then
+		generation_error="$pointer_name pointer is missing or unsafe"
+		return 1
+	fi
+	pointer_lines=$(wc -l <"$pointer_path")
+	if [ "$pointer_lines" -ne 1 ] || \
+		! IFS= read -r pointer_digest <"$pointer_path"; then
+		generation_error="$pointer_name pointer is malformed"
+		return 1
+	fi
+	prepare_generation "$pointer_digest"
+}
+
+select_generation_from_state() {
+	if [ "$generation_mode" = none ]; then
+		echo "[volatoo] generation selection disabled for this boot"
+		return
+	fi
+	if [ "$system_layout_version" != 1 ]; then
+		case $generation_mode in
+			auto)
+				echo "[volatoo] state has no system generation layout"
+				return
+				;;
+			*)
+				fatal generation.layout \
+					"selected generation mode requires system layout version 1"
+				;;
+		esac
+	fi
+
+	case $generation_mode in
+		auto)
+			if [ ! -e /state/volatoo/system/current ] && \
+				[ ! -L /state/volatoo/system/current ]; then
+				echo "[volatoo] no current generation; using configured image"
+				return
+			fi
+			if prepare_generation_pointer current; then
+				return
+			fi
+			current_generation_error=$generation_error
+			echo "[volatoo] warning: current generation rejected: $generation_error"
+			if prepare_generation_pointer previous; then
+				echo "[volatoo] warning: booting verified previous generation"
+				return
+			fi
+			fatal generation.unbootable \
+				"current failed ($current_generation_error); previous failed ($generation_error)"
+			;;
+		previous)
+			if ! prepare_generation_pointer previous; then
+				fatal generation.previous "$generation_error"
+			fi
+			;;
+		sha256:*)
+			if ! prepare_generation "$generation_mode"; then
+				fatal generation.selected "$generation_error"
+			fi
+			;;
+	esac
+}
+
+apply_generation_layers() {
+	if [ "$generation_selected" -ne 1 ] || \
+		[ "$generation_layer_count" -eq 0 ]; then
+		return
+	fi
+
+	echo "[volatoo] applying $generation_layer_count generation layers"
+	while IFS=' ' read -r \
+		layer_number \
+		layer_digest \
+		_layer_size \
+		_layer_tombstones_digest \
+		_layer_transaction_digest; do
+		tombstone_file=/generation/tombstones.$layer_number
+		if [ -f "$tombstone_file" ]; then
+			while IFS= read -r tombstone_path || \
+				[ -n "$tombstone_path" ]; do
+				echo "[volatoo] removing generation path: $tombstone_path"
+				if ! rm -rf "/newroot$tombstone_path"; then
+					fatal generation.tombstone \
+						"could not remove path: $tombstone_path"
+				fi
+			done <"$tombstone_file"
+		fi
+
+		layer_object=$(generation_object_path "$layer_digest")
+		layer_loop_device=$(losetup -f)
+		if [ -z "$layer_loop_device" ] || \
+			! losetup -r "$layer_loop_device" "$layer_object"; then
+			fatal generation.layer-loop \
+				"could not attach layer $layer_number"
+		fi
+		if ! mount -t squashfs -o ro "$layer_loop_device" /layer; then
+			losetup -d "$layer_loop_device" || true
+			fatal generation.layer-mount \
+				"could not mount layer $layer_number"
+		fi
+		if ! cp -a /layer/. /newroot/; then
+			umount /layer || true
+			losetup -d "$layer_loop_device" || true
+			fatal generation.layer-copy \
+				"could not apply layer $layer_number"
+		fi
+		umount /layer ||
+			fatal generation.layer-unmount \
+				"could not unmount layer $layer_number"
+		losetup -d "$layer_loop_device" ||
+			fatal generation.layer-detach \
+				"could not detach layer $layer_number"
+		echo "[volatoo] generation layer applied: $layer_number"
+	done </generation/layers
+}
+
 config_file=/etc/volatoo/initramfs.conf
 if [ -r "$config_file" ]; then
 	# The configuration is trusted input baked into the initramfs.
@@ -401,12 +856,19 @@ root_mode=${VOLATOO_ROOT_MODE:-copy}
 tmpfs_size=${VOLATOO_TMPFS_SIZE:-80%}
 state_spec=${VOLATOO_STATE:-LABEL=VOLATOO-STATE}
 state_required=${VOLATOO_STATE_REQUIRED:-no}
+generation_mode=${VOLATOO_GENERATION:-auto}
 state_device=
 state_mounted=0
+state_layout_version=
+system_layout_version=
+generation_selected=0
+generation_digest=
+generation_error=
 persist_config=
 persist_sync_configured=0
 
-mkdir -p /dev /image /newroot /overlay /proc /source /state /sys
+mkdir -p \
+	/dev /generation /image /layer /newroot /overlay /proc /source /state /sys
 
 if ! mount -t devtmpfs devtmpfs /dev; then
 	fatal mount.devtmpfs "could not mount devtmpfs at /dev"
@@ -432,6 +894,7 @@ for argument in $(cat /proc/cmdline 2>/dev/null); do
 		volatoo.tmpfs-size=*) tmpfs_size=${argument#volatoo.tmpfs-size=} ;;
 		volatoo.state=*) state_spec=${argument#volatoo.state=} ;;
 		volatoo.state-required=*) state_required=${argument#volatoo.state-required=} ;;
+		volatoo.generation=*) generation_mode=${argument#volatoo.generation=} ;;
 	esac
 done
 
@@ -549,6 +1012,15 @@ if [ "$state_spec" = none ] && [ "$state_required" = yes ]; then
 		"state-required=yes cannot be combined with state=none"
 fi
 
+case $generation_mode in
+	auto | previous | none | sha256:*)
+		;;
+	*)
+		fatal config.generation \
+			"generation must be auto, previous, none, or sha256:<digest>"
+		;;
+esac
+
 echo "[volatoo] kernel: $(uname -srmo)"
 echo "[volatoo] command line: $(cat /proc/cmdline 2>/dev/null)"
 
@@ -653,7 +1125,39 @@ else
 					"state layout has no safe directory: ${state_layout_directory#/state}"
 			fi
 		done
-		echo "[volatoo] state layout version 1 mounted read-write"
+		if [ -e /state/volatoo/system ] || \
+			[ -L /state/volatoo/system ]; then
+			if [ -L /state/volatoo/system ] || \
+				[ ! -d /state/volatoo/system ]; then
+				fatal state.layout-directory \
+					"state system layout is not a safe directory"
+			fi
+			system_layout_file=/state/volatoo/system/layout-version
+			if [ -L "$system_layout_file" ] || \
+				[ ! -f "$system_layout_file" ]; then
+				fatal state.layout-missing \
+					"state system layout has no safe layout-version file"
+			fi
+			IFS= read -r system_layout_version \
+				<"$system_layout_file" || true
+			if [ "$system_layout_version" != 1 ]; then
+				fatal state.layout-version \
+					"unsupported system layout version: ${system_layout_version:-empty}"
+			fi
+			for state_system_directory in \
+				/state/volatoo/system/manifests \
+				/state/volatoo/system/objects/sha256 \
+				/state/volatoo/system/plans \
+				/state/volatoo/system/staging; do
+				if [ -L "$state_system_directory" ] || \
+					[ ! -d "$state_system_directory" ]; then
+					fatal state.layout-directory \
+						"state layout has no safe directory: ${state_system_directory#/state}"
+				fi
+			done
+			echo "[volatoo] system layout version 1 available"
+		fi
+		echo "[volatoo] state layout version $state_layout_version mounted read-write"
 		if [ -L /state/volatoo/config/persist.conf ]; then
 			fatal state.config \
 				"persistence configuration must not be a symbolic link"
@@ -669,10 +1173,26 @@ else
 	fi
 fi
 
+if [ "$state_mounted" -eq 1 ]; then
+	select_generation_from_state
+elif [ "$generation_mode" != auto ] && [ "$generation_mode" != none ]; then
+	fatal generation.state \
+		"explicit generation selection requires a mounted state filesystem"
+fi
+
 image_source=$image_device
 loop_device=
 source_mounted=0
-if [ -n "$image_file" ]; then
+if [ "$generation_selected" -eq 1 ]; then
+	loop_device=$(losetup -f)
+	if [ -z "$loop_device" ] || \
+		! losetup -r "$loop_device" "$generation_base_path"; then
+		fatal generation.base-loop \
+			"could not attach selected generation base"
+	fi
+	image_source=$loop_device
+	echo "[volatoo] selected generation base attached: $generation_base_digest"
+elif [ -n "$image_file" ]; then
 	echo "[volatoo] mounting image container from $image_device"
 	if ! mount -o ro "$image_device" /source; then
 		fatal image.container-mount \
@@ -737,6 +1257,8 @@ case $root_mode in
 		;;
 esac
 
+apply_generation_layers
+
 if [ -n "$persist_config" ]; then
 	validate_persist_config "$persist_config"
 	if [ "$persist_sync_configured" -eq 1 ] && [ -z "$image_sha256" ]; then
@@ -744,6 +1266,15 @@ if [ -n "$persist_config" ]; then
 			"sync policies require a verified image SHA-256"
 	fi
 	apply_persist_config "$persist_config"
+fi
+
+if [ "$generation_selected" -eq 1 ]; then
+	mkdir -p /newroot/.volatoo
+	if ! printf '%s\n' "$generation_digest" \
+		>/newroot/.volatoo/generation-id; then
+		fatal generation.identity \
+			"could not publish the selected generation id"
+	fi
 fi
 
 if [ ! -x "/newroot$target_init" ]; then

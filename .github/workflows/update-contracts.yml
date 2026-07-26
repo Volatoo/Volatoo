@@ -1,0 +1,101 @@
+name: Update contracts
+
+on:
+  push:
+    paths:
+      - ".github/workflows/update-contracts.yml"
+      - "docs/design/atomic-package-updates.md"
+      - "docs/design/state-layout.md"
+      - "initramfs/**"
+      - "scripts/build-initramfs.sh"
+      - "scripts/build-state-image.sh"
+      - "scripts/run-phase0-qemu.sh"
+      - "scripts/test-qemu-boot.sh"
+      - "update/**"
+  pull_request:
+    paths:
+      - ".github/workflows/update-contracts.yml"
+      - "docs/design/atomic-package-updates.md"
+      - "docs/design/state-layout.md"
+      - "initramfs/**"
+      - "scripts/build-initramfs.sh"
+      - "scripts/build-state-image.sh"
+      - "scripts/run-phase0-qemu.sh"
+      - "scripts/test-qemu-boot.sh"
+      - "update/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate update contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Check shell sources
+        run: |
+          shellcheck \
+            initramfs/init \
+            scripts/build-initramfs.sh \
+            scripts/build-state-image.sh \
+            scripts/run-phase0-qemu.sh \
+            scripts/test-qemu-boot.sh \
+            update/compose-layer-docker.sh \
+            update/compact-generation-docker.sh \
+            update/layer-container/compact-generation.sh \
+            update/layer-container/compress-layer.sh \
+            update/tests/prepare-generation-qemu-fixture.sh \
+            update/tests/test-volatoo-manifest.sh \
+            update/tests/test-volatoo-plan-docker.sh \
+            update/tests/test-volatoo-acquire-docker.sh \
+            update/tests/test-volatoo-layer-docker.sh \
+            update/tests/test-volatoo-generation.sh \
+            update/tests/test-volatoo-activate.sh \
+            update/tests/test-volatoo-engine.sh \
+            update/tests/test-volatoo-compaction-docker.sh \
+            update/tests/test-volatoo-generation-qemu.sh
+
+      - name: Check Python and JSON syntax
+        run: |
+          python3 -m py_compile \
+            update/volatoo-manifest \
+            update/volatoo-plan \
+            update/volatoo-acquire \
+            update/volatoo-layer \
+            update/volatoo-generation \
+            update/volatoo-activate \
+            update/volatoo-engine \
+            update/tests/fake-portage-engine.py
+          for schema in update/schemas/*.json; do
+            python3 -m json.tool "$schema" >/dev/null
+          done
+
+      - name: Test manifest contracts
+        run: update/tests/test-volatoo-manifest.sh
+
+      - name: Test generation publication and rollback
+        run: update/tests/test-volatoo-generation.sh
+
+      - name: Test live service activation
+        run: update/tests/test-volatoo-activate.sh
+
+      - name: Test Portage planner
+        run: update/tests/test-volatoo-plan-docker.sh
+
+      - name: Test package acquisition
+        run: update/tests/test-volatoo-acquire-docker.sh
+
+      - name: Test Portage Engine adapter
+        run: update/tests/test-volatoo-engine.sh
+
+      - name: Test binary-only layer composition
+        run: update/tests/test-volatoo-layer-docker.sh
+
+      - name: Test base compaction
+        run: update/tests/test-volatoo-compaction-docker.sh

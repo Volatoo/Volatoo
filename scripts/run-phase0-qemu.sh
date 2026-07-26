@@ -22,6 +22,7 @@ Optional environment variables:
   VOLATOO_STATE_IMAGE  Writable state filesystem image to attach (default: none)
   VOLATOO_STATE        State device spec (default with image: LABEL=VOLATOO-STATE)
   VOLATOO_STATE_REQUIRED Require state discovery: yes or no (default: configured)
+  VOLATOO_GENERATION   Generation selector: auto, previous, none, or sha256:...
   VOLATOO_QEMU_MACHINE QEMU machine type (default: pc)
   VOLATOO_QEMU_FIRMWARE Optional read-only UEFI code image; BIOS when empty
   VOLATOO_QEMU_VARS    Optional writable UEFI variables image
@@ -78,6 +79,7 @@ qemu_firmware=${VOLATOO_QEMU_FIRMWARE:-}
 qemu_vars=${VOLATOO_QEMU_VARS:-}
 state_location=${VOLATOO_STATE:-}
 state_required=${VOLATOO_STATE_REQUIRED:-}
+generation_mode=${VOLATOO_GENERATION:-}
 
 if [[ ! $qemu_machine =~ ^[[:alnum:]_.-]+$ ]]; then
 	echo "error: VOLATOO_QEMU_MACHINE contains unsupported characters" >&2
@@ -119,6 +121,17 @@ if [[ -n $state_required ]]; then
 		exit 1
 	fi
 	kernel_args="$kernel_args volatoo.state-required=$state_required"
+fi
+
+if [[ -n $generation_mode ]]; then
+	if [[ $generation_mode != auto && \
+		$generation_mode != previous && \
+		$generation_mode != none && \
+		! $generation_mode =~ ^sha256:[0-9a-f]{64}$ ]]; then
+		echo "error: VOLATOO_GENERATION has an invalid selector" >&2
+		exit 1
+	fi
+	kernel_args="$kernel_args volatoo.generation=$generation_mode"
 fi
 
 if [[ -n $image_path ]]; then

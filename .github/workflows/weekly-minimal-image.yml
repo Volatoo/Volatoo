@@ -6,15 +6,19 @@ on:
       - ".github/workflows/weekly-minimal-image.yml"
       - "image/catalyst/**"
       - "persist/**"
+      - "scripts/tests/test-image-init-selection.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
+      - "scripts/test-qemu-boot.sh"
   pull_request:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
       - "image/catalyst/**"
       - "persist/**"
+      - "scripts/tests/test-image-init-selection.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
+      - "scripts/test-qemu-boot.sh"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -28,9 +32,15 @@ concurrency:
 
 jobs:
   validate:
-    name: Validate image pipeline
+    name: Validate image pipeline (${{ matrix.init_system }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        init_system:
+          - openrc
+          - systemd
 
     steps:
       - name: Check out source
@@ -41,23 +51,39 @@ jobs:
           shellcheck \
             scripts/build-catalyst-squashfs.sh \
             scripts/fetch-gentoo-inputs.sh \
+            scripts/test-qemu-boot.sh \
+            scripts/tests/test-image-init-selection.sh \
             image/catalyst/finalize.sh \
             image/catalyst/container/run-catalyst.sh
+
+      - name: Test init-system selection
+        run: scripts/tests/test-image-init-selection.sh
 
       - name: Verify and resolve Gentoo metadata
         run: |
           scripts/fetch-gentoo-inputs.sh \
-            --metadata-only "$RUNNER_TEMP/gentoo-inputs"
+            --init-system "${{ matrix.init_system }}" \
+            --metadata-only \
+            "$RUNNER_TEMP/gentoo-inputs-${{ matrix.init_system }}"
 
       - name: Validate Catalyst builder and spec
-        run: scripts/build-catalyst-squashfs.sh --validate-only
+        run: |
+          scripts/build-catalyst-squashfs.sh \
+            --init-system "${{ matrix.init_system }}" \
+            --validate-only
 
   build:
-    name: Build minimal image
+    name: Build minimal image (${{ matrix.init_system }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: validate
     runs-on: ubuntu-24.04
     timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        init_system:
+          - openrc
+          - systemd
 
     steps:
       - name: Check out source
@@ -66,7 +92,9 @@ jobs:
       - name: Download verified Gentoo inputs
         id: inputs
         run: |
-          scripts/fetch-gentoo-inputs.sh "$RUNNER_TEMP/gentoo-inputs" \
+          scripts/fetch-gentoo-inputs.sh \
+            --init-system "${{ matrix.init_system }}" \
+            "$RUNNER_TEMP/gentoo-inputs-${{ matrix.init_system }}" \
             >>"$GITHUB_OUTPUT"
 
       - name: Select image version
@@ -81,11 +109,12 @@ jobs:
           VERSION: ${{ steps.version.outputs.value }}
         run: |
           scripts/build-catalyst-squashfs.sh \
+            --init-system "${{ matrix.init_system }}" \
             --stage3 "$STAGE3_PATH" \
             --snapshot "$SNAPSHOT_PATH" \
             --snapshot-id "$SNAPSHOT_ID" \
             --version "$VERSION" \
-            "out/volatoo-minimal-${VERSION}.squashfs"
+            "out/volatoo-minimal-${{ matrix.init_system }}-${VERSION}.squashfs"
 
       - name: Write build manifest
         env:
@@ -97,9 +126,10 @@ jobs:
           SNAPSHOT_URL: ${{ steps.inputs.outputs.snapshot_url }}
           VERSION: ${{ steps.version.outputs.value }}
         run: |
-          image="out/volatoo-minimal-${VERSION}.squashfs"
+          image="out/volatoo-minimal-${{ matrix.init_system }}-${VERSION}.squashfs"
           {
             echo "version=${VERSION}"
+            echo "init_system=${{ matrix.init_system }}"
             echo "git_commit=${GITHUB_SHA}"
             echo "workflow_run=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
             echo "stage3=${STAGE3_NAME}"
@@ -109,16 +139,16 @@ jobs:
             echo "snapshot_url=${SNAPSHOT_URL}"
             echo "snapshot_sha512=${SNAPSHOT_SHA512}"
             echo "image_sha256=$(awk '{ print $1 }' "${image}.sha256")"
-          } >"out/volatoo-minimal-${VERSION}.build-info"
+          } >"out/volatoo-minimal-${{ matrix.init_system }}-${VERSION}.build-info"
 
       - name: Upload image and provenance
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: volatoo-minimal-${{ steps.version.outputs.value }}
+          name: volatoo-minimal-${{ matrix.init_system }}-${{ steps.version.outputs.value }}
           path: |
-            out/volatoo-minimal-${{ steps.version.outputs.value }}.squashfs
-            out/volatoo-minimal-${{ steps.version.outputs.value }}.squashfs.sha256
-            out/volatoo-minimal-${{ steps.version.outputs.value }}.build-info
+            out/volatoo-minimal-${{ matrix.init_system }}-${{ steps.version.outputs.value }}.squashfs
+            out/volatoo-minimal-${{ matrix.init_system }}-${{ steps.version.outputs.value }}.squashfs.sha256
+            out/volatoo-minimal-${{ matrix.init_system }}-${{ steps.version.outputs.value }}.build-info
           if-no-files-found: error
           compression-level: 0
           retention-days: 14

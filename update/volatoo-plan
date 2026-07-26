@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+
+"""Resolve a package transaction into an immutable Volatoo BuildSpec."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any
+
+
+BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
+PACKAGE_SOURCE_QUERY_SCHEMA = "org.volatoo.package-source-query/v1"
+PORTAGE_ADAPTER = "portage-3.0-depgraph-v1"
+REVISION_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
+MAX_INPUT_SIZE = 1024 * 1024
+
+RESOLVER_OPTIONS = (
+    "--autounmask=n",
+    "--backtrack=30",
+    "--binpkg-changed-deps=y",
+    "--binpkg-respect-use=y",
+    "--complete-graph=y",
+    "--pretend",
+    "--quiet",
+    "--with-bdeps=y",
+)
+
+
+class PlannerError(RuntimeError):
+    pass
+
+
+def reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    value: dict[str, Any] = {}
+    for key, item in pairs:
+        if key in value:
+            raise PlannerError(f"duplicate JSON key: {key}")
+        value[key] = item
+    return value
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise PlannerError(f"cannot read {path}: {error}") from error
+    if len(raw) > MAX_INPUT_SIZE:
+        raise PlannerError(f"{path} exceeds {MAX_INPUT_SIZE} bytes")
+    try:
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except UnicodeError as error:
+        raise PlannerError(f"{path} is not UTF-8: {error}") from error
+    except json.JSONDecodeError as error:
+        raise PlannerError(
+            f"invalid JSON in {path} at line {error.lineno}, "
+            f"column {error.colno}: {error.msg}"
+        ) from error
+    if not isinstance(value, dict):
+        raise PlannerError(f"{path} must contain a JSON object")
+    return value
+
+
+def reject_nonstandard_constant(token: str) -> None:
+    raise PlannerError(f"unsupported JSON value: {token}")
+
+
+def canonical_bytes(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def digest(value: dict[str, Any]) -> str:
+    return "sha256:" + hashlib.sha256(canonical_bytes(value)).hexdigest()
+
+
+def validate_with_contract_tool(path: Path) -> None:
+    tool = Path(__file__).with_name("volatoo-manifest")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(tool), "validate", str(path)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise PlannerError(f"cannot execute {tool}: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.strip() or "contract validation failed"
+        raise PlannerError(detail.removeprefix("error: "))
+
+
+def validate_document(value: dict[str, Any]) -> None:
+    tool = Path(__file__).with_name("volatoo-manifest")
+    try:
+        result = subprocess.run(
+            [sys.executable, str(tool), "validate", "-"],
+            check=False,
+            input=canonical_bytes(value),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except OSError as error:
+        raise PlannerError(f"cannot execute {tool}: {error}") from error
+    if result.returncode != 0:
+        detail = result.stderr.decode("utf-8", errors="replace").strip()
+        raise PlannerError(
+            (detail or "contract validation failed").removeprefix("error: ")
+        )
+
+
+def repository_revision(location: Path) -> str:
+    if (location / ".git").exists():
+        try:
+            revision_result = subprocess.run(
+                ["git", "-C", str(location), "rev-parse", "HEAD"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            status_result = subprocess.run(
+                ["git", "-C", str(location), "status", "--porcelain"],
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except (OSError, subprocess.CalledProcessError) as error:
+            raise PlannerError(
+                f"cannot inspect Git repository {location}: {error}"
+            ) from error
+        revision = revision_result.stdout.strip()
+        if REVISION_RE.fullmatch(revision) is None:
+            raise PlannerError(f"invalid Git revision for {location}")
+        if status_result.stdout:
+            raise PlannerError(f"repository {location} has uncommitted changes")
+        return revision
+
+    marker = location / "metadata" / "timestamp.commit"
+    if marker.is_file():
+        try:
+            revision = marker.read_text(encoding="utf-8").split()[0]
+        except (OSError, UnicodeError, IndexError) as error:
+            raise PlannerError(
+                f"cannot read repository revision marker {marker}: {error}"
+            ) from error
+        if REVISION_RE.fullmatch(revision) is None:
+            raise PlannerError(f"invalid repository revision in {marker}")
+        return revision
+
+    marker = location / ".volatoo-revision"
+    if marker.is_file():
+        try:
+            revision = marker.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeError) as error:
+            raise PlannerError(
+                f"cannot read repository revision marker {marker}: {error}"
+            ) from error
+        if REVISION_RE.fullmatch(revision) is None:
+            raise PlannerError(f"invalid repository revision in {marker}")
+        return revision
+
+    raise PlannerError(
+        f"repository {location} has no immutable revision marker"
+    )
+
+
+def require_equal(label: str, actual: str, expected: str) -> None:
+    if actual != expected:
+        raise PlannerError(
+            f"{label} does not match build context: "
+            f"active={actual!r}, expected={expected!r}"
+        )
+
+
+def verify_repositories(settings: Any, context: dict[str, Any]) -> None:
+    configured = {
+        repository.name: Path(repository.location).resolve()
+        for repository in settings.repositories
+        if repository.location
+    }
+    expected = {
+        source["name"]: source["revision"] for source in context["sources"]
+    }
+    if sorted(configured) != sorted(expected):
+        raise PlannerError(
+            "configured repositories do not match build context: "
+            f"active={sorted(configured)}, expected={sorted(expected)}"
+        )
+    revisions: dict[str, str] = {}
+    for name, location in configured.items():
+        revisions[name] = repository_revision(location)
+        require_equal(
+            f"repository {name} revision",
+            revisions[name],
+            expected[name],
+        )
+
+    profile_path = Path(settings.profile_path).resolve()
+    profile_repository = None
+    for name, location in sorted(
+        configured.items(),
+        key=lambda item: len(str(item[1])),
+        reverse=True,
+    ):
+        try:
+            profile_path.relative_to(location)
+        except ValueError:
+            continue
+        profile_repository = name
+        break
+    if profile_repository is None:
+        raise PlannerError(
+            f"active profile {profile_path} is not inside a pinned repository"
+        )
+    require_equal(
+        "active profile revision",
+        revisions[profile_repository],
+        context["target"]["profile_revision"],
+    )
+
+
+def detect_init_system(settings: Any, trees: Any) -> str:
+    systemd_profile = any(
+        "systemd" in Path(profile).parts for profile in settings.profiles
+    )
+    vardb = trees[settings["EROOT"]]["vartree"].dbapi
+    has_openrc = bool(vardb.match("sys-apps/openrc"))
+    has_systemd = bool(vardb.match("sys-apps/systemd"))
+    if systemd_profile and has_systemd:
+        return "systemd"
+    if not systemd_profile and has_openrc and not has_systemd:
+        return "openrc"
+    raise PlannerError(
+        "cannot identify one active init target from profile and installed VDB "
+        f"(systemd_profile={systemd_profile}, openrc={has_openrc}, "
+        f"systemd={has_systemd})"
+    )
+
+
+def verify_target(
+    portage: Any,
+    settings: Any,
+    trees: Any,
+    context: dict[str, Any],
+) -> None:
+    target = context["target"]
+    require_equal(
+        "Portage version",
+        portage.VERSION,
+        context["toolchain"]["portage_version"],
+    )
+    if not portage.VERSION.startswith("3.0."):
+        raise PlannerError(
+            f"Portage {portage.VERSION} is unsupported by {PORTAGE_ADAPTER}"
+        )
+    require_equal("EROOT", settings["EROOT"], "/")
+    require_equal("architecture", settings["ARCH"], target["arch"])
+    require_equal("CHOST", settings["CHOST"], target["chost"])
+    require_equal("libc", settings["ELIBC"], target["libc"])
+    active_abis = sorted(settings.get("MULTILIB_ABIS", settings["DEFAULT_ABI"]).split())
+    expected_abis = sorted(target["abi"]["values"])
+    if active_abis != expected_abis:
+        raise PlannerError(
+            "ABI values do not match build context: "
+            f"active={active_abis}, expected={expected_abis}"
+        )
+    active_mode = "multilib" if len(active_abis) > 1 else "no-multilib"
+    require_equal("ABI mode", active_mode, target["abi"]["mode"])
+    require_equal("init system", detect_init_system(settings, trees), target["init"])
+    verify_repositories(settings, context)
+
+
+def split_setting(settings: Any, name: str) -> list[str]:
+    return sorted(set(settings.get(name, "").split()))
+
+
+def package_record(
+    portage: Any,
+    settings: Any,
+    package: Any,
+    sequence: int,
+) -> dict[str, Any]:
+    if not all(
+        hasattr(package, attribute)
+        for attribute in ("operation", "cpv", "type_name")
+    ):
+        raise PlannerError(
+            f"resolver returned unsupported graph node {package!r}"
+        )
+    if package.operation != "merge":
+        raise PlannerError(
+            f"resolver returned unsupported operation {package.operation!r} "
+            f"for {package.cpv}"
+        )
+    if package.type_name not in ("ebuild", "binary"):
+        raise PlannerError(
+            f"resolver returned unsupported source type {package.type_name!r} "
+            f"for {package.cpv}"
+        )
+
+    package_settings = portage.config(clone=settings)
+    package_settings.setcpv(package)
+    metadata = package._metadata
+    return {
+        "sequence": sequence,
+        "cpv": str(package.cpv),
+        "repository": str(package.repo),
+        "slot": str(package.slot),
+        "subslot": str(package.sub_slot),
+        "eapi": str(metadata.get("EAPI", "")),
+        "operation": "merge",
+        "source_type": str(package.type_name),
+        "use": {
+            "enabled": sorted(package.use.enabled),
+            "iuse": sorted(package.iuse.all),
+        },
+        "acceptance": {
+            "keywords": split_setting(package_settings, "ACCEPT_KEYWORDS"),
+            "licenses": split_setting(package_settings, "ACCEPT_LICENSE"),
+        },
+        "build_flags": {
+            "cflags": package_settings.get("CFLAGS", ""),
+            "cxxflags": package_settings.get("CXXFLAGS", ""),
+            "fflags": package_settings.get("FFLAGS", ""),
+            "fcflags": package_settings.get("FCFLAGS", ""),
+            "ldflags": package_settings.get("LDFLAGS", ""),
+            "features": split_setting(package_settings, "FEATURES"),
+        },
+        "dependencies": {
+            "bdepend": metadata.get("BDEPEND", ""),
+            "depend": metadata.get("DEPEND", ""),
+            "idepend": metadata.get("IDEPEND", ""),
+            "pdepend": metadata.get("PDEPEND", ""),
+            "rdepend": metadata.get("RDEPEND", ""),
+        },
+        "metadata": {
+            "keywords": metadata.get("KEYWORDS", ""),
+            "license": metadata.get("LICENSE", ""),
+            "properties": metadata.get("PROPERTIES", ""),
+            "required_use": metadata.get("REQUIRED_USE", ""),
+            "restrict": metadata.get("RESTRICT", ""),
+        },
+    }
+
+
+def resolve(
+    context: dict[str, Any],
+    atoms: list[str],
+    selection: str,
+) -> dict[str, Any]:
+    try:
+        import portage
+        from _emerge.actions import adjust_configs, load_emerge_config
+        from _emerge.create_depgraph_params import create_depgraph_params
+        from _emerge.depgraph import backtrack_depgraph
+        from _emerge.main import parse_opts
+        from _emerge.stdout_spinner import stdout_spinner
+    except ImportError as error:
+        raise PlannerError(
+            "Portage Python modules are unavailable; run the planner inside "
+            "the selected pristine Gentoo root"
+        ) from error
+
+    arguments = list(RESOLVER_OPTIONS)
+    arguments.append("--oneshot" if selection == "oneshot" else "--select")
+    arguments.extend(atoms)
+    action, options, files = parse_opts(arguments, silent=True)
+    emerge_config = load_emerge_config(
+        action=action,
+        args=files,
+        opts=options,
+    )
+    adjust_configs(emerge_config.opts, emerge_config.trees)
+    settings, trees, _ = emerge_config
+    verify_target(portage, settings, trees, context)
+
+    parameters = create_depgraph_params(options, action)
+    success, graph, _ = backtrack_depgraph(
+        settings,
+        trees,
+        options,
+        parameters,
+        action,
+        files,
+        stdout_spinner(),
+    )
+    if not success:
+        graph.display_problems()
+        raise PlannerError("Portage dependency resolution failed")
+
+    packages = [
+        package_record(portage, settings, package, sequence)
+        for sequence, package in enumerate(graph.altlist())
+    ]
+    return {
+        "schema": BUILD_SPEC_SCHEMA,
+        "target_id": context["target"]["id"],
+        "build_context_digest": digest(context),
+        "request": {
+            "atoms": atoms,
+            "selection": selection,
+        },
+        "resolver": {
+            "name": "portage",
+            "version": portage.VERSION,
+            "adapter": PORTAGE_ADAPTER,
+            "options": sorted(
+                (
+                    *RESOLVER_OPTIONS,
+                    "--oneshot" if selection == "oneshot" else "--select",
+                )
+            ),
+        },
+        "packages": packages,
+    }
+
+
+def write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix=f".{path.name}.",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(canonical_bytes(value))
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    except OSError as error:
+        if "temporary" in locals():
+            temporary.unlink(missing_ok=True)
+        raise PlannerError(f"cannot write {path}: {error}") from error
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Resolve atoms inside the selected pristine root and emit a "
+            "canonical Volatoo BuildSpec."
+        )
+    )
+    parser.add_argument(
+        "--build-context",
+        required=True,
+        type=Path,
+        help="validated org.volatoo.build-context/v1 document",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="destination for the canonical BuildSpec",
+    )
+    parser.add_argument(
+        "--query-output",
+        required=True,
+        type=Path,
+        help="destination for the package-source query",
+    )
+    parser.add_argument(
+        "--select",
+        action="store_true",
+        help="add requested atoms to world instead of planning a oneshot",
+    )
+    parser.add_argument("atoms", nargs="+", help="Portage atoms or package sets")
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        if arguments.output.resolve() == arguments.query_output.resolve():
+            raise PlannerError("--output and --query-output must differ")
+        if arguments.build_context.resolve() in (
+            arguments.output.resolve(),
+            arguments.query_output.resolve(),
+        ):
+            raise PlannerError("planner outputs must not overwrite build context")
+        validate_with_contract_tool(arguments.build_context)
+        context = read_json(arguments.build_context)
+        if context.get("schema") != BUILD_CONTEXT_SCHEMA:
+            raise PlannerError(
+                f"--build-context must use {BUILD_CONTEXT_SCHEMA}"
+            )
+        atoms = sorted(set(arguments.atoms))
+        if any(atom.startswith("-") for atom in atoms):
+            raise PlannerError("package atoms must not begin with '-'")
+        spec = resolve(
+            context,
+            atoms,
+            "world" if arguments.select else "oneshot",
+        )
+        query = {
+            "schema": PACKAGE_SOURCE_QUERY_SCHEMA,
+            "target_id": spec["target_id"],
+            "build_context_digest": spec["build_context_digest"],
+            "build_spec_digest": digest(spec),
+        }
+        validate_document(spec)
+        validate_document(query)
+        write_json(arguments.output, spec)
+        write_json(arguments.query_output, query)
+        print(f"BuildSpec: {arguments.output} ({query['build_spec_digest']})")
+        print(f"Package source query: {arguments.query_output}")
+    except PlannerError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

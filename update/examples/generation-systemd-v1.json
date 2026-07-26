@@ -1,0 +1,11 @@
+{
+  "schema": "org.volatoo.generation/v1",
+  "target_id": "volatoo/amd64/glibc/systemd/23.0/base-v1",
+  "build_context_digest": "sha256:53f37fafc2fef91f2e933414178dd4362309a6e5ac1c401de146682e62b3f058",
+  "base": {
+    "rootfs_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "rootfs_size": 574849024,
+    "format": "squashfs"
+  },
+  "layers": []
+}

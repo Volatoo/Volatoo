@@ -1,0 +1,26 @@
+{
+  "schema": "org.volatoo.generation/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "build_context_digest": "sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd9932d36ff6ac9bc25",
+  "base": {
+    "rootfs_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+    "rootfs_size": 574849024,
+    "format": "squashfs"
+  },
+  "layers": [
+    {
+      "rootfs_digest": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+      "rootfs_size": 1048576,
+      "format": "squashfs",
+      "tombstones_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+      "transaction_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "rootfs_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "rootfs_size": 524288,
+      "format": "squashfs",
+      "tombstones_digest": "sha256:2c6ae75643fccfe6de1618d14b9900d24e61514f4f86c986476f4ef3805965f3",
+      "transaction_digest": "sha256:197bf1ddfe1d2272a21efd6362bbddcb189141deaa698fa04a201416f1221dee"
+    }
+  ]
+}

@@ -1,0 +1,921 @@
+#!/usr/bin/env python3
+
+"""Safely activate one selected Volatoo service layer without rebooting."""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+from typing import Any
+
+
+POLICY_SCHEMA = "org.volatoo.activation-policy/v1"
+RECEIPT_SCHEMA = "org.volatoo.activation-receipt/v1"
+GENERATION_SCHEMA = "org.volatoo.generation/v1"
+TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
+PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
+TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
+DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
+NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+ATOM_RE = re.compile(r"^[A-Za-z0-9+_.-]+/[A-Za-z0-9+_.-]+$")
+CPV_RE = re.compile(r"^([^/]+)/(.+)-[0-9]")
+CORE_PACKAGE_PREFIXES = (
+    "sys-apps/openrc",
+    "sys-apps/systemd",
+    "sys-kernel/",
+    "sys-libs/glibc",
+    "sys-libs/musl",
+)
+CORE_PATH_PREFIXES = (
+    "/boot",
+    "/lib",
+    "/lib32",
+    "/lib64",
+    "/usr/lib32",
+    "/usr/lib64",
+    "/usr/lib/modules",
+)
+CORE_PATHS = {
+    "/sbin/init",
+    "/sbin/openrc",
+    "/usr/bin/openrc",
+    "/usr/bin/systemd",
+    "/usr/lib/systemd/systemd",
+    "/usr/sbin/init",
+}
+
+
+class ActivationError(RuntimeError):
+    pass
+
+
+def load_generation_tool() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-generation")))
+
+
+def load_contracts() -> dict[str, Any]:
+    return runpy.run_path(str(Path(__file__).with_name("volatoo-manifest")))
+
+
+def read_json(path: Path) -> tuple[dict[str, Any], bytes]:
+    try:
+        raw = path.read_bytes()
+        value = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise ActivationError(f"cannot read JSON {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise ActivationError(f"JSON root must be an object: {path}")
+    return value, raw
+
+
+def canonical_bytes(value: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+
+
+def require_exact_object(
+    value: Any,
+    fields: set[str],
+    description: str,
+) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != fields:
+        raise ActivationError(f"{description} fields are invalid")
+    return value
+
+
+def require_argv(value: Any, description: str, allow_empty: bool = False) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or (not value and not allow_empty)
+        or any(
+            not isinstance(item, str)
+            or not item
+            or len(item) > 4096
+            or "\0" in item
+            for item in value
+        )
+    ):
+        raise ActivationError(f"{description} must be a valid argv array")
+    if value and not value[0].startswith("/"):
+        raise ActivationError(f"{description}[0] must be an absolute path")
+    return value
+
+
+def normalized_path(value: Any, description: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value.startswith("/")
+        or value == "/"
+        or value.endswith("/")
+        or "//" in value
+        or any(part in ("", ".", "..") for part in Path(value).parts[1:])
+        or any(ord(character) < 32 for character in value)
+    ):
+        raise ActivationError(f"{description} is not a normalized absolute path")
+    return value
+
+
+def validate_check(value: Any, description: str, health: bool) -> dict[str, Any]:
+    fields = {"argv", "timeout_seconds"}
+    if health:
+        fields |= {"attempts", "interval_seconds"}
+    check = require_exact_object(value, fields, description)
+    require_argv(check["argv"], f"{description}.argv")
+    timeout = check["timeout_seconds"]
+    if type(timeout) is not int or not 1 <= timeout <= 300:
+        raise ActivationError(f"{description}.timeout_seconds is invalid")
+    if health:
+        attempts = check["attempts"]
+        interval = check["interval_seconds"]
+        if type(attempts) is not int or not 1 <= attempts <= 60:
+            raise ActivationError(f"{description}.attempts is invalid")
+        if type(interval) is not int or not 0 <= interval <= 300:
+            raise ActivationError(f"{description}.interval_seconds is invalid")
+    return check
+
+
+def validate_policy_identity(policy: dict[str, Any]) -> None:
+    if policy["schema"] != POLICY_SCHEMA:
+        raise ActivationError("unsupported activation policy schema")
+    if (
+        not isinstance(policy["target_id"], str)
+        or not policy["target_id"].startswith("volatoo/")
+    ):
+        raise ActivationError("activation policy target_id is invalid")
+    if (
+        not isinstance(policy["service"], str)
+        or NAME_RE.fullmatch(policy["service"]) is None
+    ):
+        raise ActivationError("activation policy service is invalid")
+    if policy["init_system"] not in ("openrc", "systemd"):
+        raise ActivationError("activation policy init_system is invalid")
+
+
+def validate_policy_scope(policy: dict[str, Any]) -> None:
+    packages = policy["packages"]
+    if (
+        not isinstance(packages, list)
+        or not packages
+        or packages != sorted(set(packages))
+        or any(not isinstance(item, str) or ATOM_RE.fullmatch(item) is None for item in packages)
+    ):
+        raise ActivationError("activation policy packages must be sorted atoms")
+    paths = policy["allowed_paths"]
+    if not isinstance(paths, list) or not paths:
+        raise ActivationError("activation policy allowed_paths must not be empty")
+    checked_paths = [
+        normalized_path(item, f"activation policy allowed_paths[{index}]")
+        for index, item in enumerate(paths)
+    ]
+    if checked_paths != sorted(set(checked_paths)):
+        raise ActivationError("activation policy allowed_paths must be sorted")
+
+
+def validate_activation_action(value: Any) -> None:
+    activation = require_exact_object(
+        value,
+        {"type", "unit", "argv", "rollback_argv"},
+        "activation action",
+    )
+    if activation["type"] not in ("reload", "restart", "external"):
+        raise ActivationError("activation action type is invalid")
+    unit = activation["unit"]
+    if not isinstance(unit, str) or len(unit) > 256 or "\0" in unit:
+        raise ActivationError("activation action unit is invalid")
+    argv = require_argv(
+        activation["argv"],
+        "activation action argv",
+        allow_empty=activation["type"] != "external",
+    )
+    rollback_argv = require_argv(
+        activation["rollback_argv"],
+        "activation rollback argv",
+        allow_empty=activation["type"] != "external",
+    )
+    if activation["type"] == "external":
+        if unit or not argv or not rollback_argv:
+            raise ActivationError(
+                "external activation requires argv and rollback_argv but no unit"
+            )
+    elif not unit or argv or rollback_argv:
+        raise ActivationError(
+            "service-manager activation requires a unit and empty argv arrays"
+        )
+
+
+def validate_policy_checks(policy: dict[str, Any]) -> None:
+    for field, health in (("config_checks", False), ("health_checks", True)):
+        checks = policy[field]
+        if not isinstance(checks, list) or not checks:
+            raise ActivationError(f"activation policy {field} must not be empty")
+        for index, check in enumerate(checks):
+            validate_check(check, f"activation policy {field}[{index}]", health)
+
+
+def read_policy(path: Path) -> tuple[dict[str, Any], bytes]:
+    policy, raw = read_json(path)
+    require_exact_object(
+        policy,
+        {
+            "schema",
+            "target_id",
+            "service",
+            "init_system",
+            "packages",
+            "allowed_paths",
+            "activation",
+            "config_checks",
+            "health_checks",
+        },
+        "activation policy",
+    )
+    validate_policy_identity(policy)
+    validate_policy_scope(policy)
+    validate_activation_action(policy["activation"])
+    validate_policy_checks(policy)
+    canonical = canonical_bytes(policy)
+    if raw != canonical:
+        raise ActivationError("activation policy must be canonical JSON")
+    return policy, canonical
+
+
+def package_atom(cpv: str) -> str:
+    match = CPV_RE.match(cpv)
+    if match is None:
+        raise ActivationError(f"cannot derive package atom from CPV: {cpv}")
+    return f"{match.group(1)}/{match.group(2)}"
+
+
+def path_is_within(path: str, prefix: str) -> bool:
+    return path == prefix or path.startswith(prefix + "/")
+
+
+def path_is_core(path: str) -> bool:
+    return path in CORE_PATHS or any(
+        path_is_within(path, prefix) for prefix in CORE_PATH_PREFIXES
+    )
+
+
+def leaf_paths(paths: list[str]) -> list[str]:
+    selected = set(paths)
+    return sorted(
+        path
+        for path in selected
+        if not any(
+            other != path and other.startswith(path + "/")
+            for other in selected
+        )
+    )
+
+
+def contract(
+    contracts: dict[str, Any],
+    path: Path,
+    schema: str,
+) -> dict[str, Any]:
+    try:
+        value = contracts["read_manifest"](str(path))
+        contracts["validate_manifest"](value)
+    except RuntimeError as error:
+        raise ActivationError(str(error)) from error
+    if value["schema"] != schema:
+        raise ActivationError(f"{path} must use {schema}")
+    return value
+
+
+def resolve_generation_state(
+    state: Path,
+    root: Path,
+    candidate_argument: str,
+) -> tuple[dict[str, Any], Path, str, str]:
+    generation_tool = load_generation_tool()
+    try:
+        system = generation_tool["state_system"](state)
+        candidate_digest = generation_tool["resolve_digest_argument"](
+            system,
+            candidate_argument,
+        )
+        generation_tool["validate_published_generation"](
+            system,
+            candidate_digest,
+        )
+        current = generation_tool["read_pointer"](system, "current")
+    except RuntimeError as error:
+        raise ActivationError(str(error)) from error
+    if candidate_digest != current:
+        raise ActivationError("only the selected current generation may be activated")
+
+    marker = root / ".volatoo/generation-id"
+    if marker.is_symlink() or not marker.is_file():
+        raise ActivationError("running root has no safe generation-id marker")
+    try:
+        running_digest = marker.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeError) as error:
+        raise ActivationError(f"cannot read running generation-id: {error}") from error
+    if DIGEST_RE.fullmatch(running_digest) is None:
+        raise ActivationError("running generation-id is malformed")
+    return generation_tool, system, candidate_digest, running_digest
+
+
+def validate_candidate_append(
+    candidate: dict[str, Any],
+    parent: dict[str, Any],
+) -> None:
+    if (
+        candidate["target_id"] != parent["target_id"]
+        or candidate["build_context_digest"] != parent["build_context_digest"]
+        or candidate["base"] != parent["base"]
+        or candidate["layers"][:-1] != parent["layers"]
+        or len(candidate["layers"]) != len(parent["layers"]) + 1
+    ):
+        raise ActivationError(
+            "candidate must append exactly one layer to the running generation"
+        )
+
+
+def validate_activation_closure(
+    candidate: dict[str, Any],
+    running_digest: str,
+    transaction: dict[str, Any],
+    changed: dict[str, Any],
+    tombstones: dict[str, Any],
+) -> None:
+    if (
+        transaction["parent_generation_digest"] != running_digest
+        or transaction["target_id"] != candidate["target_id"]
+        or changed["target_id"] != candidate["target_id"]
+        or tombstones["target_id"] != candidate["target_id"]
+        or transaction["filesystem"]["changed_paths_count"]
+        != len(changed["paths"])
+        or transaction["filesystem"]["tombstones_count"]
+        != len(tombstones["paths"])
+    ):
+        raise ActivationError("candidate activation closure is inconsistent")
+
+
+def load_activation_closure(
+    contracts: dict[str, Any],
+    system: Path,
+    candidate_digest: str,
+    running_digest: str,
+) -> dict[str, Any]:
+    manifest_dir = system / "manifests"
+    candidate = contract(
+        contracts,
+        manifest_dir / f"{candidate_digest[7:]}.json",
+        GENERATION_SCHEMA,
+    )
+    parent = contract(
+        contracts,
+        manifest_dir / f"{running_digest[7:]}.json",
+        GENERATION_SCHEMA,
+    )
+    validate_candidate_append(candidate, parent)
+
+    layer = candidate["layers"][-1]
+    object_dir = system / "objects/sha256"
+    transaction = contract(
+        contracts,
+        object_dir / layer["transaction_digest"][7:],
+        TRANSACTION_SCHEMA,
+    )
+    changed = contract(
+        contracts,
+        object_dir / transaction["filesystem"]["changed_paths_digest"][7:],
+        PATHS_SCHEMA,
+    )
+    tombstones = contract(
+        contracts,
+        object_dir / layer["tombstones_digest"][7:],
+        TOMBSTONES_SCHEMA,
+    )
+    validate_activation_closure(
+        candidate,
+        running_digest,
+        transaction,
+        changed,
+        tombstones,
+    )
+    return {
+        "candidate": candidate,
+        "layer": layer,
+        "transaction": transaction,
+        "changed": changed,
+        "tombstones": tombstones,
+        "object_dir": object_dir,
+    }
+
+
+def validate_policy_target(
+    contracts: dict[str, Any],
+    object_dir: Path,
+    candidate: dict[str, Any],
+    policy: dict[str, Any],
+) -> None:
+    context = contract(
+        contracts,
+        object_dir / candidate["build_context_digest"][7:],
+        "org.volatoo.build-context/v1",
+    )
+    if (
+        policy["target_id"] != candidate["target_id"]
+        or policy["init_system"] != context["target"]["init"]
+    ):
+        raise ActivationError("activation policy target differs from generation")
+
+
+def validate_transaction_packages(
+    transaction: dict[str, Any],
+    policy: dict[str, Any],
+) -> None:
+    atoms = sorted({package_atom(package["cpv"]) for package in transaction["packages"]})
+    disallowed_core = [
+        atom
+        for atom in atoms
+        if any(
+            atom == prefix or atom.startswith(prefix)
+            for prefix in CORE_PACKAGE_PREFIXES
+        )
+    ]
+    if disallowed_core:
+        raise ActivationError(
+            "core packages require next-boot activation: "
+            + ", ".join(disallowed_core)
+        )
+    unapproved_atoms = sorted(set(atoms) - set(policy["packages"]))
+    if unapproved_atoms:
+        raise ActivationError(
+            "policy does not cover transaction packages: "
+            + ", ".join(unapproved_atoms)
+        )
+
+
+def validate_changed_paths(
+    changed: dict[str, Any],
+    tombstones: dict[str, Any],
+    policy: dict[str, Any],
+) -> list[str]:
+    effective_paths = leaf_paths([*changed["paths"], *tombstones["paths"]])
+    core_paths = [path for path in effective_paths if path_is_core(path)]
+    if core_paths:
+        raise ActivationError(
+            "core paths require next-boot activation: " + ", ".join(core_paths)
+        )
+    unapproved_paths = [
+        path
+        for path in effective_paths
+        if not any(path_is_within(path, prefix) for prefix in policy["allowed_paths"])
+    ]
+    if unapproved_paths:
+        raise ActivationError(
+            "policy does not cover changed paths: " + ", ".join(unapproved_paths)
+        )
+    return effective_paths
+
+
+def eligibility(
+    state: Path,
+    root: Path,
+    candidate_argument: str,
+    policy_path: Path,
+) -> dict[str, Any]:
+    (
+        generation_tool,
+        system,
+        candidate_digest,
+        running_digest,
+    ) = resolve_generation_state(state, root, candidate_argument)
+    contracts = load_contracts()
+    closure = load_activation_closure(
+        contracts,
+        system,
+        candidate_digest,
+        running_digest,
+    )
+    policy, policy_bytes = read_policy(policy_path)
+    validate_policy_target(
+        contracts,
+        closure["object_dir"],
+        closure["candidate"],
+        policy,
+    )
+    validate_transaction_packages(closure["transaction"], policy)
+    effective_paths = validate_changed_paths(
+        closure["changed"],
+        closure["tombstones"],
+        policy,
+    )
+
+    previous = generation_tool["read_pointer"](system, "previous", required=False)
+    if previous != running_digest:
+        raise ActivationError(
+            "previous must name the running generation before live activation"
+        )
+    return {
+        "system": system,
+        "candidate_digest": candidate_digest,
+        "running_digest": running_digest,
+        "candidate": closure["candidate"],
+        "layer": closure["layer"],
+        "transaction": closure["transaction"],
+        "changed": closure["changed"],
+        "tombstones": closure["tombstones"],
+        "policy": policy,
+        "policy_bytes": policy_bytes,
+        "effective_paths": effective_paths,
+        "generation_tool": generation_tool,
+    }
+
+
+def run_command(
+    argv: list[str],
+    timeout: int,
+    environment: dict[str, str],
+    description: str,
+) -> None:
+    try:
+        subprocess.run(
+            argv,
+            check=True,
+            timeout=timeout,
+            env=environment,
+        )
+    except (OSError, subprocess.CalledProcessError, subprocess.TimeoutExpired) as error:
+        raise ActivationError(f"{description} failed: {error}") from error
+
+
+def action_argv(policy: dict[str, Any], rollback: bool = False) -> list[str]:
+    action = policy["activation"]
+    if action["type"] == "external":
+        return action["rollback_argv"] if rollback else action["argv"]
+    verb = action["type"]
+    if policy["init_system"] == "systemd":
+        return ["/bin/systemctl", verb, action["unit"]]
+    return ["/sbin/rc-service", action["unit"], verb]
+
+
+def service_action(
+    policy: dict[str, Any],
+    environment: dict[str, str],
+    rollback: bool = False,
+) -> None:
+    if policy["init_system"] == "systemd":
+        run_command(
+            ["/bin/systemctl", "daemon-reload"],
+            300,
+            environment,
+            "systemd daemon-reload",
+        )
+    run_command(
+        action_argv(policy, rollback),
+        300,
+        environment,
+        "rollback service action" if rollback else "service action",
+    )
+
+
+def write_path_list(path: Path, root: Path, paths: list[str]) -> None:
+    with path.open("wb") as stream:
+        for value in paths:
+            candidate = root / value.removeprefix("/")
+            if candidate.exists() or candidate.is_symlink():
+                stream.write(value.removeprefix("/").encode("utf-8") + b"\0")
+
+
+def create_archive(
+    root: Path,
+    paths: list[str],
+    output: Path,
+    no_recursion: bool,
+) -> None:
+    path_list = output.with_suffix(".paths")
+    write_path_list(path_list, root, paths)
+    if path_list.stat().st_size == 0:
+        return
+    argv = [
+        "tar",
+        "-C",
+        str(root),
+        "--create",
+        f"--file={output}",
+        "--null",
+        "--numeric-owner",
+        "--acls",
+        "--xattrs",
+        f"--files-from={path_list}",
+    ]
+    if no_recursion:
+        argv.append("--no-recursion")
+    try:
+        subprocess.run(argv, check=True)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ActivationError(f"cannot snapshot live paths: {error}") from error
+
+
+def extract_archive(archive: Path, root: Path) -> None:
+    if not archive.exists():
+        return
+    try:
+        subprocess.run(
+            [
+                "tar",
+                "-C",
+                str(root),
+                "--extract",
+                f"--file={archive}",
+                "--numeric-owner",
+                "--same-owner",
+                "--same-permissions",
+                "--acls",
+                "--xattrs",
+            ],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ActivationError(f"cannot restore live paths: {error}") from error
+
+
+def remove_paths(root: Path, paths: list[str]) -> None:
+    for value in sorted(paths, key=lambda item: (item.count("/"), item), reverse=True):
+        candidate = root / value.removeprefix("/")
+        if candidate.is_dir() and not candidate.is_symlink():
+            shutil.rmtree(candidate)
+        elif candidate.exists() or candidate.is_symlink():
+            candidate.unlink()
+
+
+def apply_layer(layer_tree: Path, root: Path, archive: Path) -> None:
+    try:
+        subprocess.run(
+            [
+                "tar",
+                "-C",
+                str(layer_tree),
+                "--create",
+                f"--file={archive}",
+                "--numeric-owner",
+                "--acls",
+                "--xattrs",
+                ".",
+            ],
+            check=True,
+        )
+        extract_archive(archive, root)
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ActivationError(f"cannot apply service layer: {error}") from error
+
+
+def prepare_layer(
+    system: Path,
+    layer_digest: str,
+    prepared: Path | None,
+    temporary: Path,
+) -> Path:
+    if prepared is not None:
+        if prepared.is_symlink() or not prepared.is_dir():
+            raise ActivationError("prepared layer must be a safe directory")
+        return prepared
+    destination = temporary / "layer"
+    layer_object = system / "objects/sha256" / layer_digest[7:]
+    try:
+        subprocess.run(
+            [
+                "unsquashfs",
+                "-no-progress",
+                "-d",
+                str(destination),
+                str(layer_object),
+            ],
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise ActivationError(f"cannot extract service layer: {error}") from error
+    return destination
+
+
+def check_health(
+    policy: dict[str, Any],
+    environment: dict[str, str],
+) -> None:
+    for number, check in enumerate(policy["health_checks"]):
+        last_error: ActivationError | None = None
+        for attempt in range(check["attempts"]):
+            try:
+                run_command(
+                    check["argv"],
+                    check["timeout_seconds"],
+                    environment,
+                    f"health check {number + 1}",
+                )
+                last_error = None
+                break
+            except ActivationError as error:
+                last_error = error
+                if attempt + 1 < check["attempts"]:
+                    time.sleep(check["interval_seconds"])
+        if last_error is not None:
+            raise last_error
+
+
+def activate(arguments: argparse.Namespace) -> None:
+    state = arguments.state.resolve()
+    root = arguments.root.resolve()
+    details = eligibility(
+        state,
+        root,
+        arguments.generation,
+        arguments.policy,
+    )
+    if arguments.command == "check":
+        result = {
+            "candidate_generation": details["candidate_digest"],
+            "running_generation": details["running_digest"],
+            "service": details["policy"]["service"],
+            "activation_type": details["policy"]["activation"]["type"],
+            "changed_paths": len(details["changed"]["paths"]),
+            "tombstones": len(details["tombstones"]["paths"]),
+            "eligible": True,
+        }
+        print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+        return
+    if os.geteuid() != 0 and not arguments.allow_unprivileged:
+        raise ActivationError("live activation must run as root")
+
+    generation_tool = details["generation_tool"]
+    system = details["system"]
+    policy = details["policy"]
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "VOLATOO_ACTIVATION_ROOT": str(root),
+            "VOLATOO_GENERATION": details["candidate_digest"],
+            "VOLATOO_PARENT_GENERATION": details["running_digest"],
+            "VOLATOO_SERVICE": policy["service"],
+        }
+    )
+    all_paths = sorted(
+        set(details["changed"]["paths"]) | set(details["tombstones"]["paths"])
+    )
+    leaves = leaf_paths(all_paths)
+    ancestors = sorted(set(all_paths) - set(leaves))
+
+    with generation_tool["mutation_lock"](system):
+        # Recheck selection and running identity after taking the mutation lock.
+        if generation_tool["read_pointer"](system, "current") != details["candidate_digest"]:
+            raise ActivationError("current generation changed during activation")
+        marker = root / ".volatoo/generation-id"
+        if marker.read_text(encoding="ascii").strip() != details["running_digest"]:
+            raise ActivationError("running generation changed during activation")
+
+        with tempfile.TemporaryDirectory(prefix="volatoo-activate.") as name:
+            temporary = Path(name)
+            layer_tree = prepare_layer(
+                system,
+                details["layer"]["rootfs_digest"],
+                arguments.prepared_layer,
+                temporary,
+            )
+            content_backup = temporary / "content-backup.tar"
+            metadata_backup = temporary / "metadata-backup.tar"
+            create_archive(root, leaves, content_backup, False)
+            create_archive(root, ancestors, metadata_backup, True)
+            absent_paths = [
+                value
+                for value in all_paths
+                if not (root / value.removeprefix("/")).exists()
+                and not (root / value.removeprefix("/")).is_symlink()
+            ]
+            applied_archive = temporary / "applied.tar"
+            applied = False
+            try:
+                applied = True
+                remove_paths(root, details["tombstones"]["paths"])
+                apply_layer(layer_tree, root, applied_archive)
+                for number, check in enumerate(policy["config_checks"]):
+                    run_command(
+                        check["argv"],
+                        check["timeout_seconds"],
+                        environment,
+                        f"configuration check {number + 1}",
+                    )
+                service_action(policy, environment)
+                check_health(policy, environment)
+            except ActivationError as activation_error:
+                rollback_errors = []
+                if applied:
+                    try:
+                        remove_paths(root, leaves)
+                        extract_archive(content_backup, root)
+                        extract_archive(metadata_backup, root)
+                        remove_paths(root, absent_paths)
+                    except ActivationError as error:
+                        rollback_errors.append(str(error))
+                    try:
+                        service_action(policy, environment, rollback=True)
+                    except ActivationError as error:
+                        rollback_errors.append(str(error))
+                try:
+                    generation_tool["select_digest"](
+                        system,
+                        details["running_digest"],
+                    )
+                except RuntimeError as error:
+                    rollback_errors.append(str(error))
+                suffix = (
+                    f"; rollback errors: {'; '.join(rollback_errors)}"
+                    if rollback_errors
+                    else ""
+                )
+                raise ActivationError(
+                    f"live activation rolled back: {activation_error}{suffix}"
+                ) from activation_error
+
+        generation_tool["atomic_write"](
+            root / ".volatoo/generation-id",
+            f"{details['candidate_digest']}\n".encode("ascii"),
+            0o644,
+        )
+        receipt = {
+            "schema": RECEIPT_SCHEMA,
+            "generation_digest": details["candidate_digest"],
+            "parent_generation_digest": details["running_digest"],
+            "transaction_digest": details["layer"]["transaction_digest"],
+            "policy_digest": "sha256:"
+            + hashlib.sha256(details["policy_bytes"]).hexdigest(),
+            "service": policy["service"],
+            "activation_type": policy["activation"]["type"],
+            "result": "healthy",
+        }
+        generation_tool["atomic_write"](
+            system
+            / "activations"
+            / f"{details['candidate_digest'][7:]}.json",
+            canonical_bytes(receipt),
+            0o444,
+        )
+    print(
+        f"activated {policy['service']} at generation "
+        f"{details['candidate_digest']}"
+    )
+
+
+def validate_policy(arguments: argparse.Namespace) -> None:
+    policy, content = read_policy(arguments.policy)
+    print(
+        f"{policy['service']}\tsha256:{hashlib.sha256(content).hexdigest()}"
+    )
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(prog="volatoo-activate")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    validate = subparsers.add_parser("validate-policy")
+    validate.add_argument("policy", type=Path)
+    validate.set_defaults(handler=validate_policy)
+    for name in ("check", "activate"):
+        command = subparsers.add_parser(name)
+        command.add_argument("--state", type=Path, required=True)
+        command.add_argument("--root", type=Path, default=Path("/"))
+        command.add_argument("--policy", type=Path, required=True)
+        command.add_argument(
+            "--generation",
+            default="current",
+            help="selected generation digest or current",
+        )
+        command.add_argument(
+            "--prepared-layer",
+            type=Path,
+            help="pre-extracted layer tree for controlled testing",
+        )
+        command.add_argument(
+            "--allow-unprivileged",
+            action="store_true",
+            help=argparse.SUPPRESS,
+        )
+        command.set_defaults(handler=activate)
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        arguments.handler(arguments)
+    except ActivationError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

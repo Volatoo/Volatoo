@@ -4,32 +4,68 @@ set -euo pipefail
 
 usage() {
 	cat <<'EOF'
-Usage: scripts/fetch-gentoo-inputs.sh [--metadata-only] OUTPUT_DIR
+Usage: scripts/fetch-gentoo-inputs.sh [OPTIONS] OUTPUT_DIR
 
-Resolve the latest official Gentoo amd64 OpenRC stage3 and Catalyst SquashFS
-snapshot, verify their signed metadata, and download the inputs.
+Resolve the latest official Gentoo amd64 stage3 for the selected init system
+and the Catalyst SquashFS snapshot, verify their signed metadata, and download
+the inputs.
 
 The script prints key=value records suitable for GitHub Actions outputs.
---metadata-only verifies and resolves the signed metadata without downloading
-the two large payloads.
+
+Options:
+  --init-system NAME  Select openrc or systemd (default: openrc)
+  --metadata-only     Resolve signed metadata without downloading large payloads
+  -h, --help          Show this help
 EOF
 }
 
 metadata_only=no
-if (( $# > 0 )) && [[ $1 == --metadata-only ]]; then
-	metadata_only=yes
-	shift
+init_system=openrc
+output_dir=
+
+while (( $# > 0 )); do
+	case $1 in
+		--init-system)
+			(( $# >= 2 )) || {
+				echo "error: --init-system requires a value" >&2
+				exit 2
+			}
+			init_system=$2
+			shift 2
+			;;
+		--metadata-only)
+			metadata_only=yes
+			shift
+			;;
+		-h | --help)
+			usage
+			exit 0
+			;;
+		-*)
+			echo "error: unknown option: $1" >&2
+			usage >&2
+			exit 2
+			;;
+		*)
+			if [[ -n $output_dir ]]; then
+				echo "error: only one output directory may be supplied" >&2
+				exit 2
+			fi
+			output_dir=$1
+			shift
+			;;
+	esac
+done
+
+if [[ $init_system != openrc && $init_system != systemd ]]; then
+	echo "error: --init-system must be openrc or systemd" >&2
+	exit 2
 fi
-if (( $# == 1 )) && [[ $1 == -h || $1 == --help ]]; then
-	usage
-	exit 0
-fi
-if (( $# != 1 )); then
+if [[ -z $output_dir ]]; then
 	usage >&2
 	exit 2
 fi
 
-output_dir=$1
 for command_name in awk curl gpgv sort tail; do
 	if ! command -v "$command_name" >/dev/null 2>&1; then
 		echo "error: required command is not installed: $command_name" >&2
@@ -40,12 +76,18 @@ done
 mkdir -p "$output_dir"
 output_dir=$(cd -- "$output_dir" && pwd)
 marker=$output_dir/.volatoo-gentoo-inputs
-if [[ ! -e $marker ]] &&
-	find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
+marker_value=init-system=$init_system
+if [[ -e $marker || -L $marker ]]; then
+	if [[ -L $marker || ! -f $marker ]] || \
+		[[ $(cat "$marker") != "$marker_value" ]]; then
+		echo "error: input directory belongs to a different init target: $output_dir" >&2
+		exit 1
+	fi
+elif find "$output_dir" -mindepth 1 -maxdepth 1 -print -quit | grep -q .; then
 	echo "error: refusing to reuse an unmarked non-empty directory: $output_dir" >&2
 	exit 1
 fi
-: >"$marker"
+printf '%s\n' "$marker_value" >"$marker"
 
 distfiles_base=https://distfiles.gentoo.org
 stage3_base=$distfiles_base/releases/amd64/autobuilds
@@ -58,6 +100,11 @@ download() {
 	url=$1
 	destination=$2
 
+	if [[ -L $destination ]] || \
+		[[ -e $destination && ! -f $destination ]]; then
+		echo "error: download destination must be a regular file: $destination" >&2
+		exit 1
+	fi
 	echo "downloading $url" >&2
 	curl \
 		--fail \
@@ -109,16 +156,18 @@ sha512_file() {
 }
 
 keyring_path=$output_dir/gentoo-service-keys.gpg
-stage3_latest_path=$output_dir/latest-stage3-amd64-openrc.txt
+stage3_latest_name=latest-stage3-amd64-${init_system}.txt
+stage3_latest_path=$output_dir/$stage3_latest_name
 snapshot_digests_path=$output_dir/snapshot-sha512sums.txt
 
 download "$keyring_url" "$keyring_path"
-download "$stage3_base/latest-stage3-amd64-openrc.txt" "$stage3_latest_path"
+download "$stage3_base/$stage3_latest_name" "$stage3_latest_path"
 verify_signed_file "$stage3_latest_path" "$stage3_signer"
 
 stage3_entries=$(
-	awk '
-		$1 ~ /^[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\/stage3-amd64-openrc-[0-9][0-9][0-9][0-9][0-9][0-9][0-9][0-9]T[0-9][0-9][0-9][0-9][0-9][0-9]Z\.tar\.xz$/ {
+	awk -v init="$init_system" '
+		$1 ~ ("^[0-9]{8}T[0-9]{6}Z/stage3-amd64-" init \
+			"-[0-9]{8}T[0-9]{6}Z\\.tar\\.xz$") {
 			print $1
 		}
 	' "$stage3_latest_path"
@@ -199,6 +248,7 @@ if [[ $metadata_only == no ]]; then
 fi
 
 printf '%s\n' \
+	"init_system=$init_system" \
 	"stage3_name=$stage3_name" \
 	"stage3_url=$stage3_url" \
 	"stage3_sha512=$stage3_sha512" \
@@ -208,4 +258,4 @@ printf '%s\n' \
 	"snapshot_url=$snapshot_url" \
 	"snapshot_sha512=$snapshot_sha512" \
 	"snapshot_path=$snapshot_path"
-echo "verified Gentoo stage3 and snapshot metadata" >&2
+echo "verified Gentoo $init_system stage3 and snapshot metadata" >&2

@@ -1,0 +1,80 @@
+{
+  "schema": "org.volatoo.build-spec/v1",
+  "target_id": "volatoo/amd64/glibc/openrc/23.0/base-v1",
+  "build_context_digest": "sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd9932d36ff6ac9bc25",
+  "request": {
+    "atoms": [
+      "app-misc/jq"
+    ],
+    "selection": "oneshot"
+  },
+  "resolver": {
+    "name": "portage",
+    "version": "3.0.77",
+    "adapter": "portage-3.0-depgraph-v1",
+    "options": [
+      "--autounmask=n",
+      "--complete-graph=y",
+      "--oneshot",
+      "--pretend",
+      "--with-bdeps=y"
+    ]
+  },
+  "packages": [
+    {
+      "sequence": 0,
+      "cpv": "app-misc/jq-1.8.1",
+      "repository": "gentoo",
+      "slot": "0",
+      "subslot": "1",
+      "eapi": "8",
+      "operation": "merge",
+      "source_type": "ebuild",
+      "use": {
+        "enabled": [
+          "abi_x86_64",
+          "oniguruma"
+        ],
+        "iuse": [
+          "oniguruma",
+          "static-libs",
+          "test"
+        ]
+      },
+      "acceptance": {
+        "keywords": [
+          "amd64"
+        ],
+        "licenses": [
+          "MIT"
+        ]
+      },
+      "build_flags": {
+        "cflags": "-O2 -pipe",
+        "cxxflags": "-O2 -pipe",
+        "fflags": "-O2 -pipe",
+        "fcflags": "-O2 -pipe",
+        "ldflags": "-Wl,-O1 -Wl,--as-needed",
+        "features": [
+          "binpkg-multi-instance",
+          "sandbox",
+          "userpriv"
+        ]
+      },
+      "dependencies": {
+        "bdepend": "virtual/pkgconfig",
+        "depend": "oniguruma? ( dev-libs/oniguruma:= )",
+        "idepend": "",
+        "pdepend": "",
+        "rdepend": "oniguruma? ( dev-libs/oniguruma:= )"
+      },
+      "metadata": {
+        "keywords": "amd64 arm64 x86",
+        "license": "MIT",
+        "properties": "",
+        "required_use": "",
+        "restrict": ""
+      }
+    }
+  ]
+}
