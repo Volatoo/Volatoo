@@ -105,6 +105,8 @@ case ${1:-} in
 					"$config_dir/volatoo.spec"
 				! grep -Fq 'stage4/rcadd:' "$config_dir/volatoo.spec"
 				! grep -Fq 'app-admin/sysklogd' "$config_dir/volatoo.spec"
+				grep -Fq '/usr/bin/sshd' "$config_dir/finalize.sh"
+				grep -Fq 'systemd sshd units still reference /usr/sbin/sshd' "$config_dir/finalize.sh"
 				[[ -f $config_dir/overlay/usr/lib/systemd/system/volatoo-persist.service ]]
 				[[ ! -e $config_dir/overlay/etc/init.d/volatoo-persist ]]
 				;;

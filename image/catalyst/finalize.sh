@@ -28,6 +28,17 @@ case $init_system in
 		fi
 		;;
 	systemd)
+		# Gentoo's OpenSSH units still reference the pre-merged-usr path.
+		for ssh_unit in sshd.service sshd@.service; do
+			sed -i 's|/usr/sbin/sshd|/usr/bin/sshd|g' \
+				"/usr/lib/systemd/system/$ssh_unit"
+		done
+		if grep -q '/usr/sbin/sshd' \
+			/usr/lib/systemd/system/sshd.service \
+			/usr/lib/systemd/system/sshd@.service; then
+			echo "error: systemd sshd units still reference /usr/sbin/sshd" >&2
+			exit 1
+		fi
 		mkdir -p /etc/systemd/system/multi-user.target.wants
 		for service in dhcpcd sshd volatoo-persist; do
 			ln -sfn \
