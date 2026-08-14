@@ -655,8 +655,10 @@ authenticated SquashFS mount.
 Supplying `VOLATOO_GENERATION_QEMU_SIGNING_KEY` and
 `VOLATOO_GENERATION_QEMU_TRUSTED_KEY` signs that fixture and requires the
 public key to be embedded in the supplied initramfs. The signed lane verifies
-BIOS/UEFI boot and corrupts the detached signature in a third image, which
-must fail before accepting the dm-verity root hash.
+BIOS/UEFI boot, corrupts a current-only dm-verity image and requires automatic
+rollback to the independently signed parent under both firmware paths. It also
+corrupts data, hash-tree, parent-tree receipt and detached-signature objects in
+explicit-selection images; each must fail closed at its expected trust gate.
 The full-copy lane has a separate 900-second timeout because cross-architecture
 TCG must expand the complete Gentoo root. A quicker smoke run can select one
 firmware and keep only the RAM-backed lane:
