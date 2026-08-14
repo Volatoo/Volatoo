@@ -32,6 +32,7 @@ disk_mib=$(( 4 + efi_mib + system_mib + state_mib + 16 ))
 rootfs_sha256=$(sha256sum /input/rootfs | awk '{print $1}')
 
 staging=/output/.${output_name}.$$
+staging_manifest=${staging}.manifest
 loop_device=
 boot_mount=/mnt/volatoo-boot
 system_mount=/mnt/volatoo-system
@@ -40,11 +41,11 @@ cleanup()
 	if mountpoint -q "$system_mount"; then umount "$system_mount"; fi
 	if mountpoint -q "$boot_mount"; then umount "$boot_mount"; fi
 	if [[ -n $loop_device ]]; then losetup -d "$loop_device"; fi
-	rm -f -- "$staging"
+	rm -f -- "$staging" "$staging_manifest"
 }
 trap cleanup EXIT
 
-[[ ! -e /output/$output_name ]] || {
+[[ ! -e /output/$output_name && ! -e /output/$output_name.manifest ]] || {
 	echo "error: release output already exists: /output/$output_name" >&2
 	exit 1
 }
@@ -122,6 +123,19 @@ umount "$boot_mount"
 losetup -d "$loop_device"
 loop_device=
 chown "$host_uid:$host_gid" "$staging"
+disk_sha256=$(sha256sum "$staging" | awk '{print $1}')
+disk_size=$(stat -c %s "$staging")
+cat >"$staging_manifest" <<EOF
+schema=org.volatoo.release-media/v1
+channel=v0.1-dev
+init_system=$init_system
+disk_file=$output_name
+disk_size=$disk_size
+disk_sha256=$disk_sha256
+rootfs_sha256=$rootfs_sha256
+EOF
+chown "$host_uid:$host_gid" "$staging_manifest"
 mv "$staging" "/output/$output_name"
+mv "$staging_manifest" "/output/$output_name.manifest"
 trap - EXIT
 echo "built /output/$output_name"

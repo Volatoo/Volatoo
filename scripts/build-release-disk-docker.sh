@@ -46,7 +46,10 @@ done
 }
 [[ -n $output ]] || { echo "error: OUTPUT.img is required" >&2; exit 2; }
 [[ $output == *.img ]] || { echo "error: OUTPUT must end in .img" >&2; exit 2; }
-[[ ! -e $output ]] || { echo "error: output already exists: $output" >&2; exit 1; }
+[[ ! -e $output && ! -e $output.manifest ]] || {
+	echo "error: output or manifest already exists: $output" >&2
+	exit 1
+}
 for variable in kernel initramfs rootfs state; do
 	path=${!variable}
 	[[ -f $path && ! -L $path ]] || {

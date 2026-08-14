@@ -128,6 +128,10 @@ system generations. See `docs/design/atomic-package-updates.md`.
   - [ ] Make GPT, filesystem and GRUB output bit-reproducible for identical inputs
 - [ ] Bootable ISO that is itself a Volatoo system (the live medium *is* the distro)
 - [ ] Installer: partition, write image + bootloader + state partition (a script is fine)
+  - [x] Require an explicit block device and verify the release manifest, digest
+        and selected init system before writing
+  - [x] Expand the state partition and filesystem to fill a larger destination
+  - [ ] Package the installer in the live medium
 - [ ] PXE/diskless boot documented and tested
 - [ ] User handbook: install, persist policy, updating, rebuilding your own image
 - [ ] Tag v0.1.0 and publish the first image release

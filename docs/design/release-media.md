@@ -77,3 +77,20 @@ persistent identity, real PID 1 and a login prompt. The OpenRC and systemd
 disks have passed this Gate under BIOS and OVMF UEFI. Bit-for-bit output
 reproducibility remains pending: repeated builds currently differ in generated
 GPT/filesystem identifiers and filesystem/GRUB timestamps.
+
+Install a release image only to an explicit block device:
+
+```sh
+sudo scripts/install-volatoo.sh \
+  --device /dev/DEVICE \
+  --init-system openrc \
+  --image out/volatoo-v0.1-dev-openrc.img
+```
+
+The installer verifies the sidecar manifest, image size, SHA-256 digest,
+selected init system and destination capacity before writing. It refuses
+symlink destinations, mounted targets and the current root disk, then requires
+the operator to type the exact device path unless `--yes` is supplied. When the
+destination is larger than the image, partition 4 and its ext4 filesystem are
+expanded to consume the remaining usable space while retaining their start
+sector and partition identity.
