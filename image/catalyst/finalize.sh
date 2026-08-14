@@ -21,9 +21,11 @@ case $init_system in
 		;;
 	systemd)
 		mkdir -p /etc/systemd/system/multi-user.target.wants
-		ln -sfn \
-			/usr/lib/systemd/system/volatoo-persist.service \
-			/etc/systemd/system/multi-user.target.wants/volatoo-persist.service
+		for service in dhcpcd sshd volatoo-persist; do
+			ln -sfn \
+				"/usr/lib/systemd/system/${service}.service" \
+				"/etc/systemd/system/multi-user.target.wants/${service}.service"
+		done
 		;;
 	*)
 		echo "error: unsupported Volatoo init system: $init_system" >&2

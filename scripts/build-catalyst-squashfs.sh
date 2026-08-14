@@ -216,7 +216,7 @@ fi
 if [[ $init_system == openrc ]]; then
 	profile=default/linux/amd64/23.0
 	rel_type=volatoo
-	init_settings="stage4/rcadd: sysklogd|default volatoo-persist|default"
+	init_settings="stage4/rcadd: dhcpcd|default sshd|default sysklogd|default volatoo-persist|default"
 else
 	profile=default/linux/amd64/23.0/systemd
 	rel_type=volatoo-systemd

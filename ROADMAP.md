@@ -59,7 +59,7 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Cover generation payloads in store/copy/RAM overlays and selectable firmware QEMU lanes
   - [x] Add a RAM-backed SquashFS overlay that releases the source image device
   - [x] Add an explicit store-backed overlay and make it the default root mode
-- [ ] Let installers and image tooling select `openrc` or `systemd` explicitly
+- [x] Let installers and image tooling select `openrc` or `systemd` explicitly
 - [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
 - [ ] Run the image, boot, update and rollback CI matrix against both init systems
 - [ ] Package-set variants: `minimal` (console) first; `desktop` later
@@ -132,6 +132,8 @@ system generations. See `docs/design/atomic-package-updates.md`.
         and selected init system before writing
   - [x] Expand the state partition and filesystem to fill a larger destination
   - [ ] Package the installer in the live medium
+- [x] Provision a key-only `volatoo` administrator and enable DHCP/SSH for both
+      init-system targets without shipping a default password
 - [ ] PXE/diskless boot documented and tested
 - [ ] User handbook: install, persist policy, updating, rebuilding your own image
 - [ ] Tag v0.1.0 and publish the first image release

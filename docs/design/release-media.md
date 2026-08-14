@@ -84,7 +84,8 @@ Install a release image only to an explicit block device:
 sudo scripts/install-volatoo.sh \
   --device /dev/DEVICE \
   --init-system openrc \
-  --image out/volatoo-v0.1-dev-openrc.img
+  --image out/volatoo-v0.1-dev-openrc.img \
+  --ssh-authorized-key "$HOME/.ssh/id_ed25519.pub"
 ```
 
 The installer verifies the sidecar manifest, image size, SHA-256 digest,
@@ -94,3 +95,11 @@ the operator to type the exact device path unless `--yes` is supplied. When the
 destination is larger than the image, partition 4 and its ext4 filesystem are
 expanded to consume the remaining usable space while retaining their start
 sector and partition identity.
+
+The public key is installed into the state partition, not baked into the
+immutable image. At every boot the early handoff creates or refreshes a
+password-disabled `volatoo` administrator, installs the persisted keys, denies
+root and password SSH, and then starts the selected init system. DHCP and sshd
+are enabled for both OpenRC and systemd. An unattended image writer may use
+`--no-provision-access`, but that leaves the installed system without an
+administrator login and must be an explicit choice.

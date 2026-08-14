@@ -86,6 +86,8 @@ case ${1:-} in
 					'source_subpath: volatoo/stage3-amd64-openrc-validate.tar.xz' \
 					"$config_dir/volatoo.spec"
 				grep -Fq 'stage4/rcadd:' "$config_dir/volatoo.spec"
+				grep -Fq 'dhcpcd|default' "$config_dir/volatoo.spec"
+				grep -Fq 'sshd|default' "$config_dir/volatoo.spec"
 				grep -Fq '  app-admin/sysklogd' "$config_dir/volatoo.spec"
 				[[ -x $config_dir/overlay/etc/init.d/volatoo-persist ]]
 				[[ ! -e $config_dir/overlay/usr/lib/systemd/system/volatoo-persist.service ]]

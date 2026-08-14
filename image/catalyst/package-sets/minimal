@@ -2,5 +2,6 @@
 net-misc/dhcpcd
 net-misc/openssh
 net-misc/rsync
+app-admin/sudo
 sys-apps/util-linux
 sys-fs/e2fsprogs

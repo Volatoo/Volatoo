@@ -39,6 +39,7 @@ docker run --rm --privileged \
 		system_offset=$((system_start * 512))
 		system_size=$(((system_end - system_start + 1) * 512))
 		truncate -s "$((size + extra_size))" /tmp/target
+		printf "%s\n" "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIN8XFE9WwjHvSxBSnbiuupCmyvRetPJYcHARXeTwdtLb volatoo-installer-test" >/tmp/authorized_key
 		loop=$(losetup --find --show /tmp/target)
 		cleanup() { losetup -d "$loop" 2>/dev/null || true; }
 		trap cleanup EXIT
@@ -46,6 +47,7 @@ docker run --rm --privileged \
 			--device "$loop" \
 			--init-system openrc \
 			--image /input/release.img \
+			--ssh-authorized-key /tmp/authorized_key \
 			--yes
 		cmp -n "$system_size" /input/release.img "$loop" "$system_offset" "$system_offset"
 		expanded_state_start=$(sgdisk --info=4 "$loop" | awk "/First sector:/ { print \$3 }")
@@ -55,10 +57,16 @@ docker run --rm --privileged \
 		(( expanded_state_sectors > original_state_sectors ))
 		if [[ $loop =~ [0-9]$ ]]; then state_partition=${loop}p4; else state_partition=${loop}4; fi
 		e2fsck -fn "$state_partition"
+		mkdir /tmp/state
+		mount -o ro "$state_partition" /tmp/state
+		cmp /tmp/authorized_key /tmp/state/volatoo/config/access/authorized_keys
+		[[ $(stat -c %a /tmp/state/volatoo/config/access/authorized_keys) == 600 ]]
+		umount /tmp/state
 		if /repo/scripts/install-volatoo.sh \
 			--device "$loop" \
 			--init-system systemd \
 			--image /input/release.img \
+			--no-provision-access \
 			--yes >/tmp/wrong-target.stdout 2>/tmp/wrong-target.stderr
 		then
 			echo "error: installer accepted the wrong init system" >&2
@@ -72,6 +80,7 @@ docker run --rm --privileged \
 			--init-system openrc \
 			--image /input/release.img \
 			--manifest /tmp/bad.manifest \
+			--no-provision-access \
 			--yes >/tmp/bad-digest.stdout 2>/tmp/bad-digest.stderr
 		then
 			echo "error: installer accepted a mismatched digest" >&2

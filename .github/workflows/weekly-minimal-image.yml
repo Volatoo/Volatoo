@@ -14,6 +14,7 @@ on:
       - "scripts/install-volatoo.sh"
       - "scripts/test-release-disk-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
+      - "scripts/tests/test-firstboot-access-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
   pull_request:
@@ -29,6 +30,7 @@ on:
       - "scripts/install-volatoo.sh"
       - "scripts/test-release-disk-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
+      - "scripts/tests/test-firstboot-access-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
   schedule:
@@ -68,6 +70,7 @@ jobs:
             scripts/install-volatoo.sh \
             scripts/test-release-disk-docker.sh \
             scripts/tests/test-install-volatoo-docker.sh \
+            scripts/tests/test-firstboot-access-docker.sh \
             scripts/tests/test-image-init-selection.sh \
             image/catalyst/finalize.sh \
             image/catalyst/container/run-catalyst.sh \
