@@ -11,6 +11,8 @@ disk=$1
 init_system=$2
 firmware=$3
 timeout_seconds=${VOLATOO_RELEASE_QEMU_TIMEOUT:-240}
+rejection_timeout_seconds=${VOLATOO_RELEASE_REJECTION_TIMEOUT:-45}
+expect_secure_rejection=${VOLATOO_RELEASE_EXPECT_SECURE_REJECTION:-no}
 ssh_key=${VOLATOO_RELEASE_SSH_KEY:-}
 [[ -f $disk && ! -L $disk ]] || {
 	echo "error: release disk is missing or unsafe: $disk" >&2
@@ -20,14 +22,26 @@ ssh_key=${VOLATOO_RELEASE_SSH_KEY:-}
 	echo "error: init system must be openrc or systemd" >&2
 	exit 2
 }
-[[ $firmware == bios || $firmware == uefi ]] || {
-	echo "error: firmware must be bios or uefi" >&2
+[[ $firmware == bios || $firmware == uefi || $firmware == uefi-secure ]] || {
+	echo "error: firmware must be bios, uefi, or uefi-secure" >&2
 	exit 2
 }
 [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || {
 	echo "error: VOLATOO_RELEASE_QEMU_TIMEOUT must be a positive integer" >&2
 	exit 2
 }
+[[ $rejection_timeout_seconds =~ ^[1-9][0-9]*$ ]] || {
+	echo "error: VOLATOO_RELEASE_REJECTION_TIMEOUT must be a positive integer" >&2
+	exit 2
+}
+[[ $expect_secure_rejection == yes || $expect_secure_rejection == no ]] || {
+	echo "error: VOLATOO_RELEASE_EXPECT_SECURE_REJECTION must be yes or no" >&2
+	exit 2
+}
+if [[ $expect_secure_rejection == yes && $firmware != uefi-secure ]]; then
+	echo "error: secure rejection can only be expected with uefi-secure" >&2
+	exit 2
+fi
 if [[ -n $ssh_key && (! -f $ssh_key || -L $ssh_key) ]]; then
 	echo "error: VOLATOO_RELEASE_SSH_KEY is missing or unsafe" >&2
 	exit 1
@@ -47,6 +61,7 @@ cleanup()
 trap cleanup EXIT
 
 firmware_args=()
+machine=accel=tcg
 if [[ $firmware == uefi ]]; then
 	vars=$(mktemp)
 	cp /usr/share/OVMF/OVMF_VARS.fd "$vars"
@@ -54,10 +69,19 @@ if [[ $firmware == uefi ]]; then
 		-drive "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.fd"
 		-drive "if=pflash,format=raw,file=$vars"
 	)
+elif [[ $firmware == uefi-secure ]]; then
+	vars=$(mktemp)
+	cp /usr/share/OVMF/OVMF_VARS_4M.snakeoil.fd "$vars"
+	machine=q35,smm=on,accel=tcg
+	firmware_args=(
+		-global "driver=cfi.pflash01,property=secure,value=on"
+		-drive "if=pflash,format=raw,unit=0,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd"
+		-drive "if=pflash,format=raw,unit=1,file=$vars"
+	)
 fi
 
 qemu-system-x86_64 \
-	-machine accel=tcg \
+	-machine "$machine" \
 	-m 4096 \
 	-smp 2 \
 	-nographic \
@@ -68,6 +92,29 @@ qemu-system-x86_64 \
 	-device virtio-net-pci,netdev=net0 \
 	>"$log" 2>&1 &
 qemu_pid=$!
+
+if [[ $expect_secure_rejection == yes ]]; then
+	rejection_deadline=$((SECONDS + rejection_timeout_seconds))
+	while (( SECONDS < rejection_deadline )); do
+		if grep -Fq '[volatoo] initramfs started' "$log" ||
+			grep -Eq '(^|[^[:alpha:]])login: ' "$log"; then
+			echo "error: tampered Secure Boot image reached Volatoo userspace" >&2
+			tail -160 "$log" >&2
+			exit 1
+		fi
+		if ! kill -0 "$qemu_pid" 2>/dev/null; then
+			break
+		fi
+		sleep 0.5
+	done
+	if ! grep -Eiq 'security violation|access denied|image failed to verify' "$log"; then
+		echo "error: Secure Boot firmware did not report signature rejection" >&2
+		tail -160 "$log" >&2
+		exit 1
+	fi
+	echo "Volatoo tampered release disk rejected by uefi-secure"
+	exit 0
+fi
 
 deadline=$((SECONDS + timeout_seconds))
 while (( SECONDS < deadline )); do

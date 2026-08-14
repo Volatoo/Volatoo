@@ -51,9 +51,10 @@ realization-plan bytes before parsing the dm-verity root hash. The public key
 is embedded in the initramfs and the state carries only detached signatures.
 This proves that the complete generation binding and root hash came from a
 trusted release key. `current` may still select an older validly signed
-generation because rollback is intentional. Secure Boot remains necessary to
-authenticate the initramfs and its embedded key; replay prevention additionally
-requires protected monotonic state. See [`release-trust.md`](release-trust.md).
+generation because rollback is intentional. Release media can now use a signed
+UKI and Secure Boot to authenticate the initramfs and its embedded key; replay
+prevention additionally requires protected monotonic state. See
+[`release-trust.md`](release-trust.md).
 
 The first x86_64-TCG development Gate used a 574,824,448-byte OpenRC closure
 and a 4,534,272-byte verity tree (about 0.79% overhead). Realization-v2

@@ -92,9 +92,11 @@ package-level `/nix/store` layout is specified in
 The release-key, rollback and Secure Boot boundaries are specified in
 [`docs/design/release-trust.md`](docs/design/release-trust.md).
 OpenRC and systemd minimal images both pass the overlay-root BIOS and UEFI
-boot gates. They are separate, first-class release targets; users select one
-during image installation or generation selection rather than converting the
-init system with an ordinary package layer.
+boot gates. Signed systemd release media also pass enrolled-key Secure Boot,
+including firmware rejection after a signed UKI is changed. They are separate,
+first-class release targets; users select one during image installation or
+generation selection rather than converting the init system with an ordinary
+package layer.
 
 ## Requirements (target)
 

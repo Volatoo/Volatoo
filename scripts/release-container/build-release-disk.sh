@@ -14,6 +14,8 @@ output_name=${OUTPUT_NAME:?missing OUTPUT_NAME}
 init_system=${INIT_SYSTEM:?missing INIT_SYSTEM}
 host_uid=${HOST_UID:?missing HOST_UID}
 host_gid=${HOST_GID:?missing HOST_GID}
+secure_boot=${VOLATOO_SECURE_BOOT:-no}
+source_date_epoch=${SOURCE_DATE_EPOCH:-0}
 [[ $output_name =~ ^[A-Za-z0-9._-]+\.img$ ]] || {
 	echo "error: unsafe release output name: $output_name" >&2
 	exit 1
@@ -22,6 +24,22 @@ host_gid=${HOST_GID:?missing HOST_GID}
 	echo "error: INIT_SYSTEM must be openrc or systemd" >&2
 	exit 1
 }
+[[ $secure_boot == yes || $secure_boot == no ]] || {
+	echo "error: VOLATOO_SECURE_BOOT must be yes or no" >&2
+	exit 1
+}
+[[ $source_date_epoch =~ ^[0-9]+$ ]] || {
+	echo "error: SOURCE_DATE_EPOCH must be a non-negative integer" >&2
+	exit 1
+}
+if [[ $secure_boot == yes ]]; then
+	for secure_boot_input in secure-boot.key secure-boot.crt; do
+		[[ -f /input/$secure_boot_input && ! -L /input/$secure_boot_input ]] || {
+			echo "error: secure boot input is missing or unsafe: $secure_boot_input" >&2
+			exit 1
+		}
+	done
+fi
 
 efi_mib=128
 rootfs_bytes=$(stat -c %s /input/rootfs)
@@ -111,12 +129,51 @@ grub-install \
 	--boot-directory="$boot_mount/boot" \
 	--modules="part_gpt ext2 fat normal linux echo serial" \
 	"$loop_device" >/dev/null
-grub-install \
-	--target=x86_64-efi \
-	--efi-directory="$boot_mount" \
-	--boot-directory="$boot_mount/boot" \
-	--removable \
-	--no-nvram >/dev/null
+kernel_command_line="console=tty0 console=ttyS0,115200 volatoo.image=LABEL=VOLATOO-SYSTEM volatoo.image-file=/volatoo/root.squashfs volatoo.image-sha256=$rootfs_sha256 volatoo.root=store-overlay volatoo.state=LABEL=VOLATOO-STATE volatoo.state-required=yes volatoo.generation=none"
+uki_sha256=none
+if [[ $secure_boot == yes ]]; then
+	uki_dir=$boot_mount/EFI/BOOT
+	mkdir -p "$uki_dir"
+	printf 'ID=volatoo\nNAME=Volatoo\nVERSION_ID=0.1-dev\n' \
+		>/tmp/volatoo-os-release
+	printf '%s\n' "$kernel_command_line" >/tmp/volatoo-cmdline
+	stub=/usr/lib/systemd/boot/efi/linuxx64.efi.stub
+	stub_image_base=$(objdump -p "$stub" | awk '$1 == "ImageBase" { print $2 }')
+	[[ $stub_image_base =~ ^[0-9A-Fa-f]+$ ]] || {
+		echo "error: could not read EFI stub image base" >&2
+		exit 1
+	}
+	printf -v osrel_vma '0x%x' "$((0x$stub_image_base + 0x20000))"
+	printf -v cmdline_vma '0x%x' "$((0x$stub_image_base + 0x30000))"
+	printf -v linux_vma '0x%x' "$((0x$stub_image_base + 0x2000000))"
+	printf -v initrd_vma '0x%x' "$((0x$stub_image_base + 0x3000000))"
+	objcopy \
+		--add-section .osrel=/tmp/volatoo-os-release \
+		--change-section-vma ".osrel=$osrel_vma" \
+		--add-section .cmdline=/tmp/volatoo-cmdline \
+		--change-section-vma ".cmdline=$cmdline_vma" \
+		--add-section .linux=/input/kernel \
+		--change-section-vma ".linux=$linux_vma" \
+		--add-section .initrd=/input/initramfs \
+		--change-section-vma ".initrd=$initrd_vma" \
+		"$stub" \
+		/tmp/volatoo-unsigned.efi
+	faketime "@$source_date_epoch" sbsign \
+		--key /input/secure-boot.key \
+		--cert /input/secure-boot.crt \
+		--output "$uki_dir/BOOTX64.EFI" \
+		/tmp/volatoo-unsigned.efi >/dev/null
+	sbverify --cert /input/secure-boot.crt \
+		"$uki_dir/BOOTX64.EFI" >/dev/null
+	uki_sha256=$(sha256sum "$uki_dir/BOOTX64.EFI" | awk '{print $1}')
+else
+	grub-install \
+		--target=x86_64-efi \
+		--efi-directory="$boot_mount" \
+		--boot-directory="$boot_mount/boot" \
+		--removable \
+		--no-nvram >/dev/null
+fi
 cat >"$boot_mount/boot/grub/grub.cfg" <<EOF
 set timeout=3
 set default=0
@@ -125,7 +182,7 @@ terminal_input console serial
 terminal_output console serial
 
 menuentry "Volatoo v0.1-dev ($init_system)" {
-	linux /boot/vmlinuz console=tty0 console=ttyS0,115200 volatoo.image=LABEL=VOLATOO-SYSTEM volatoo.image-file=/volatoo/root.squashfs volatoo.image-sha256=$rootfs_sha256 volatoo.root=store-overlay volatoo.state=LABEL=VOLATOO-STATE volatoo.state-required=yes volatoo.generation=none
+	linux /boot/vmlinuz $kernel_command_line
 	initrd /boot/initramfs.cpio.gz
 }
 EOF
@@ -146,6 +203,8 @@ disk_file=$output_name
 disk_size=$disk_size
 disk_sha256=$disk_sha256
 rootfs_sha256=$rootfs_sha256
+secure_boot=$secure_boot
+uki_sha256=$uki_sha256
 EOF
 chown "$host_uid:$host_gid" "$staging_manifest"
 mv "$staging" "/output/$output_name"

@@ -1,7 +1,7 @@
 # Release trust and realization signatures
 
-Status: realization-plan signing is implemented; Secure Boot and the real
-Portage Engine release Gate remain pending.
+Status: realization-plan signing and the Secure Boot outer anchor are
+implemented; the real Portage Engine release Gate remains pending.
 
 ## Trust statement
 
@@ -29,10 +29,10 @@ trusted public key in initramfs
   -> base/layer SquashFS data and hash-tree blocks
 ```
 
-The initramfs itself must ultimately be authenticated by Secure Boot or an
-equivalent measured and verified boot chain. Without that outer anchor, an
-attacker who can replace both the initramfs and state can also replace the
-embedded public key.
+The release-media builder can authenticate the initramfs with a signed UKI and
+Secure Boot. Without selecting and enrolling that outer anchor, an attacker
+who can replace both the initramfs and state can also replace the embedded
+public key.
 
 ## Storage contract
 
@@ -96,3 +96,13 @@ The signed realization-v3 Gate booted a two-layer FHS stack under BIOS and
 UEFI, including a pure deletion and remove-then-replace transaction. Changing
 a layer data block or a used base hash-tree block rejected the generation at
 the authenticated SquashFS mount.
+
+The release-media Gate builds a UKI containing the kernel, initramfs, command
+line and OS identity, signs it with an operator-supplied certificate, and uses
+it as the removable-media UEFI entry. The same disk retains BIOS GRUB support.
+It booted through OVMF with Secure Boot enabled and the signing certificate
+enrolled. Repeating the build with identical inputs produced the same signed
+UKI digest. Changing one byte in that UKI caused OVMF to report a security
+violation before the Volatoo initramfs started. Debian OVMF snakeoil keys are
+used only for this public QEMU fixture; production release keys remain an
+operator responsibility.

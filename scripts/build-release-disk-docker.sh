@@ -8,6 +8,7 @@ usage()
 Usage: scripts/build-release-disk-docker.sh \
   --init-system openrc|systemd \
   --kernel PATH --initramfs PATH --rootfs PATH --state PATH \
+  [--secure-boot-key KEY.pem --secure-boot-cert CERT.pem] \
   OUTPUT.img
 
 Build a new BIOS/UEFI v0.1-dev raw disk image inside the OrbStack Docker
@@ -20,10 +21,12 @@ kernel=
 initramfs=
 rootfs=
 state=
+secure_boot_key=
+secure_boot_cert=
 output=
 while (( $# > 0 )); do
 	case $1 in
-		--init-system|--kernel|--initramfs|--rootfs|--state)
+		--init-system|--kernel|--initramfs|--rootfs|--state|--secure-boot-key|--secure-boot-cert)
 			(( $# >= 2 )) || { echo "error: $1 requires a value" >&2; exit 2; }
 			case $1 in
 				--init-system) init_system=$2 ;;
@@ -31,6 +34,8 @@ while (( $# > 0 )); do
 				--initramfs) initramfs=$2 ;;
 				--rootfs) rootfs=$2 ;;
 				--state) state=$2 ;;
+				--secure-boot-key) secure_boot_key=$2 ;;
+				--secure-boot-cert) secure_boot_cert=$2 ;;
 			esac
 			shift 2
 			;;
@@ -58,6 +63,22 @@ for variable in kernel initramfs rootfs state; do
 	}
 	printf -v "$variable" '%s/%s' "$(cd -- "$(dirname -- "$path")" && pwd)" "$(basename -- "$path")"
 done
+if [[ -n $secure_boot_key || -n $secure_boot_cert ]]; then
+	[[ -n $secure_boot_key && -n $secure_boot_cert ]] || {
+		echo "error: --secure-boot-key and --secure-boot-cert are required together" >&2
+		exit 2
+	}
+	for variable in secure_boot_key secure_boot_cert; do
+		path=${!variable}
+		[[ -f $path && ! -L $path ]] || {
+			echo "error: --${variable//_/-} must name a regular non-symlink file" >&2
+			exit 1
+		}
+		printf -v "$variable" '%s/%s' \
+			"$(cd -- "$(dirname -- "$path")" && pwd)" \
+			"$(basename -- "$path")"
+	done
+fi
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_dir=$(cd -- "$(dirname -- "$output")" && pwd)
@@ -77,21 +98,33 @@ docker build \
 	--tag "$image" \
 	--file "$repo_root/scripts/release-container/Dockerfile" \
 	"$repo_root"
-docker run --rm --privileged \
-	--platform linux/amd64 \
-	--env "INIT_SYSTEM=$init_system" \
-	--env "OUTPUT_NAME=$output_name" \
-	--env "HOST_UID=$(id -u)" \
-	--env "HOST_GID=$(id -g)" \
-	--mount "type=bind,src=$kernel,dst=/input/kernel,readonly" \
-	--mount "type=bind,src=$initramfs,dst=/input/initramfs,readonly" \
-	--mount "type=bind,src=$rootfs,dst=/input/rootfs,readonly" \
-	--mount "type=bind,src=$state,dst=/input/state,readonly" \
-	--mount "type=bind,src=$output_dir,dst=/output" \
-	"$image"
+docker_args=(
+	run --rm --privileged
+	--platform linux/amd64
+	--env "INIT_SYSTEM=$init_system"
+	--env "OUTPUT_NAME=$output_name"
+	--env "HOST_UID=$(id -u)"
+	--env "HOST_GID=$(id -g)"
+	--env SOURCE_DATE_EPOCH=0
+	--mount "type=bind,src=$kernel,dst=/input/kernel,readonly"
+	--mount "type=bind,src=$initramfs,dst=/input/initramfs,readonly"
+	--mount "type=bind,src=$rootfs,dst=/input/rootfs,readonly"
+	--mount "type=bind,src=$state,dst=/input/state,readonly"
+	--mount "type=bind,src=$output_dir,dst=/output"
+)
+if [[ -n $secure_boot_key ]]; then
+	docker_args+=(
+		--env VOLATOO_SECURE_BOOT=yes
+		--mount "type=bind,src=$secure_boot_key,dst=/input/secure-boot.key,readonly"
+		--mount "type=bind,src=$secure_boot_cert,dst=/input/secure-boot.crt,readonly"
+	)
+fi
+docker "${docker_args[@]}" "$image"
 
 output_path=$output_dir/$output_name
 manifest_path=$output_path.manifest
+expected_secure_boot=no
+if [[ -n $secure_boot_key ]]; then expected_secure_boot=yes; fi
 for release_path in "$output_path" "$manifest_path"; do
 	[[ -f $release_path && ! -L $release_path ]] || {
 		echo "error: release builder did not publish a safe file: $release_path" >&2
@@ -108,7 +141,8 @@ manifest_value()
 }
 [[ $(manifest_value schema) == org.volatoo.release-media/v1 && \
 	$(manifest_value init_system) == "$init_system" && \
-	$(manifest_value disk_file) == "$output_name" ]] || {
+	$(manifest_value disk_file) == "$output_name" && \
+	$(manifest_value secure_boot) == "$expected_secure_boot" ]] || {
 	echo "error: release manifest identity differs after publication" >&2
 	exit 1
 }
@@ -128,6 +162,18 @@ checksum_file()
 }
 actual_disk_sha256=$(checksum_file "$output_path")
 actual_rootfs_sha256=$(checksum_file "$rootfs")
+manifest_uki_sha256=$(manifest_value uki_sha256)
+if [[ $expected_secure_boot == yes ]]; then
+	[[ $manifest_uki_sha256 =~ ^[0-9a-f]{64}$ ]] || {
+		echo "error: signed UKI digest is malformed after publication" >&2
+		exit 1
+	}
+else
+	[[ $manifest_uki_sha256 == none ]] || {
+		echo "error: unsigned release unexpectedly claims a UKI" >&2
+		exit 1
+	}
+fi
 [[ $(manifest_value disk_sha256) == "$actual_disk_sha256" && \
 	$(manifest_value rootfs_sha256) == "$actual_rootfs_sha256" ]] || {
 	echo "error: release digest differs after publication" >&2

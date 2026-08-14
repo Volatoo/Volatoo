@@ -6,8 +6,8 @@ usage()
 {
 	cat <<'EOF'
 Usage: scripts/test-release-disk-docker.sh \
-  --init-system openrc|systemd [--firmwares bios,uefi] \
-  [--ssh-private-key KEY] DISK.img
+  --init-system openrc|systemd [--firmwares bios,uefi,uefi-secure] \
+  [--ssh-private-key KEY] [--expect-secure-rejection] DISK.img
 
 Boot a complete Volatoo raw disk through the pinned QEMU runner in the
 OrbStack Docker context. The input disk is mounted read-only and QEMU writes
@@ -19,6 +19,7 @@ init_system=
 firmwares=bios,uefi
 disk=
 ssh_private_key=
+expect_secure_rejection=no
 while (( $# > 0 )); do
 	case $1 in
 		--init-system|--firmwares|--ssh-private-key)
@@ -31,10 +32,16 @@ while (( $# > 0 )); do
 			shift 2
 			;;
 		-h|--help) usage; exit 0 ;;
+		--expect-secure-rejection) expect_secure_rejection=yes; shift ;;
 		-*) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
 		*) [[ -z $disk ]] || { echo "error: only one disk is allowed" >&2; exit 2; }; disk=$1; shift ;;
 	esac
 done
+
+if [[ $expect_secure_rejection == yes && $firmwares != uefi-secure ]]; then
+	echo "error: --expect-secure-rejection requires --firmwares uefi-secure" >&2
+	exit 2
+fi
 
 [[ $init_system == openrc || $init_system == systemd ]] || {
 	echo "error: --init-system must be openrc or systemd" >&2
@@ -63,7 +70,7 @@ IFS=, read -r -a selected_firmwares <<<"$firmwares"
 	exit 2
 }
 for firmware in "${selected_firmwares[@]}"; do
-	[[ $firmware == bios || $firmware == uefi ]] || {
+	[[ $firmware == bios || $firmware == uefi || $firmware == uefi-secure ]] || {
 		echo "error: unsupported firmware: $firmware" >&2
 		exit 2
 	}
@@ -80,6 +87,9 @@ for firmware in "${selected_firmwares[@]}"; do
 		--mount "type=bind,src=$repo_root,dst=/repo,readonly"
 		--mount "type=bind,src=$disk,dst=/inputs/disk,readonly"
 	)
+	if [[ $expect_secure_rejection == yes ]]; then
+		docker_args+=(--env VOLATOO_RELEASE_EXPECT_SECURE_REJECTION=yes)
+	fi
 	if [[ -n $ssh_private_key ]]; then
 		docker_args+=(
 			--env VOLATOO_RELEASE_SSH_KEY=/inputs/ssh-key

@@ -4,6 +4,7 @@ FROM --platform=linux/amd64 alpine:3.24.1@sha256:79ff19e9084a00eece421b2523fb93e
 
 RUN apk add --no-cache \
     bash \
+    binutils=2.45.1-r1 \
     coreutils \
     dosfstools \
     e2fsprogs \
@@ -11,7 +12,10 @@ RUN apk add --no-cache \
     grub \
     grub-bios \
     grub-efi \
+    libfaketime=0.9.12-r0 \
+    sbsigntool=0.9.5-r3 \
     sgdisk \
+    systemd-efistub=260.2-r0 \
     util-linux
 
 COPY --chmod=0755 scripts/release-container/build-release-disk.sh \
