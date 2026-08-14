@@ -16,15 +16,19 @@ from typing import Any, Callable
 
 BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
 BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
-GENERATION_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V1_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V2_SCHEMA = "org.volatoo.generation/v2"
+GENERATION_SCHEMAS = (GENERATION_V1_SCHEMA, GENERATION_V2_SCHEMA)
 LAYER_PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
 LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
 PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
 PACKAGE_SOURCE_CATALOG_SCHEMA = "org.volatoo.package-source-catalog/v1"
 PACKAGE_SOURCE_QUERY_SCHEMA = "org.volatoo.package-source-query/v1"
+PORTAGE_STATE_SCHEMA = "org.volatoo.portage-state/v1"
 TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
 MAX_MANIFEST_SIZE = 1024 * 1024
 MAX_INTEGER = (1 << 63) - 1
+MAX_GENERATION_V2_LAYERS = 256
 
 SHA256_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 REVISION_RE = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
@@ -352,6 +356,105 @@ def validate_build_context(manifest: dict[str, Any]) -> str:
     require_digest(context["config_digest"], "manifest.config_digest")
     require_digest(context["world_digest"], "manifest.world_digest")
     return target_id
+
+
+def validate_portage_state(manifest: dict[str, Any]) -> str:
+    state = require_object(
+        manifest,
+        "manifest",
+        {
+            "schema",
+            "target_id",
+            "config_digest",
+            "world_digest",
+            "repositories",
+            "profile",
+            "toolchain",
+        },
+    )
+    if state["schema"] != PORTAGE_STATE_SCHEMA:
+        raise ManifestError(
+            f"manifest.schema must be {PORTAGE_STATE_SCHEMA}"
+        )
+    target_id = require_identifier(state["target_id"], "manifest.target_id")
+    if not target_id.startswith("volatoo/"):
+        raise ManifestError("manifest.target_id must use the volatoo/ namespace")
+    require_digest(state["config_digest"], "manifest.config_digest")
+    require_digest(state["world_digest"], "manifest.world_digest")
+
+    repositories = state["repositories"]
+    if not isinstance(repositories, list) or not repositories:
+        raise ManifestError(
+            "manifest.repositories must be a non-empty array"
+        )
+    repository_names: list[str] = []
+    for index, value in enumerate(repositories):
+        path = f"manifest.repositories[{index}]"
+        repository = require_object(
+            value,
+            path,
+            {"name", "revision", "tree_digest"},
+        )
+        repository_names.append(
+            require_string(
+                repository["name"],
+                f"{path}.name",
+                NAME_RE,
+                64,
+            )
+        )
+        require_revision(repository["revision"], f"{path}.revision")
+        require_digest(repository["tree_digest"], f"{path}.tree_digest")
+    if repository_names != sorted(set(repository_names)):
+        raise ManifestError(
+            "manifest.repositories must be sorted by name and contain no "
+            "duplicates"
+        )
+
+    profile = require_object(
+        state["profile"],
+        "manifest.profile",
+        {"id", "revision"},
+    )
+    require_identifier(profile["id"], "manifest.profile.id")
+    require_revision(profile["revision"], "manifest.profile.revision")
+
+    toolchain = require_object(
+        state["toolchain"],
+        "manifest.toolchain",
+        {"portage_version", "digest"},
+    )
+    require_string(
+        toolchain["portage_version"],
+        "manifest.toolchain.portage_version",
+        VALUE_RE,
+        128,
+    )
+    require_digest(toolchain["digest"], "manifest.toolchain.digest")
+    return target_id
+
+
+def portage_state_from_context(
+    context: dict[str, Any],
+    world_digest: str | None = None,
+) -> dict[str, Any]:
+    target_id = validate_build_context(context)
+    selected_world = (
+        context["world_digest"] if world_digest is None else world_digest
+    )
+    require_digest(selected_world, "world_digest")
+    return {
+        "schema": PORTAGE_STATE_SCHEMA,
+        "target_id": target_id,
+        "config_digest": context["config_digest"],
+        "world_digest": selected_world,
+        "repositories": context["sources"],
+        "profile": {
+            "id": context["target"]["profile_id"],
+            "revision": context["target"]["profile_revision"],
+        },
+        "toolchain": context["toolchain"],
+    }
 
 
 def validate_build_spec(manifest: dict[str, Any]) -> str:
@@ -1070,21 +1173,35 @@ def validate_layer_transaction(manifest: dict[str, Any]) -> str:
 
 
 def validate_generation(manifest: dict[str, Any]) -> str:
-    generation = require_object(
-        manifest,
-        "manifest",
-        {
+    schema = manifest.get("schema")
+    if schema == GENERATION_V1_SCHEMA:
+        required = {
             "schema",
             "target_id",
             "build_context_digest",
             "base",
             "layers",
-        },
-    )
-    if generation["schema"] != GENERATION_SCHEMA:
+        }
+    elif schema == GENERATION_V2_SCHEMA:
+        required = {
+            "schema",
+            "target_id",
+            "build_context_digest",
+            "portage_state_digest",
+            "parent_generation_digest",
+            "base",
+            "layers",
+        }
+    else:
         raise ManifestError(
-            f"manifest.schema must be {GENERATION_SCHEMA}"
+            "manifest.schema must be one of "
+            + ", ".join(GENERATION_SCHEMAS)
         )
+    generation = require_object(
+        manifest,
+        "manifest",
+        required,
+    )
     target_id = require_identifier(
         generation["target_id"], "manifest.target_id"
     )
@@ -1094,6 +1211,17 @@ def validate_generation(manifest: dict[str, Any]) -> str:
         generation["build_context_digest"],
         "manifest.build_context_digest",
     )
+    if schema == GENERATION_V2_SCHEMA:
+        require_digest(
+            generation["portage_state_digest"],
+            "manifest.portage_state_digest",
+        )
+        parent_digest = generation["parent_generation_digest"]
+        if parent_digest is not None:
+            require_digest(
+                parent_digest,
+                "manifest.parent_generation_digest",
+            )
 
     base = require_object(
         generation["base"],
@@ -1108,6 +1236,14 @@ def validate_generation(manifest: dict[str, Any]) -> str:
     layers = generation["layers"]
     if not isinstance(layers, list):
         raise ManifestError("manifest.layers must be an array")
+    if (
+        schema == GENERATION_V2_SCHEMA
+        and len(layers) > MAX_GENERATION_V2_LAYERS
+    ):
+        raise ManifestError(
+            "manifest.layers exceeds the generation v2 limit of "
+            f"{MAX_GENERATION_V2_LAYERS}; compact the generation"
+        )
     rootfs_digests: set[str] = set()
     transaction_digests: set[str] = set()
     for index, value in enumerate(layers):
@@ -1141,6 +1277,18 @@ def validate_generation(manifest: dict[str, Any]) -> str:
         require_digest(
             layer["tombstones_digest"], f"{path}.tombstones_digest"
         )
+    if schema == GENERATION_V2_SCHEMA:
+        parent_digest = generation["parent_generation_digest"]
+        if layers and parent_digest is None:
+            raise ManifestError(
+                "manifest.parent_generation_digest is required when layers "
+                "are present"
+            )
+        if not layers and parent_digest is not None:
+            raise ManifestError(
+                "manifest.parent_generation_digest must be null when layers "
+                "are empty"
+            )
     return target_id
 
 
@@ -1150,7 +1298,7 @@ def validate_manifest(manifest: dict[str, Any]) -> str:
         validate_build_context(manifest)
     elif schema == BUILD_SPEC_SCHEMA:
         validate_build_spec(manifest)
-    elif schema == GENERATION_SCHEMA:
+    elif schema in GENERATION_SCHEMAS:
         validate_generation(manifest)
     elif schema == LAYER_PATHS_SCHEMA:
         validate_path_manifest(manifest, LAYER_PATHS_SCHEMA)
@@ -1162,6 +1310,8 @@ def validate_manifest(manifest: dict[str, Any]) -> str:
         validate_package_source_catalog(manifest)
     elif schema == PACKAGE_SOURCE_QUERY_SCHEMA:
         validate_package_source_query(manifest)
+    elif schema == PORTAGE_STATE_SCHEMA:
+        validate_portage_state(manifest)
     elif schema == TOMBSTONES_SCHEMA:
         validate_path_manifest(manifest, TOMBSTONES_SCHEMA)
     else:
@@ -1218,9 +1368,11 @@ def command_digest(arguments: argparse.Namespace) -> None:
     print(manifest_digest(manifest))
 
 
-def command_verify_generation(arguments: argparse.Namespace) -> None:
-    generation = read_manifest(arguments.generation)
-    context = read_manifest(arguments.build_context)
+def verify_generation_context(
+    generation: dict[str, Any],
+    context: dict[str, Any],
+    portage_state: dict[str, Any] | None = None,
+) -> None:
     generation_target = validate_generation(generation)
     context_target = validate_build_context(context)
     if generation_target != context_target:
@@ -1239,12 +1391,126 @@ def command_verify_generation(arguments: argparse.Namespace) -> None:
         raise ManifestError(
             "generation base rootfs_digest does not match build context"
         )
-    print(f"valid {GENERATION_SCHEMA} with {BUILD_CONTEXT_SCHEMA}")
+    if generation["schema"] == GENERATION_V2_SCHEMA:
+        if portage_state is None:
+            raise ManifestError(
+                "generation v2 requires its PortageState object"
+            )
+        state_target = validate_portage_state(portage_state)
+        if state_target != generation_target:
+            raise ManifestError(
+                "generation target_id does not match PortageState target_id"
+            )
+        if (
+            generation["portage_state_digest"]
+            != manifest_digest(portage_state)
+        ):
+            raise ManifestError(
+                "generation portage_state_digest does not match PortageState"
+            )
+        expected_state = portage_state_from_context(
+            context,
+            portage_state["world_digest"],
+        )
+        if portage_state != expected_state:
+            raise ManifestError(
+                "PortageState config, repositories, profile or toolchain "
+                "does not match build context"
+            )
+        if (
+            generation["parent_generation_digest"] is None
+            and portage_state["world_digest"] != context["world_digest"]
+        ):
+            raise ManifestError(
+                "base generation PortageState world does not match build "
+                "context"
+            )
 
 
-def command_verify_build_spec(arguments: argparse.Namespace) -> None:
-    spec = read_manifest(arguments.build_spec)
+def command_verify_generation(arguments: argparse.Namespace) -> None:
+    generation = read_manifest(arguments.generation)
     context = read_manifest(arguments.build_context)
+    portage_state = (
+        read_manifest(arguments.portage_state)
+        if arguments.portage_state is not None
+        else None
+    )
+    verify_generation_context(generation, context, portage_state)
+    print(
+        f"valid {generation['schema']} with {BUILD_CONTEXT_SCHEMA}"
+        + (
+            f" and {PORTAGE_STATE_SCHEMA}"
+            if portage_state is not None
+            else ""
+        )
+    )
+
+
+def verify_update_context(
+    parent: dict[str, Any],
+    context: dict[str, Any],
+    parent_portage_state: dict[str, Any] | None = None,
+) -> None:
+    parent_target = validate_generation(parent)
+    context_target = validate_build_context(context)
+    if parent_target != context_target:
+        raise ManifestError(
+            "update build context target does not match parent generation"
+        )
+    if (
+        parent["base"]["rootfs_digest"]
+        != context["base"]["rootfs_digest"]
+    ):
+        raise ManifestError(
+            "update build context base does not match parent generation"
+        )
+    if (
+        parent["schema"] == GENERATION_V1_SCHEMA
+        and parent["build_context_digest"] != manifest_digest(context)
+    ):
+        raise ManifestError(
+            "generation v1 requires an unchanged build context; publish one "
+            "v2 transition before changing Portage state"
+        )
+    if parent["schema"] == GENERATION_V2_SCHEMA:
+        if parent_portage_state is None:
+            raise ManifestError(
+                "generation v2 update requires the parent PortageState"
+            )
+        validate_portage_state(parent_portage_state)
+        if (
+            parent["portage_state_digest"]
+            != manifest_digest(parent_portage_state)
+        ):
+            raise ManifestError(
+                "parent generation portage_state_digest does not match "
+                "PortageState"
+            )
+        if context["world_digest"] != parent_portage_state["world_digest"]:
+            raise ManifestError(
+                "update build context world does not match parent "
+                "PortageState"
+            )
+
+
+def command_verify_update_context(arguments: argparse.Namespace) -> None:
+    parent = read_manifest(arguments.parent_generation)
+    context = read_manifest(arguments.build_context)
+    parent_portage_state = (
+        read_manifest(arguments.parent_portage_state)
+        if arguments.parent_portage_state is not None
+        else None
+    )
+    verify_update_context(parent, context, parent_portage_state)
+    print(
+        f"valid update from {parent['schema']} with {BUILD_CONTEXT_SCHEMA}"
+    )
+
+
+def verify_build_spec_context(
+    spec: dict[str, Any],
+    context: dict[str, Any],
+) -> None:
     spec_target = validate_build_spec(spec)
     context_target = validate_build_context(context)
     if spec_target != context_target:
@@ -1263,6 +1529,12 @@ def command_verify_build_spec(arguments: argparse.Namespace) -> None:
         raise ManifestError(
             "BuildSpec resolver.version does not match build context Portage"
         )
+
+
+def command_verify_build_spec(arguments: argparse.Namespace) -> None:
+    spec = read_manifest(arguments.build_spec)
+    context = read_manifest(arguments.build_context)
+    verify_build_spec_context(spec, context)
     print(f"valid {BUILD_SPEC_SCHEMA} with {BUILD_CONTEXT_SCHEMA}")
 
 
@@ -1305,11 +1577,12 @@ def command_verify_package_source_query(
     )
 
 
-def command_verify_acquisition(arguments: argparse.Namespace) -> None:
-    receipt = read_manifest(arguments.receipt)
-    spec = read_manifest(arguments.build_spec)
-    context = read_manifest(arguments.build_context)
-    catalog = read_manifest(arguments.source_catalog)
+def verify_acquisition_closure(
+    receipt: dict[str, Any],
+    spec: dict[str, Any],
+    context: dict[str, Any],
+    catalog: dict[str, Any],
+) -> None:
     receipt_target = validate_package_acquisition(receipt)
     spec_target = validate_build_spec(spec)
     context_target = validate_build_context(context)
@@ -1396,6 +1669,14 @@ def command_verify_acquisition(arguments: argparse.Namespace) -> None:
         raise ManifestError(
             "acquisition does not cover every BuildSpec package exactly once"
         )
+
+
+def command_verify_acquisition(arguments: argparse.Namespace) -> None:
+    receipt = read_manifest(arguments.receipt)
+    spec = read_manifest(arguments.build_spec)
+    context = read_manifest(arguments.build_context)
+    catalog = read_manifest(arguments.source_catalog)
+    verify_acquisition_closure(receipt, spec, context, catalog)
     print(
         f"valid {PACKAGE_ACQUISITION_SCHEMA} with "
         f"{BUILD_SPEC_SCHEMA}, {BUILD_CONTEXT_SCHEMA} and "
@@ -1403,16 +1684,17 @@ def command_verify_acquisition(arguments: argparse.Namespace) -> None:
     )
 
 
-def command_verify_layer_transaction(arguments: argparse.Namespace) -> None:
-    transaction = read_manifest(arguments.transaction)
-    generation = read_manifest(arguments.generation)
-    parent = read_manifest(arguments.parent_generation)
-    context = read_manifest(arguments.build_context)
-    spec = read_manifest(arguments.build_spec)
-    acquisition = read_manifest(arguments.acquisition)
-    changed = read_manifest(arguments.changed_paths)
-    tombstones = read_manifest(arguments.tombstones)
-
+def verify_layer_transaction_closure(
+    transaction: dict[str, Any],
+    generation: dict[str, Any],
+    parent: dict[str, Any],
+    context: dict[str, Any],
+    spec: dict[str, Any],
+    acquisition: dict[str, Any],
+    changed: dict[str, Any],
+    tombstones: dict[str, Any],
+    portage_state: dict[str, Any] | None = None,
+) -> None:
     targets = {
         validate_layer_transaction(transaction),
         validate_generation(generation),
@@ -1491,6 +1773,73 @@ def command_verify_layer_transaction(arguments: argparse.Namespace) -> None:
         raise ManifestError(
             "generation candidate does not append exactly one transaction"
         )
+    if generation["target_id"] != parent["target_id"]:
+        raise ManifestError("generation candidate changes parent target")
+    if generation["schema"] == GENERATION_V1_SCHEMA:
+        if parent["schema"] != GENERATION_V1_SCHEMA:
+            raise ManifestError("generation v1 cannot extend generation v2")
+        if generation["build_context_digest"] != parent[
+            "build_context_digest"
+        ]:
+            raise ManifestError(
+                "generation v1 candidate changes parent build context"
+            )
+    else:
+        if generation["parent_generation_digest"] != parent_digest:
+            raise ManifestError(
+                "generation candidate parent_generation_digest mismatch"
+            )
+        if portage_state is None:
+            raise ManifestError(
+                "generation v2 transaction requires its PortageState object"
+            )
+        state_target = validate_portage_state(portage_state)
+        if state_target != generation["target_id"]:
+            raise ManifestError(
+                "generation candidate PortageState target mismatch"
+            )
+        if (
+            generation["portage_state_digest"]
+            != manifest_digest(portage_state)
+        ):
+            raise ManifestError(
+                "generation candidate portage_state_digest mismatch"
+            )
+        if portage_state != portage_state_from_context(
+            context,
+            transaction["world_digest"],
+        ):
+            raise ManifestError(
+                "generation candidate PortageState does not describe the "
+                "transaction result"
+            )
+
+
+def command_verify_layer_transaction(arguments: argparse.Namespace) -> None:
+    transaction = read_manifest(arguments.transaction)
+    generation = read_manifest(arguments.generation)
+    parent = read_manifest(arguments.parent_generation)
+    context = read_manifest(arguments.build_context)
+    spec = read_manifest(arguments.build_spec)
+    acquisition = read_manifest(arguments.acquisition)
+    changed = read_manifest(arguments.changed_paths)
+    tombstones = read_manifest(arguments.tombstones)
+    portage_state = (
+        read_manifest(arguments.portage_state)
+        if arguments.portage_state is not None
+        else None
+    )
+    verify_layer_transaction_closure(
+        transaction,
+        generation,
+        parent,
+        context,
+        spec,
+        acquisition,
+        changed,
+        tombstones,
+        portage_state,
+    )
     print(
         f"valid {LAYER_TRANSACTION_SCHEMA} and generation candidate"
     )
@@ -1517,7 +1866,21 @@ def parse_arguments() -> argparse.Namespace:
     )
     verify.add_argument("generation")
     verify.add_argument("build_context")
+    verify.add_argument(
+        "portage_state",
+        nargs="?",
+        help="required org.volatoo.portage-state/v1 object for generation v2",
+    )
     verify.set_defaults(handler=command_verify_generation)
+
+    verify_update = subparsers.add_parser(
+        "verify-update-context",
+        help="verify a build context can extend a parent generation",
+    )
+    verify_update.add_argument("parent_generation")
+    verify_update.add_argument("build_context")
+    verify_update.add_argument("parent_portage_state", nargs="?")
+    verify_update.set_defaults(handler=command_verify_update_context)
 
     verify_spec = subparsers.add_parser(
         "verify-build-spec",
@@ -1558,6 +1921,10 @@ def parse_arguments() -> argparse.Namespace:
     verify_layer.add_argument("acquisition")
     verify_layer.add_argument("changed_paths")
     verify_layer.add_argument("tombstones")
+    verify_layer.add_argument(
+        "--portage-state",
+        help="required org.volatoo.portage-state/v1 object for generation v2",
+    )
     verify_layer.set_defaults(handler=command_verify_layer_transaction)
     return parser.parse_args()
 

@@ -22,6 +22,8 @@ from typing import Any
 POLICY_SCHEMA = "org.volatoo.activation-policy/v1"
 RECEIPT_SCHEMA = "org.volatoo.activation-receipt/v1"
 GENERATION_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V2_SCHEMA = "org.volatoo.generation/v2"
+GENERATION_SCHEMAS = (GENERATION_SCHEMA, GENERATION_V2_SCHEMA)
 TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
 PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
 TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
@@ -289,8 +291,11 @@ def contract(
         contracts["validate_manifest"](value)
     except RuntimeError as error:
         raise ActivationError(str(error)) from error
-    if value["schema"] != schema:
-        raise ActivationError(f"{path} must use {schema}")
+    expected = (
+        GENERATION_SCHEMAS if schema == GENERATION_SCHEMA else (schema,)
+    )
+    if value["schema"] not in expected:
+        raise ActivationError(f"{path} must use one of {', '.join(expected)}")
     return value
 
 
@@ -332,13 +337,27 @@ def validate_candidate_append(
     candidate: dict[str, Any],
     parent: dict[str, Any],
 ) -> None:
-    if (
+    common_invalid = (
         candidate["target_id"] != parent["target_id"]
-        or candidate["build_context_digest"] != parent["build_context_digest"]
         or candidate["base"] != parent["base"]
         or candidate["layers"][:-1] != parent["layers"]
         or len(candidate["layers"]) != len(parent["layers"]) + 1
-    ):
+    )
+    schema_invalid = (
+        (
+            parent["schema"] != GENERATION_SCHEMA
+            or candidate["build_context_digest"]
+            != parent["build_context_digest"]
+        )
+        if candidate["schema"] == GENERATION_SCHEMA
+        else (
+            candidate["schema"] != GENERATION_V2_SCHEMA
+            or candidate["parent_generation_digest"]
+            != "sha256:"
+            + hashlib.sha256(canonical_bytes(parent)).hexdigest()
+        )
+    )
+    if common_invalid or schema_invalid:
         raise ActivationError(
             "candidate must append exactly one layer to the running generation"
         )
@@ -829,6 +848,7 @@ def activate(arguments: argparse.Namespace) -> None:
                     generation_tool["select_digest"](
                         system,
                         details["running_digest"],
+                        details["candidate_digest"],
                     )
                 except RuntimeError as error:
                     rollback_errors.append(str(error))

@@ -1,0 +1,103 @@
+#!/bin/sh
+
+set -eu
+
+usage()
+{
+	cat <<'EOF'
+Usage:
+  volatoo-update-view COMMAND [ARGUMENT...]
+
+Run one update command in a private mount namespace. The command receives a
+writable state view at /run/volatoo/update-state and in VOLATOO_UPDATE_STATE.
+The public /.volatoo/state/volatoo/system mount must already be read-only.
+EOF
+}
+
+case ${1:-} in
+	-h | --help)
+		usage
+		exit
+		;;
+	--private-view)
+		shift
+		;;
+	'')
+		usage >&2
+		exit 2
+		;;
+	*)
+		if [ "$(id -u)" != 0 ]; then
+			echo "error: the Volatoo update view requires root" >&2
+			exit 1
+		fi
+		for command_name in flock mount unshare; do
+			if ! command -v "$command_name" >/dev/null 2>&1; then
+				echo "error: required update-view command is missing: $command_name" >&2
+				exit 1
+			fi
+		done
+		mkdir -p /run/volatoo
+		exec flock -n /run/volatoo/update-view.lock \
+			unshare --mount --propagation private \
+			"$0" --private-view "$@"
+		;;
+esac
+
+if [ "$#" -eq 0 ]; then
+	usage >&2
+	exit 2
+fi
+
+public_state=${VOLATOO_PUBLIC_STATE:-/.volatoo/state}
+update_state=/run/volatoo/update-state
+public_system=$public_state/volatoo/system
+public_probe=$public_system/staging/.volatoo-public-write-probe.$$
+
+if [ -L "$public_state" ] || [ ! -d "$public_state" ]; then
+	echo "error: Volatoo public state mount is missing or unsafe" >&2
+	exit 1
+fi
+if [ -L "$public_system" ] || [ ! -d "$public_system" ]; then
+	echo "error: Volatoo public system store is missing or unsafe" >&2
+	exit 1
+fi
+if (: >"$public_probe") 2>/dev/null; then
+	rm -f "$public_probe"
+	echo "error: refusing an update because the public system store is writable" >&2
+	exit 1
+fi
+
+mkdir -p "$update_state"
+if [ -L "$update_state" ] || [ ! -d "$update_state" ]; then
+	echo "error: private update mountpoint is unsafe" >&2
+	exit 1
+fi
+
+mounted=0
+# The function is invoked indirectly by the signal/exit trap.
+# shellcheck disable=SC2329
+cleanup()
+{
+	if [ "$mounted" -eq 1 ]; then
+		umount "$update_state" 2>/dev/null || true
+	fi
+	rmdir "$update_state" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+mount --bind "$public_state" "$update_state"
+mounted=1
+private_probe=$update_state/volatoo/system/staging/.volatoo-private-write-probe.$$
+if ! (: >"$private_probe") 2>/dev/null; then
+	echo "error: private update state view is not writable" >&2
+	exit 1
+fi
+rm -f "$private_probe"
+
+VOLATOO_UPDATE_STATE=$update_state
+export VOLATOO_UPDATE_STATE
+
+status=0
+"$@" || status=$?
+exit "$status"
