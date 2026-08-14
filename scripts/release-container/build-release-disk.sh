@@ -47,7 +47,14 @@ state_bytes=$(stat -c %s /input/state)
 system_mib=$(( (rootfs_bytes + 1048575) / 1048576 + 64 ))
 state_mib=$(( (state_bytes + 1048575) / 1048576 + 8 ))
 disk_mib=$(( 4 + efi_mib + system_mib + state_mib + 16 ))
+kernel_sha256=$(sha256sum /input/kernel | awk '{print $1}')
+initramfs_sha256=$(sha256sum /input/initramfs | awk '{print $1}')
 rootfs_sha256=$(sha256sum /input/rootfs | awk '{print $1}')
+state_sha256=$(sha256sum /input/state | awk '{print $1}')
+secure_boot_cert_sha256=none
+if [[ $secure_boot == yes ]]; then
+	secure_boot_cert_sha256=$(sha256sum /input/secure-boot.crt | awk '{print $1}')
+fi
 
 staging=/output/.${output_name}.$$
 staging_manifest=${staging}.manifest
@@ -117,12 +124,6 @@ install -d "$boot_mount/boot" "$system_mount/volatoo"
 install -m 0644 /input/kernel "$boot_mount/boot/vmlinuz"
 install -m 0644 /input/initramfs "$boot_mount/boot/initramfs.cpio.gz"
 install -m 0644 /input/rootfs "$system_mount/volatoo/root.squashfs"
-cat >"$system_mount/volatoo/release.env" <<EOF
-schema=org.volatoo.release-media/v1
-channel=v0.1-dev
-init_system=$init_system
-rootfs_sha256=$rootfs_sha256
-EOF
 
 grub-install \
 	--target=i386-pc \
@@ -186,6 +187,18 @@ menuentry "Volatoo v0.1-dev ($init_system)" {
 	initrd /boot/initramfs.cpio.gz
 }
 EOF
+cat >"$system_mount/volatoo/release.env" <<EOF
+schema=org.volatoo.release-media/v2
+channel=v0.1-dev
+init_system=$init_system
+kernel_sha256=$kernel_sha256
+initramfs_sha256=$initramfs_sha256
+rootfs_sha256=$rootfs_sha256
+state_sha256=$state_sha256
+secure_boot=$secure_boot
+secure_boot_cert_sha256=$secure_boot_cert_sha256
+uki_sha256=$uki_sha256
+EOF
 
 sync
 umount "$system_mount"
@@ -196,14 +209,18 @@ chown "$host_uid:$host_gid" "$staging"
 disk_sha256=$(sha256sum "$staging" | awk '{print $1}')
 disk_size=$(stat -c %s "$staging")
 cat >"$staging_manifest" <<EOF
-schema=org.volatoo.release-media/v1
+schema=org.volatoo.release-media/v2
 channel=v0.1-dev
 init_system=$init_system
 disk_file=$output_name
 disk_size=$disk_size
 disk_sha256=$disk_sha256
+kernel_sha256=$kernel_sha256
+initramfs_sha256=$initramfs_sha256
 rootfs_sha256=$rootfs_sha256
+state_sha256=$state_sha256
 secure_boot=$secure_boot
+secure_boot_cert_sha256=$secure_boot_cert_sha256
 uki_sha256=$uki_sha256
 EOF
 chown "$host_uid:$host_gid" "$staging_manifest"

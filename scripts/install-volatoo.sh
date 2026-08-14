@@ -130,8 +130,19 @@ manifest_value()
 	printf '%s\n' "$value"
 }
 
-[[ $(manifest_value schema) == org.volatoo.release-media/v1 ]] || {
+manifest_schema=$(manifest_value schema)
+[[ $manifest_schema == org.volatoo.release-media/v1 || \
+	$manifest_schema == org.volatoo.release-media/v2 ]] || {
 	echo "error: unsupported release manifest schema" >&2
+	exit 1
+}
+[[ $(manifest_value channel) == v0.1-dev ]] || {
+	echo "error: unsupported release channel" >&2
+	exit 1
+}
+manifest_disk_file=$(manifest_value disk_file)
+[[ $manifest_disk_file =~ ^[A-Za-z0-9._-]+\.img$ ]] || {
+	echo "error: invalid disk_file in release manifest" >&2
 	exit 1
 }
 manifest_init=$(manifest_value init_system)
@@ -149,6 +160,34 @@ expected_sha256=$(manifest_value disk_sha256)
 	echo "error: invalid disk_sha256 in release manifest" >&2
 	exit 1
 }
+if [[ $manifest_schema == org.volatoo.release-media/v2 ]]; then
+	for digest_name in kernel_sha256 initramfs_sha256 rootfs_sha256 state_sha256; do
+		digest_value=$(manifest_value "$digest_name")
+		[[ $digest_value =~ ^[0-9a-f]{64}$ ]] || {
+			echo "error: invalid $digest_name in release manifest" >&2
+			exit 1
+		}
+	done
+	manifest_secure_boot=$(manifest_value secure_boot)
+	manifest_secure_boot_cert=$(manifest_value secure_boot_cert_sha256)
+	manifest_uki=$(manifest_value uki_sha256)
+	[[ $manifest_secure_boot == yes || $manifest_secure_boot == no ]] || {
+		echo "error: invalid secure_boot in release manifest" >&2
+		exit 1
+	}
+	if [[ $manifest_secure_boot == yes ]]; then
+		[[ $manifest_secure_boot_cert =~ ^[0-9a-f]{64}$ && \
+			$manifest_uki =~ ^[0-9a-f]{64}$ ]] || {
+			echo "error: signed release has invalid Secure Boot provenance" >&2
+			exit 1
+		}
+	else
+		[[ $manifest_secure_boot_cert == none && $manifest_uki == none ]] || {
+			echo "error: unsigned release claims Secure Boot provenance" >&2
+			exit 1
+		}
+	fi
+fi
 actual_size=$(stat -c %s "$image")
 [[ $actual_size == "$expected_size" ]] || {
 	echo "error: release image size does not match its manifest" >&2

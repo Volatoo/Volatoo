@@ -125,6 +125,9 @@ workflow and Docker requirements.
 The official Gentoo package repository is maintained separately in
 [`Volatoo/volatoo-overlay`](https://github.com/Volatoo/volatoo-overlay).
 
+Installation, first-boot access, persistence, rollback and reproducible image
+build instructions are in the [developer preview handbook](docs/handbook.md).
+
 ## Contributing
 
 The project is in the design phase — issues and discussions about the boot flow, persistence semantics, and image tooling are the most valuable contribution right now. See [ROADMAP.md](ROADMAP.md) for where things stand and [AGENTS.md](AGENTS.md) for repository conventions (commit style included).

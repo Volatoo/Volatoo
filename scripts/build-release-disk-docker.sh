@@ -139,7 +139,7 @@ manifest_value()
 		END { if (count != 1) exit 1; print value }
 	' "$manifest_path"
 }
-[[ $(manifest_value schema) == org.volatoo.release-media/v1 && \
+[[ $(manifest_value schema) == org.volatoo.release-media/v2 && \
 	$(manifest_value init_system) == "$init_system" && \
 	$(manifest_value disk_file) == "$output_name" && \
 	$(manifest_value secure_boot) == "$expected_secure_boot" ]] || {
@@ -161,21 +161,33 @@ checksum_file()
 	fi
 }
 actual_disk_sha256=$(checksum_file "$output_path")
+actual_kernel_sha256=$(checksum_file "$kernel")
+actual_initramfs_sha256=$(checksum_file "$initramfs")
 actual_rootfs_sha256=$(checksum_file "$rootfs")
+actual_state_sha256=$(checksum_file "$state")
 manifest_uki_sha256=$(manifest_value uki_sha256)
+manifest_secure_boot_cert_sha256=$(manifest_value secure_boot_cert_sha256)
 if [[ $expected_secure_boot == yes ]]; then
 	[[ $manifest_uki_sha256 =~ ^[0-9a-f]{64}$ ]] || {
 		echo "error: signed UKI digest is malformed after publication" >&2
 		exit 1
 	}
+	actual_secure_boot_cert_sha256=$(checksum_file "$secure_boot_cert")
+	[[ $manifest_secure_boot_cert_sha256 == "$actual_secure_boot_cert_sha256" ]] || {
+		echo "error: Secure Boot certificate digest differs after publication" >&2
+		exit 1
+	}
 else
-	[[ $manifest_uki_sha256 == none ]] || {
-		echo "error: unsigned release unexpectedly claims a UKI" >&2
+	[[ $manifest_uki_sha256 == none && $manifest_secure_boot_cert_sha256 == none ]] || {
+		echo "error: unsigned release unexpectedly claims Secure Boot inputs" >&2
 		exit 1
 	}
 fi
 [[ $(manifest_value disk_sha256) == "$actual_disk_sha256" && \
-	$(manifest_value rootfs_sha256) == "$actual_rootfs_sha256" ]] || {
+	$(manifest_value kernel_sha256) == "$actual_kernel_sha256" && \
+	$(manifest_value initramfs_sha256) == "$actual_initramfs_sha256" && \
+	$(manifest_value rootfs_sha256) == "$actual_rootfs_sha256" && \
+	$(manifest_value state_sha256) == "$actual_state_sha256" ]] || {
 	echo "error: release digest differs after publication" >&2
 	exit 1
 }
