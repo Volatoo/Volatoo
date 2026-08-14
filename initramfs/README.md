@@ -192,8 +192,9 @@ lazily. It exposes the contract version, `dm-verity` or
 `dm-verity-layer-stack`, `signify-ed25519`, the signing-key digest and
 authenticated image identity below `/.volatoo/`. Realization v1 remains
 compatible when signed and verifies the complete SquashFS SHA-256 eagerly. A
-rejected current generation falls back to a fully verified and independently
-signed `previous`.
+rejected current generation, including a dm-verity failure discovered while
+mounting its authenticated image stack, releases the partial mappings and
+falls back to a fully verified and independently signed `previous`.
 `VOLATOO_GENERATION=previous`, `none`, or an explicit digest provides
 deterministic recovery behavior.
 

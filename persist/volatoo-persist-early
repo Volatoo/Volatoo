@@ -28,4 +28,10 @@ if ! /usr/sbin/volatoo-identity apply; then
 fi
 echo "[volatoo] persistent machine identity ready"
 
+echo "[volatoo] applying administrator access configuration"
+if ! /usr/libexec/volatoo-firstboot-access; then
+	echo "[volatoo] administrator access setup failed; opening an emergency shell"
+	exec /bin/sh
+fi
+
 exec "$real_init" "$@"

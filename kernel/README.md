@@ -30,6 +30,14 @@ Build the kernel and modules with the same output directory:
 make -C /usr/src/linux O="$PWD/out/kernel-build" -j"$(nproc)" bzImage modules
 ```
 
+For a host-independent release build, the repository pins Linux 6.18.40 and
+its kernel.org SHA-256 digest. The wrapper uses an amd64 cross-compiler in a
+native OrbStack container and retains downloads and objects in a named volume:
+
+```sh
+scripts/build-kernel-docker.sh out/vmlinuz-6.18.40-volatoo
+```
+
 Install the matching modules into the Catalyst image before relying on any
 optional driver configured as a module. Modules are not required for Volatoo's
 image discovery or tmpfs handoff.

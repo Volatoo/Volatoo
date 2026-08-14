@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if (( $# != 1 )); then
+	echo "Usage: build-kernel OUTPUT_BASENAME" >&2
+	exit 2
+fi
+
+output_name=$1
+kernel_version=6.18.40
+kernel_sha256=3712fc1ec839e4daac981176c8518912e8f452650aaedfe4381da4419613a431
+kernel_url=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${kernel_version}.tar.xz
+archive=/work/linux-${kernel_version}.tar.xz
+source_dir=/work/linux-${kernel_version}
+build_dir=/work/build-${kernel_version}
+output=/output/$output_name
+
+if ! [[ $output_name =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
+	echo "error: output basename contains unsupported characters" >&2
+	exit 2
+fi
+if [[ -e $output || -L $output ]]; then
+	echo "error: output already exists: $output" >&2
+	exit 1
+fi
+
+mkdir -p /work /output
+if [[ ! -f $archive ]]; then
+	temporary_archive=${archive}.partial
+	rm -f -- "$temporary_archive"
+	curl --fail --location --retry 5 --output "$temporary_archive" "$kernel_url"
+	printf '%s  %s\n' "$kernel_sha256" "$temporary_archive" | sha256sum --check
+	mv "$temporary_archive" "$archive"
+else
+	printf '%s  %s\n' "$kernel_sha256" "$archive" | sha256sum --check
+fi
+
+if [[ ! -f $source_dir/Makefile ]]; then
+	temporary_source=/work/linux-${kernel_version}.extracting
+	rm -rf -- "$temporary_source"
+	mkdir "$temporary_source"
+	tar -xJf "$archive" --strip-components=1 -C "$temporary_source"
+	mv "$temporary_source" "$source_dir"
+fi
+
+export ARCH=x86_64
+export CROSS_COMPILE=x86_64-linux-gnu-
+/repo/scripts/prepare-kernel-config.sh "$source_dir" "$build_dir"
+
+build_jobs=${VOLATOO_BUILD_JOBS:-$(getconf _NPROCESSORS_ONLN)}
+if ! [[ $build_jobs =~ ^[1-9][0-9]*$ ]]; then
+	echo "error: VOLATOO_BUILD_JOBS must be a positive integer" >&2
+	exit 2
+fi
+
+make -C "$source_dir" \
+	O="$build_dir" \
+	KBUILD_BUILD_TIMESTAMP='@0' \
+	KBUILD_BUILD_USER=volatoo \
+	KBUILD_BUILD_HOST=builder \
+	-j"$build_jobs" \
+	bzImage
+
+/repo/scripts/validate-kernel-config.sh \
+	"$build_dir/.config" /repo/kernel/config/amd64.fragment
+install -m 0644 "$build_dir/arch/x86/boot/bzImage" "$output"
+sha256sum "$output" >"${output}.sha256"
+echo "built $output"

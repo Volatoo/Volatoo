@@ -18,18 +18,54 @@ case $init_system in
 		sed -i \
 			's|^command="/usr/sbin/syslogd"$|command="/usr/bin/syslogd"|' \
 			/etc/init.d/sysklogd
+		# OpenSSH is also installed below /usr/bin on merged-usr images.
+		sed -i \
+			's|/usr/sbin/sshd}|/usr/bin/sshd}|' \
+			/etc/init.d/sshd
+		if grep -q '/usr/sbin/sshd' /etc/init.d/sshd; then
+			echo "error: OpenRC sshd still references /usr/sbin/sshd" >&2
+			exit 1
+		fi
 		;;
 	systemd)
+		# Gentoo's OpenSSH units still reference the pre-merged-usr path.
+		for ssh_unit in sshd.service sshd@.service; do
+			sed -i 's|/usr/sbin/sshd|/usr/bin/sshd|g' \
+				"/usr/lib/systemd/system/$ssh_unit"
+		done
+		if grep -q '/usr/sbin/sshd' \
+			/usr/lib/systemd/system/sshd.service \
+			/usr/lib/systemd/system/sshd@.service; then
+			echo "error: systemd sshd units still reference /usr/sbin/sshd" >&2
+			exit 1
+		fi
 		mkdir -p /etc/systemd/system/multi-user.target.wants
-		ln -sfn \
-			/usr/lib/systemd/system/volatoo-persist.service \
-			/etc/systemd/system/multi-user.target.wants/volatoo-persist.service
+		for service in dhcpcd sshd volatoo-persist; do
+			ln -sfn \
+				"/usr/lib/systemd/system/${service}.service" \
+				"/etc/systemd/system/multi-user.target.wants/${service}.service"
+		done
 		;;
 	*)
 		echo "error: unsupported Volatoo init system: $init_system" >&2
 		exit 1
 		;;
 esac
+
+if [ -e /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
+	if [ ! -x /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
+		echo "error: packaged signify wrapper is missing or unsafe" >&2
+		exit 1
+	fi
+	set +e
+	/usr/bin/signify -h >/dev/null 2>&1
+	signify_status=$?
+	set -e
+	if [ "$signify_status" -ne 1 ]; then
+		echo "error: packaged signify runtime failed its help probe" >&2
+		exit 1
+	fi
+fi
 
 # Host keys are machine identity and must be generated or restored at boot.
 rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub

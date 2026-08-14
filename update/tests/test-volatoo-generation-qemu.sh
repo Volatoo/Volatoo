@@ -294,6 +294,33 @@ if [[ $test_realized == yes ]]; then
 			"$initramfs" \
 			"$openrc_image"
 
+	if [[ $realization_version == 3 && -n $trusted_key ]]; then
+		realized_rollback_state=$work_dir/openrc-realized-rollback.ext4
+		cp "$realized_fixture/state.ext4" "$realized_rollback_state"
+		"$repo_root/update/tests/corrupt-state-object-docker.sh" \
+			"$realized_rollback_state" \
+			"$(<"$realized_fixture/realization-rootfs.digest")"
+		realized_previous_generation=$(<"$realized_fixture/previous.digest")
+		echo "testing signed realized generation rollback"
+		VOLATOO_STATE_IMAGE="$realized_rollback_state" \
+		VOLATOO_STATE_REQUIRED=yes \
+		VOLATOO_TEST_ROOT_MODE=store-overlay \
+		VOLATOO_TEST_GENERATION="$realized_previous_generation" \
+		VOLATOO_TEST_GENERATION_SIGNATURE=required \
+		VOLATOO_TEST_GENERATION_FALLBACK=yes \
+		VOLATOO_TEST_GENERATION_REALIZED=yes \
+		VOLATOO_TEST_GENERATION_VERITY=yes \
+		VOLATOO_TEST_SERVICE_READY=yes \
+		VOLATOO_TEST_FIRMWARES="$firmwares" \
+		VOLATOO_TEST_INIT_SYSTEM=openrc \
+		VOLATOO_TEST_TIMEOUT="$payload_timeout" \
+		VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
+			"$boot_harness" \
+				"$kernel" \
+				"$initramfs" \
+				"$openrc_image"
+	fi
+
 	if [[ $test_verity_tamper == yes ]]; then
 		declare -a tamper_kinds=(data hash)
 		if [[ $realization_version == 3 ]]; then
