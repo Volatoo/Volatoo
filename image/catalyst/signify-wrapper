@@ -1,6 +1,0 @@
-#!/bin/sh
-
-runtime=/usr/libexec/volatoo-signify
-exec "$runtime/ld-musl-x86_64.so.1" \
-	--library-path "$runtime/lib" \
-	"$runtime/signify" "$@"
