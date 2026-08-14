@@ -87,6 +87,36 @@ docker run --rm --privileged \
 			exit 1
 		fi
 		grep -q "release image digest does not match" /tmp/bad-digest.stderr
+		sed "s/^channel=.*/channel=stable/" \
+			/input/release.img.manifest >/tmp/bad-channel.manifest
+		if /repo/scripts/install-volatoo.sh \
+			--device "$loop" \
+			--init-system openrc \
+			--image /input/release.img \
+			--manifest /tmp/bad-channel.manifest \
+			--no-provision-access \
+			--yes >/tmp/bad-channel.stdout 2>/tmp/bad-channel.stderr
+		then
+			echo "error: installer accepted an unsupported release channel" >&2
+			exit 1
+		fi
+		grep -q "unsupported release channel" /tmp/bad-channel.stderr
+		sed \
+			-e "s#^schema=.*#schema=org.volatoo.release-media/v2#" \
+			-e "/^kernel_sha256=/d" \
+			/input/release.img.manifest >/tmp/incomplete-v2.manifest
+		if /repo/scripts/install-volatoo.sh \
+			--device "$loop" \
+			--init-system openrc \
+			--image /input/release.img \
+			--manifest /tmp/incomplete-v2.manifest \
+			--no-provision-access \
+			--yes >/tmp/incomplete-v2.stdout 2>/tmp/incomplete-v2.stderr
+		then
+			echo "error: installer accepted incomplete v2 provenance" >&2
+			exit 1
+		fi
+		grep -q "exactly one kernel_sha256" /tmp/incomplete-v2.stderr
 	'
 
 echo "Volatoo explicit-device installer test passed"

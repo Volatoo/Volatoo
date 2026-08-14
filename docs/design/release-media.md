@@ -45,6 +45,15 @@ the published file size, image digest, rootfs digest and manifest identity from
 the host-visible paths. A writeback or bind-publication drift therefore fails
 closed before the image can reach the installer.
 
+Release-media manifest v2 records the SHA-256 of the kernel, initramfs,
+Catalyst root and initial state image in addition to the complete disk. Secure
+Boot output also records the public signing certificate and signed UKI
+digests; unsigned output must record `none` for both. The host wrapper hashes
+every original input again after the container publishes the disk and rejects
+any missing, duplicate or changed provenance value. The installer retains
+read compatibility with v1 manifests and requires the complete provenance set
+for v2.
+
 ## Acceptance gates
 
 1. Inspect the GPT types, filesystem labels and embedded manifest.
@@ -133,6 +142,22 @@ scripts/test-release-disk-docker.sh \
   --expect-secure-rejection \
   tampered.img
 ```
+
+Package one validated OpenRC disk and one validated systemd disk for
+publication:
+
+```sh
+scripts/package-release-docker.sh \
+  out/volatoo-v0.1-dev-openrc-amd64.img \
+  out/volatoo-v0.1-dev-systemd-amd64.img \
+  out/volatoo-v0.1-dev-release
+```
+
+The OrbStack packager requires manifest v2, rechecks disk identity and every
+provenance field, compresses each raw disk with pinned zstd, decompresses it to
+verify the manifest disk digest, and publishes `SHA256SUMS` only after both
+targets pass. The output also contains the matching manifests, installer and
+developer-preview handbook. Its runtime has no network access.
 
 Install a release image only to an explicit block device:
 
