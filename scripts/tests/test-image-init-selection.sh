@@ -76,6 +76,19 @@ case ${1:-} in
 
 		[[ -n $init_system && -n $config_dir ]]
 		[[ $(cat "$config_dir/overlay/etc/volatoo/init-system") == "$init_system" ]]
+		[[ -x $config_dir/overlay/usr/libexec/volatoo-update-view ]]
+		[[ -L $config_dir/overlay/usr/bin/volatoo-update-view ]]
+		for update_tool in \
+			volatoo-acquire \
+			volatoo-activate \
+			volatoo-engine \
+			volatoo-generation \
+			volatoo-layer \
+			volatoo-manifest \
+			volatoo-plan; do
+			[[ -x $config_dir/overlay/usr/libexec/volatoo-update/$update_tool ]]
+			[[ -L $config_dir/overlay/usr/bin/$update_tool ]]
+		done
 		case $init_system in
 			openrc)
 				[[ -z $rel_type || $rel_type == volatoo ]]

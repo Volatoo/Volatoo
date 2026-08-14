@@ -171,7 +171,9 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "$runtime_dir/overlay/usr/sbin" \
+	"$runtime_dir/overlay/usr/bin" \
 	"$runtime_dir/overlay/usr/libexec" \
+	"$runtime_dir/overlay/usr/libexec/volatoo-update" \
 	"$runtime_dir/overlay/etc/volatoo"
 cp -R "$repo_root/image/catalyst/overlay/." "$runtime_dir/overlay/"
 cp "$repo_root/persist/volatoo-persist" \
@@ -182,6 +184,25 @@ cp "$repo_root/persist/volatoo-persist-early" \
 	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early"
 cp "$repo_root/update/volatoo-update-view" \
 	"$runtime_dir/overlay/usr/libexec/volatoo-update-view"
+update_tools=(
+	volatoo-acquire
+	volatoo-activate
+	volatoo-engine
+	volatoo-generation
+	volatoo-layer
+	volatoo-manifest
+	volatoo-plan
+)
+for update_tool in "${update_tools[@]}"; do
+	cp "$repo_root/update/$update_tool" \
+		"$runtime_dir/overlay/usr/libexec/volatoo-update/$update_tool"
+	chmod 0755 \
+		"$runtime_dir/overlay/usr/libexec/volatoo-update/$update_tool"
+	ln -s "../libexec/volatoo-update/$update_tool" \
+		"$runtime_dir/overlay/usr/bin/$update_tool"
+done
+ln -s ../libexec/volatoo-update-view \
+	"$runtime_dir/overlay/usr/bin/volatoo-update-view"
 chmod 0755 \
 	"$runtime_dir/overlay/usr/sbin/volatoo-persist" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-identity" \
