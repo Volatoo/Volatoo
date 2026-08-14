@@ -12,6 +12,8 @@ on:
       - "scripts/test-qemu-boot.sh"
       - "scripts/build-release-disk-docker.sh"
       - "scripts/install-volatoo.sh"
+      - "scripts/prepare-secure-boot-test-key-docker.sh"
+      - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
@@ -28,6 +30,8 @@ on:
       - "scripts/test-qemu-boot.sh"
       - "scripts/build-release-disk-docker.sh"
       - "scripts/install-volatoo.sh"
+      - "scripts/prepare-secure-boot-test-key-docker.sh"
+      - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
@@ -68,6 +72,8 @@ jobs:
             scripts/test-qemu-boot.sh \
             scripts/build-release-disk-docker.sh \
             scripts/install-volatoo.sh \
+            scripts/prepare-secure-boot-test-key-docker.sh \
+            scripts/tamper-release-efi-docker.sh \
             scripts/test-release-disk-docker.sh \
             scripts/tests/test-install-volatoo-docker.sh \
             scripts/tests/test-firstboot-access-docker.sh \
