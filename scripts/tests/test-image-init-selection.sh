@@ -89,6 +89,14 @@ case ${1:-} in
 			[[ -x $config_dir/overlay/usr/libexec/volatoo-update/$update_tool ]]
 			[[ -L $config_dir/overlay/usr/bin/$update_tool ]]
 		done
+		if [[ -e $config_dir/overlay/usr/bin/signify ]]; then
+			[[ -x $config_dir/overlay/usr/bin/signify ]]
+			[[ -x $config_dir/overlay/usr/libexec/volatoo-signify/signify ]]
+			[[ -x $config_dir/overlay/usr/libexec/volatoo-signify/ld-musl-x86_64.so.1 ]]
+			[[ -f $config_dir/overlay/usr/libexec/volatoo-signify/lib/libbsd.so.0 ]]
+			trusted_keys=("$config_dir"/overlay/etc/volatoo/trusted.d/*.pub)
+			[[ ${#trusted_keys[@]} -eq 1 && -f ${trusted_keys[0]} ]]
+		fi
 		case $init_system in
 			openrc)
 				[[ -z $rel_type || $rel_type == volatoo ]]
@@ -141,6 +149,30 @@ for init_system in openrc systemd; do
 		--init-system "$init_system" \
 		--validate-only
 done
+
+mkdir -p \
+	"$work_dir/signify-root/lib" \
+	"$work_dir/signify-root/usr/bin" \
+	"$work_dir/signify-root/usr/lib"
+printf '#!/bin/sh\nexit 1\n' >"$work_dir/signify-root/usr/bin/signify"
+printf '#!/bin/sh\nexit 1\n' >"$work_dir/signify-root/lib/ld-musl-x86_64.so.1"
+printf 'signify-32-r1\n' >"$work_dir/signify-root/signify-version"
+printf 'private runtime\n' >"$work_dir/signify-root/usr/lib/libbsd.so.0"
+chmod 0755 \
+	"$work_dir/signify-root/usr/bin/signify" \
+	"$work_dir/signify-root/lib/ld-musl-x86_64.so.1"
+printf 'untrusted comment: test key\nRWQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n' \
+	>"$work_dir/release.pub"
+PATH="$fake_bin:$PATH" \
+	"$repo_root/scripts/build-catalyst-squashfs.sh" \
+	--init-system openrc \
+	--signify-root "$work_dir/signify-root" \
+	--trust-key "$work_dir/release.pub" \
+	--validate-only
+expect_failure "--trust-key requires --signify-root" \
+	"$repo_root/scripts/build-catalyst-squashfs.sh" \
+	--trust-key "$work_dir/release.pub" \
+	--validate-only
 
 expect_failure "--init-system must be openrc or systemd" \
 	"$repo_root/scripts/fetch-gentoo-inputs.sh" \

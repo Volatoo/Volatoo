@@ -118,7 +118,7 @@ if [[ -n $ssh_key ]]; then
 			-i "$ssh_key" \
 			-p 2222 \
 			volatoo@127.0.0.1 \
-			'id -u; sudo -n true; for tool in volatoo-acquire volatoo-activate volatoo-engine volatoo-generation volatoo-layer volatoo-manifest volatoo-plan volatoo-update-view; do command -v "$tool" >/dev/null || exit 1; done; volatoo-manifest --help >/dev/null; printf "volatoo-ssh-ready\\n"' 2>/dev/null)
+			'id -u; sudo -n true; for tool in signify volatoo-acquire volatoo-activate volatoo-engine volatoo-generation volatoo-layer volatoo-manifest volatoo-plan volatoo-update-view; do command -v "$tool" >/dev/null || exit 1; done; signify -h >/dev/null 2>&1; test $? -eq 1; find /etc/volatoo/trusted.d -type f -name "*.pub" -print -quit | grep -q .; volatoo-manifest --help >/dev/null; printf "volatoo-ssh-ready\\n"' 2>/dev/null)
 		then
 			break
 		fi

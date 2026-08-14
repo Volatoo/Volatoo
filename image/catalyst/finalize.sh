@@ -52,6 +52,21 @@ case $init_system in
 		;;
 esac
 
+if [ -e /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
+	if [ ! -x /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
+		echo "error: packaged signify wrapper is missing or unsafe" >&2
+		exit 1
+	fi
+	set +e
+	/usr/bin/signify -h >/dev/null 2>&1
+	signify_status=$?
+	set -e
+	if [ "$signify_status" -ne 1 ]; then
+		echo "error: packaged signify runtime failed its help probe" >&2
+		exit 1
+	fi
+fi
+
 # Host keys are machine identity and must be generated or restored at boot.
 rm -f /etc/ssh/ssh_host_*_key /etc/ssh/ssh_host_*_key.pub
 
