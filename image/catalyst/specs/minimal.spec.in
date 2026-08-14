@@ -18,4 +18,4 @@ stage4/packages:
 stage4/root_overlay: /config/overlay
 stage4/fsscript: /config/finalize.sh
 @INIT_SETTINGS@
-stage4/empty: /var/cache/binpkgs /var/cache/distfiles /var/tmp/portage
+stage4/empty: /var/cache/binpkgs /var/cache/distfiles /var/tmp/portage /work

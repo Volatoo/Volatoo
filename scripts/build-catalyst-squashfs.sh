@@ -180,10 +180,13 @@ cp "$repo_root/persist/volatoo-identity" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-identity"
 cp "$repo_root/persist/volatoo-persist-early" \
 	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early"
+cp "$repo_root/update/volatoo-update-view" \
+	"$runtime_dir/overlay/usr/libexec/volatoo-update-view"
 chmod 0755 \
 	"$runtime_dir/overlay/usr/sbin/volatoo-persist" \
 	"$runtime_dir/overlay/usr/sbin/volatoo-identity" \
-	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early"
+	"$runtime_dir/overlay/usr/libexec/volatoo-persist-early" \
+	"$runtime_dir/overlay/usr/libexec/volatoo-update-view"
 printf '%s\n' "$init_system" \
 	>"$runtime_dir/overlay/etc/volatoo/init-system"
 if [[ $init_system == openrc ]]; then

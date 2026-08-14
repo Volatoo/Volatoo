@@ -32,6 +32,7 @@ RUN sed -i \
 COPY --chmod=0755 persist/volatoo-persist /rootfs/usr/sbin/volatoo-persist
 COPY --chmod=0755 persist/volatoo-identity /rootfs/usr/sbin/volatoo-identity
 COPY --chmod=0755 persist/volatoo-persist-early /rootfs/usr/libexec/volatoo-persist-early
+COPY --chmod=0755 update/volatoo-update-view /rootfs/usr/libexec/volatoo-update-view
 COPY --chmod=0755 persist/volatoo-persist.initd /rootfs/etc/init.d/volatoo-persist
 
 RUN ln -s /etc/init.d/volatoo-persist \
