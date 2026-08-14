@@ -20,10 +20,13 @@ from typing import Any
 
 BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
 BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
-GENERATION_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V1_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V2_SCHEMA = "org.volatoo.generation/v2"
+GENERATION_SCHEMAS = (GENERATION_V1_SCHEMA, GENERATION_V2_SCHEMA)
 LAYER_PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
 LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
 PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
+PORTAGE_STATE_SCHEMA = "org.volatoo.portage-state/v1"
 TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
 PORTAGE_ADAPTER = "emerge-binary-only-v1"
 INSTALL_OPTIONS = (
@@ -70,15 +73,16 @@ def load_contracts() -> dict[str, Any]:
 def read_contract(
     contracts: dict[str, Any],
     path: Path,
-    schema: str,
+    schema: str | tuple[str, ...],
 ) -> dict[str, Any]:
     try:
         value = contracts["read_manifest"](str(path))
         contracts["validate_manifest"](value)
     except RuntimeError as error:
         raise LayerError(str(error)) from error
-    if value.get("schema") != schema:
-        raise LayerError(f"{path} must use {schema}")
+    expected = (schema,) if isinstance(schema, str) else schema
+    if value.get("schema") not in expected:
+        raise LayerError(f"{path} must use one of {', '.join(expected)}")
     return value
 
 
@@ -203,8 +207,13 @@ def verify_references(
         raise LayerError("BuildSpec does not reference the build context")
     if acquisition["build_context_digest"] != context_digest:
         raise LayerError("acquisition does not reference the build context")
-    if parent["build_context_digest"] != context_digest:
+    if (
+        parent["schema"] == GENERATION_V1_SCHEMA
+        and parent["build_context_digest"] != context_digest
+    ):
         raise LayerError("parent generation does not reference the build context")
+    if parent["base"]["rootfs_digest"] != context["base"]["rootfs_digest"]:
+        raise LayerError("build context base differs from parent generation")
     if acquisition["build_spec_digest"] != contracts["manifest_digest"](spec):
         raise LayerError("acquisition does not reference the BuildSpec")
     if not acquisition["complete"] or acquisition["missing"]:
@@ -668,7 +677,7 @@ def stage(arguments: argparse.Namespace) -> None:
     parent = read_contract(
         contracts,
         arguments.parent_generation,
-        GENERATION_SCHEMA,
+        GENERATION_SCHEMAS,
     )
     verify_references(contracts, context, spec, acquisition, parent)
     portage, settings = verify_runtime(context)
@@ -847,7 +856,7 @@ def finalize(arguments: argparse.Namespace) -> None:
     parent = read_contract(
         contracts,
         arguments.parent_generation,
-        GENERATION_SCHEMA,
+        GENERATION_SCHEMAS,
     )
     changed = read_contract(
         contracts,
@@ -919,10 +928,19 @@ def finalize(arguments: argparse.Namespace) -> None:
         },
         "world_digest": report["world_digest"],
     }
-    write_contract(contracts, arguments.transaction, transaction)
     transaction_digest = contracts["manifest_digest"](transaction)
+    portage_state = contracts["portage_state_from_context"](
+        context,
+        report["world_digest"],
+    )
+    portage_state_digest = contracts["manifest_digest"](portage_state)
     generation = {
-        **parent,
+        "schema": GENERATION_V2_SCHEMA,
+        "target_id": parent["target_id"],
+        "build_context_digest": contracts["manifest_digest"](context),
+        "portage_state_digest": portage_state_digest,
+        "parent_generation_digest": contracts["manifest_digest"](parent),
+        "base": parent["base"],
         "layers": [
             *parent["layers"],
             {
@@ -934,8 +952,25 @@ def finalize(arguments: argparse.Namespace) -> None:
             },
         ],
     }
+    try:
+        contracts["verify_layer_transaction_closure"](
+            transaction,
+            generation,
+            parent,
+            context,
+            spec,
+            acquisition,
+            changed,
+            tombstones,
+            portage_state,
+        )
+    except RuntimeError as error:
+        raise LayerError(str(error)) from error
+    write_contract(contracts, arguments.transaction, transaction)
+    write_contract(contracts, arguments.portage_state, portage_state)
     write_contract(contracts, arguments.generation, generation)
     print(f"Layer transaction: {arguments.transaction}")
+    print(f"Portage state: {arguments.portage_state}")
     print(f"Generation candidate: {arguments.generation}")
 
 
@@ -980,6 +1015,11 @@ def parse_arguments() -> argparse.Namespace:
     )
     finalize_parser.add_argument(
         "--transaction",
+        required=True,
+        type=absolute_path,
+    )
+    finalize_parser.add_argument(
+        "--portage-state",
         required=True,
         type=absolute_path,
     )

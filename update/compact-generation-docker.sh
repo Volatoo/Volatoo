@@ -92,7 +92,14 @@ docker info >/dev/null 2>&1 || {
 state=$(cd -- "$state" && pwd)
 mkdir -p "$output_dir"
 output_dir=$(cd -- "$output_dir" && pwd)
-for name in base.squashfs generation.json compaction.json tree-digest; do
+for name in \
+	base.squashfs \
+	build-context.json \
+	generation.json \
+	compaction.json \
+	fhs-contract \
+	tree-digest
+do
 	[[ ! -e $output_dir/$name ]] || {
 		echo "error: output already exists: $output_dir/$name" >&2
 		exit 1
@@ -104,6 +111,26 @@ resolved_generation=$(
 	python3 -c 'import json,sys; print(json.load(sys.stdin)["generation_digest"])' \
 		<<<"$inspection"
 )
+boot_plan_digest=$(
+	python3 -c 'import json,sys; print(json.load(sys.stdin)["boot_plan_digest"])' \
+		<<<"$inspection"
+)
+target_id=$(
+	python3 -c 'import json,sys; print(json.load(sys.stdin)["target_id"])' \
+		<<<"$inspection"
+)
+expected_current=none
+if [[ -e $state/volatoo/system/current ||
+	-L $state/volatoo/system/current ]]; then
+	current_inspection=$(
+		"$generation_tool" inspect --state "$state" current
+	)
+	expected_current=$(
+		python3 -c \
+			'import json,sys; print(json.load(sys.stdin)["generation_digest"])' \
+			<<<"$current_inspection"
+	)
+fi
 layer_count=$(
 	python3 -c 'import json,sys; print(json.load(sys.stdin)["layer_count"])' \
 		<<<"$inspection"
@@ -136,7 +163,9 @@ docker run --rm \
 	"$compressor_image" \
 	/state \
 	"$resolved_generation" \
-	/workspace
+	"$boot_plan_digest" \
+	/workspace \
+	"$target_id"
 docker run --rm \
 	--platform "$platform" \
 	--mount "type=volume,src=$workspace_volume,dst=/workspace,readonly" \
@@ -146,6 +175,7 @@ docker run --rm \
 	-c '
 		set -eu
 		cp /workspace/base.squashfs /export/base.squashfs
+		cp /workspace/fhs-contract /export/fhs-contract
 		cp /workspace/tree-digest /export/tree-digest
 		cmp /workspace/tree-digest /workspace/verified-tree-digest
 	'
@@ -155,12 +185,14 @@ tree_digest=sha256:$(tr -d '[:space:]' <"$output_dir/tree-digest")
 	--state "$state" \
 	--generation "$resolved_generation" \
 	--base "$output_dir/base.squashfs" \
+	--context-output "$output_dir/build-context.json" \
 	--output "$output_dir/generation.json" \
 	--receipt "$output_dir/compaction.json" \
 	--tree-digest "$tree_digest"
 "$generation_tool" publish \
 	--state "$state" \
 	--generation "$output_dir/generation.json" \
+	--object "$output_dir/build-context.json" \
 	--object "$output_dir/base.squashfs"
 "$generation_tool" record-compaction \
 	--state "$state" \
@@ -171,7 +203,10 @@ if [[ $activate == yes ]]; then
 		"$repo_root/update/volatoo-manifest" \
 			digest "$output_dir/generation.json"
 	)
-	"$generation_tool" select --state "$state" "$compacted_digest"
+	"$generation_tool" select \
+		--state "$state" \
+		--expected-current "$expected_current" \
+		"$compacted_digest"
 fi
 
 echo "compacted $resolved_generation from $layer_count layers"

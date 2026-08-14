@@ -13,6 +13,7 @@ import re
 import runpy
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 from contextlib import contextmanager
@@ -21,13 +22,34 @@ from typing import Any
 
 
 BUILD_CONTEXT_SCHEMA = "org.volatoo.build-context/v1"
+BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
 GENERATION_SCHEMA = "org.volatoo.generation/v1"
+GENERATION_V2_SCHEMA = "org.volatoo.generation/v2"
+GENERATION_SCHEMAS = (GENERATION_SCHEMA, GENERATION_V2_SCHEMA)
+LAYER_PATHS_SCHEMA = "org.volatoo.layer-paths/v1"
 LAYER_TRANSACTION_SCHEMA = "org.volatoo.layer-transaction/v1"
+PACKAGE_ACQUISITION_SCHEMA = "org.volatoo.package-acquisition/v1"
+PACKAGE_SOURCE_CATALOG_SCHEMA = "org.volatoo.package-source-catalog/v1"
+PORTAGE_STATE_SCHEMA = "org.volatoo.portage-state/v1"
 TOMBSTONES_SCHEMA = "org.volatoo.tombstones/v1"
 COMPACTION_SCHEMA = "org.volatoo.compaction-receipt/v1"
 DIGEST_PREFIX = "sha256:"
 BOOT_PLAN_HEADER = "VOLATOO_GENERATION_V1"
+REALIZATION_V1_HEADER = "VOLATOO_REALIZATION_V1"
+REALIZATION_V2_HEADER = "VOLATOO_REALIZATION_V2"
+REALIZATION_V3_HEADER = "VOLATOO_REALIZATION_V3"
+PARENT_TREE_RECEIPT_V1_HEADER = "VOLATOO_PARENT_TREE_RECEIPT_V1"
+PARENT_TREE_RECEIPT_V2_HEADER = "VOLATOO_PARENT_TREE_RECEIPT_V2"
+PARENT_TREE_RECEIPT_V3_HEADER = "VOLATOO_PARENT_TREE_RECEIPT_V3"
+TREE_STATE_V1_HEADER = "VOLATOO_TREE_STATE_V1"
+FHS_CONTRACT = "org.volatoo.gentoo-fhs/v1"
+VERITY_ALGORITHM = "sha256"
+VERITY_BLOCK_SIZE = 4096
+VERITY_FORMAT = 1
+MAX_INCREMENTAL_REALIZATION_LAYERS = 64
+SIGNIFY_FILE_LIMIT = 1024
 PIN_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+EXPECTED_CURRENT_UNSET = object()
 
 
 class GenerationError(RuntimeError):
@@ -65,6 +87,16 @@ def digest_name(digest: str) -> str:
     ):
         raise GenerationError(f"invalid SHA-256 digest: {digest}")
     return digest[7:]
+
+
+def expected_current_value(value: str) -> str | None:
+    if value == "none":
+        return None
+    try:
+        digest_name(value)
+    except GenerationError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+    return value
 
 
 def fsync_directory(path: Path) -> None:
@@ -133,6 +165,7 @@ def ensure_safe_directory(
         raise GenerationError(f"{description} is missing: {path}")
     try:
         path.mkdir()
+        fsync_directory(path.parent)
     except OSError as error:
         raise GenerationError(f"cannot create {description}: {error}") from error
 
@@ -170,6 +203,8 @@ def state_system(state: Path) -> Path:
         "manifests",
         "plans",
         "pins",
+        "realizations",
+        "signatures",
         "activations",
         "compactions",
         "staging",
@@ -220,6 +255,8 @@ def migrate_state(arguments: argparse.Namespace) -> None:
                 "manifests",
                 "plans",
                 "pins",
+                "realizations",
+                "signatures",
                 "activations",
                 "compactions",
                 "staging",
@@ -243,6 +280,8 @@ def migrate_state(arguments: argparse.Namespace) -> None:
         "manifests",
         "plans",
         "pins",
+        "realizations",
+        "signatures",
         "activations",
         "compactions",
         "staging",
@@ -272,8 +311,13 @@ def read_contract(
         contracts["validate_manifest"](value)
     except RuntimeError as error:
         raise GenerationError(str(error)) from error
-    if value["schema"] != expected_schema:
-        raise GenerationError(f"{path} must use {expected_schema}")
+    expected = (
+        GENERATION_SCHEMAS
+        if expected_schema == GENERATION_SCHEMA
+        else (expected_schema,)
+    )
+    if value["schema"] not in expected:
+        raise GenerationError(f"{path} must use one of {', '.join(expected)}")
     return value
 
 
@@ -369,7 +413,11 @@ def resolve_object(
 
 
 def require_squashfs(path: Path, expected_size: int) -> None:
-    _, size = digest_file(path)
+    require_regular_file(path, "SquashFS object")
+    try:
+        size = path.stat().st_size
+    except OSError as error:
+        raise GenerationError(f"cannot inspect SquashFS {path}: {error}") from error
     if size != expected_size:
         raise GenerationError(
             f"SquashFS size mismatch for {path}: expected {expected_size}, got {size}"
@@ -411,6 +459,1372 @@ def boot_plan(
     return ("\n".join(lines) + "\n").encode("utf-8")
 
 
+def realization_plan(
+    generation_digest: str,
+    boot_plan_digest: str,
+    generation: dict[str, Any],
+    rootfs_digest: str,
+    rootfs_size: int,
+    tree_digest: str,
+    fhs_contract: str,
+    verity: dict[str, Any] | None = None,
+) -> bytes:
+    lines = [
+        REALIZATION_V2_HEADER if verity is not None else REALIZATION_V1_HEADER,
+        f"generation {generation_digest}",
+        f"boot-plan {boot_plan_digest}",
+        f"target {generation['target_id']}",
+        f"context {generation['build_context_digest']}",
+        f"rootfs {rootfs_digest} {rootfs_size}",
+        f"tree {tree_digest}",
+        f"fhs {fhs_contract}",
+    ]
+    if verity is not None:
+        lines.extend(
+            [
+                "verity "
+                f"{verity['hash_digest']} "
+                f"{verity['hash_size']} "
+                f"{verity['root_hash']} "
+                f"{verity['salt']} "
+                f"{verity['data_blocks']}",
+                "verity-format 1 sha256 4096 4096 no-superblock",
+            ]
+        )
+    lines.extend(
+        [
+            "builder squashfs-tools 4.7.5 zstd 19 1048576 reproducible",
+            "end",
+        ]
+    )
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def parse_parent_tree_receipt(
+    content: bytes,
+    generation_digest: str,
+    boot_plan_digest: str,
+    generation: dict[str, Any],
+    tree_digest: str,
+) -> dict[str, Any]:
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise GenerationError("parent-tree receipt is not ASCII") from error
+    if not text.endswith("\n"):
+        raise GenerationError("parent-tree receipt has no final newline")
+    lines = text.splitlines()
+    if lines and lines[0] == PARENT_TREE_RECEIPT_V1_HEADER:
+        receipt_version = 1
+        expected_lines = 11
+    elif lines and lines[0] == PARENT_TREE_RECEIPT_V2_HEADER:
+        receipt_version = 2
+        expected_lines = 12
+    elif lines and lines[0] == PARENT_TREE_RECEIPT_V3_HEADER:
+        receipt_version = 3
+        expected_lines = 13
+    else:
+        receipt_version = 0
+        expected_lines = 0
+    if len(lines) != expected_lines or receipt_version == 0:
+        raise GenerationError("parent-tree receipt framing is invalid")
+
+    def record(index: int, keyword: str) -> str:
+        tokens = lines[index].split(" ")
+        if len(tokens) != 2 or tokens[0] != keyword or not tokens[1]:
+            raise GenerationError(
+                f"parent-tree receipt {keyword} record is malformed"
+            )
+        return tokens[1]
+
+    receipt_generation = record(1, "generation")
+    receipt_plan = record(2, "boot-plan")
+    parent_generation = record(3, "parent-generation")
+    parent_realization = record(4, "parent-realization")
+    target = record(5, "target")
+    context = record(6, "context")
+    receipt_tree = record(7, "tree")
+    fhs = record(8, "fhs")
+    validation_index_digest = None
+    validation_index_size = None
+    tree_state_digest = None
+    tree_state_size = None
+    validation_record = 9
+    end_record = 10
+    if receipt_version >= 2:
+        index_tokens = lines[9].split(" ")
+        if (
+            len(index_tokens) != 3
+            or index_tokens[0] != "validation-index"
+        ):
+            raise GenerationError(
+                "parent-tree receipt validation-index record is malformed"
+            )
+        validation_index_digest = index_tokens[1]
+        digest_name(validation_index_digest)
+        try:
+            validation_index_size = int(index_tokens[2])
+        except ValueError as error:
+            raise GenerationError(
+                "parent-tree receipt validation-index size is invalid"
+            ) from error
+        if validation_index_size <= 0:
+            raise GenerationError(
+                "parent-tree receipt validation-index size is invalid"
+            )
+        validation_record = 10
+        end_record = 11
+    if receipt_version == 3:
+        state_tokens = lines[10].split(" ")
+        if len(state_tokens) != 3 or state_tokens[0] != "tree-state":
+            raise GenerationError(
+                "parent-tree receipt tree-state record is malformed"
+            )
+        tree_state_digest = state_tokens[1]
+        digest_name(tree_state_digest)
+        try:
+            tree_state_size = int(state_tokens[2])
+        except ValueError as error:
+            raise GenerationError(
+                "parent-tree receipt tree-state size is invalid"
+            ) from error
+        if tree_state_size <= 0:
+            raise GenerationError(
+                "parent-tree receipt tree-state size is invalid"
+            )
+        if tree_state_digest != receipt_tree:
+            raise GenerationError(
+                "parent-tree receipt tree-state binding differs"
+            )
+        validation_record = 11
+        end_record = 12
+    validation = record(validation_record, "validation")
+    if lines[end_record] != "end":
+        raise GenerationError("parent-tree receipt has no end record")
+    for digest in (
+        receipt_generation,
+        receipt_plan,
+        context,
+        receipt_tree,
+    ):
+        digest_name(digest)
+    for optional_digest, description in (
+        (parent_generation, "parent generation"),
+        (parent_realization, "parent realization"),
+    ):
+        if optional_digest != "none":
+            try:
+                digest_name(optional_digest)
+            except GenerationError as error:
+                raise GenerationError(
+                    f"parent-tree receipt {description} is invalid"
+                ) from error
+    expected_parent = generation.get("parent_generation_digest") or "none"
+    if receipt_generation != generation_digest:
+        raise GenerationError("parent-tree receipt generation binding differs")
+    if receipt_plan != boot_plan_digest:
+        raise GenerationError("parent-tree receipt boot-plan binding differs")
+    if parent_generation != expected_parent:
+        raise GenerationError("parent-tree receipt direct-parent binding differs")
+    if parent_generation == "none" and parent_realization != "none":
+        raise GenerationError("parent-tree receipt has a realization without a parent")
+    if target != generation["target_id"]:
+        raise GenerationError("parent-tree receipt target binding differs")
+    if context != generation["build_context_digest"]:
+        raise GenerationError("parent-tree receipt context binding differs")
+    if receipt_tree != tree_digest:
+        raise GenerationError("parent-tree receipt tree binding differs")
+    if fhs != FHS_CONTRACT:
+        raise GenerationError("parent-tree receipt FHS contract is unsupported")
+    expected_validation = (
+        "full-fhs-elf-v1"
+        if receipt_version == 1
+        else "indexed-fhs-elf-v1"
+    )
+    if validation != expected_validation:
+        raise GenerationError("parent-tree receipt validation contract is unsupported")
+    return {
+        "contract_version": receipt_version,
+        "generation_digest": receipt_generation,
+        "boot_plan_digest": receipt_plan,
+        "parent_generation_digest": (
+            None if parent_generation == "none" else parent_generation
+        ),
+        "parent_realization_digest": (
+            None if parent_realization == "none" else parent_realization
+        ),
+        "target_id": target,
+        "build_context_digest": context,
+        "tree_digest": receipt_tree,
+        "fhs_contract": fhs,
+        "validation": validation,
+        "validation_index_digest": validation_index_digest,
+        "validation_index_size": validation_index_size,
+        "tree_state_digest": tree_state_digest,
+        "tree_state_size": tree_state_size,
+    }
+
+
+def parse_tree_state(
+    content: bytes,
+    generation_digest: str,
+    boot_plan_digest: str,
+    generation: dict[str, Any],
+    validation_index_digest: str,
+    validation_index_size: int,
+) -> dict[str, Any]:
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise GenerationError("tree state is not ASCII") from error
+    if not text.endswith("\n"):
+        raise GenerationError("tree state has no final newline")
+    lines = text.splitlines()
+    if (
+        len(lines) != 9
+        or lines[0] != TREE_STATE_V1_HEADER
+        or lines[7] != "composition generation-plan-and-index-v1"
+        or lines[8] != "end"
+    ):
+        raise GenerationError("tree state framing is invalid")
+
+    def record(index: int, keyword: str) -> str:
+        tokens = lines[index].split(" ")
+        if len(tokens) != 2 or tokens[0] != keyword or not tokens[1]:
+            raise GenerationError(f"tree state {keyword} record is malformed")
+        return tokens[1]
+
+    state_generation = record(1, "generation")
+    state_plan = record(2, "boot-plan")
+    parent_state = record(3, "parent-state")
+    target = record(4, "target")
+    context = record(5, "context")
+    index_tokens = lines[6].split(" ")
+    if len(index_tokens) != 3 or index_tokens[0] != "validation-index":
+        raise GenerationError("tree state validation-index record is malformed")
+    state_index_digest = index_tokens[1]
+    digest_name(state_index_digest)
+    try:
+        state_index_size = int(index_tokens[2])
+    except ValueError as error:
+        raise GenerationError("tree state validation-index size is invalid") from error
+    for digest in (state_generation, state_plan, context):
+        digest_name(digest)
+    if parent_state != "none":
+        digest_name(parent_state)
+    if state_generation != generation_digest:
+        raise GenerationError("tree state generation binding differs")
+    if state_plan != boot_plan_digest:
+        raise GenerationError("tree state boot-plan binding differs")
+    if target != generation["target_id"]:
+        raise GenerationError("tree state target binding differs")
+    if context != generation["build_context_digest"]:
+        raise GenerationError("tree state context binding differs")
+    if (
+        state_index_digest != validation_index_digest
+        or state_index_size != validation_index_size
+    ):
+        raise GenerationError("tree state validation-index binding differs")
+    return {
+        "contract_version": 1,
+        "parent_tree_state_digest": (
+            None if parent_state == "none" else parent_state
+        ),
+        "validation_index_digest": state_index_digest,
+        "validation_index_size": state_index_size,
+        "composition": "generation-plan-and-index-v1",
+    }
+
+
+def parse_fhs_elf_validation_index(
+    content: bytes,
+    expected_target: str,
+) -> dict[str, int]:
+    if not content.endswith(b"\n"):
+        raise GenerationError("FHS/ELF validation index has no final newline")
+    lines = content.splitlines()
+    expected_target_line = f"target {expected_target}".encode("ascii")
+    if (
+        len(lines) < 3
+        or lines[0] != b"VOLATOO_FHS_ELF_INDEX_V1"
+        or lines[1] != expected_target_line
+        or lines[-1] != b"end"
+    ):
+        raise GenerationError("FHS/ELF validation index framing is invalid")
+    records = lines[2:-1]
+    if records != sorted(set(records)):
+        raise GenerationError("FHS/ELF validation index is not canonical")
+
+    expected_fields = {
+        b"P": 4,
+        b"L": 3,
+        b"S": 3,
+        b"E": 10,
+        b"C": 3,
+    }
+    path_types: dict[bytes, tuple[bytes, int]] = {}
+    specialized_paths: dict[bytes, set[bytes]] = {
+        b"L": set(),
+        b"S": set(),
+        b"E": set(),
+    }
+    counts = {name.decode("ascii"): 0 for name in expected_fields}
+    for record in records:
+        fields = record.split(b"|")
+        kind = fields[0] if fields else b""
+        if expected_fields.get(kind) != len(fields):
+            raise GenerationError("FHS/ELF validation index record is malformed")
+        path = fields[1]
+        if (
+            not path.startswith(b"/")
+            or b"//" in path
+            or b"\x00" in path
+            or any(part in (b".", b"..") for part in path.split(b"/")[1:])
+        ):
+            raise GenerationError("FHS/ELF validation index path is invalid")
+        counts[kind.decode("ascii")] += 1
+        if kind == b"P":
+            if path in path_types:
+                raise GenerationError(
+                    "FHS/ELF validation index contains duplicate paths"
+                )
+            inode_type = fields[2]
+            if inode_type not in (b"b", b"c", b"d", b"f", b"l", b"p", b"s"):
+                raise GenerationError(
+                    "FHS/ELF validation index inode type is invalid"
+                )
+            try:
+                mode = int(fields[3], 8)
+            except ValueError as error:
+                raise GenerationError(
+                    "FHS/ELF validation index mode is invalid"
+                ) from error
+            if mode < 0 or mode > 0o7777:
+                raise GenerationError(
+                    "FHS/ELF validation index mode is invalid"
+                )
+            path_types[path] = (inode_type, mode)
+        elif kind in specialized_paths:
+            if path in specialized_paths[kind]:
+                raise GenerationError(
+                    "FHS/ELF validation index contains duplicate metadata"
+                )
+            specialized_paths[kind].add(path)
+
+    for kind, required_type in ((b"L", b"l"), (b"S", b"f"), (b"E", b"f")):
+        for path in specialized_paths[kind]:
+            if path_types.get(path, (None, 0))[0] != required_type:
+                raise GenerationError(
+                    "FHS/ELF validation index metadata path type differs"
+                )
+            if kind == b"S" and not path_types[path][1] & 0o111:
+                raise GenerationError(
+                    "FHS/ELF validation index shebang is not executable"
+                )
+    return counts
+
+
+def parse_realization_plan(
+    content: bytes,
+    generation_digest: str,
+    boot_plan_digest: str,
+    generation: dict[str, Any],
+) -> dict[str, Any]:
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise GenerationError("realization plan is not ASCII") from error
+    if not text.endswith("\n"):
+        raise GenerationError("realization plan has no final newline")
+    lines = text.splitlines()
+    if not lines or lines[0] not in (
+        REALIZATION_V1_HEADER,
+        REALIZATION_V2_HEADER,
+        REALIZATION_V3_HEADER,
+    ):
+        raise GenerationError("realization plan has an invalid header")
+    version = {
+        REALIZATION_V1_HEADER: 1,
+        REALIZATION_V2_HEADER: 2,
+        REALIZATION_V3_HEADER: 3,
+    }[lines[0]]
+    if version == 3:
+        if len(lines) < 12 or lines[-1] != "end":
+            raise GenerationError("realization plan framing is invalid")
+
+        def v3_record(index: int, keyword: str, fields: int) -> list[str]:
+            tokens = lines[index].split(" ")
+            if len(tokens) != fields or tokens[0] != keyword or any(
+                token == "" for token in tokens
+            ):
+                raise GenerationError(
+                    f"realization plan {keyword} record is malformed"
+                )
+            return tokens
+
+        generation_record = v3_record(1, "generation", 2)
+        plan_record = v3_record(2, "boot-plan", 2)
+        target_record = v3_record(3, "target", 2)
+        context_record = v3_record(4, "context", 2)
+        tree_record = v3_record(5, "tree", 2)
+        tree_receipt_digest: str | None = None
+        fhs_index = 6
+        if lines[6].startswith("tree-receipt "):
+            tree_receipt_record = v3_record(6, "tree-receipt", 2)
+            digest_name(tree_receipt_record[1])
+            tree_receipt_digest = tree_receipt_record[1]
+            fhs_index = 7
+        fhs_record = v3_record(fhs_index, "fhs", 2)
+        composition_record = v3_record(fhs_index + 1, "composition", 3)
+        for digest in (
+            generation_record[1],
+            plan_record[1],
+            context_record[1],
+            tree_record[1],
+        ):
+            digest_name(digest)
+        if generation_record[1] != generation_digest:
+            raise GenerationError("realization generation binding differs")
+        if plan_record[1] != boot_plan_digest:
+            raise GenerationError("realization boot-plan binding differs")
+        if target_record[1] != generation["target_id"]:
+            raise GenerationError("realization target binding differs")
+        if context_record[1] != generation["build_context_digest"]:
+            raise GenerationError("realization context binding differs")
+        if fhs_record[1] != FHS_CONTRACT:
+            raise GenerationError("realization FHS contract is unsupported")
+        if composition_record[1:] != [
+            "overlayfs-lowerdir",
+            "whiteout-char-0-0",
+        ]:
+            raise GenerationError("realization composition is unsupported")
+
+        images: list[dict[str, Any]] = []
+        image_index = fhs_index + 2
+        while image_index < len(lines) and lines[image_index].startswith(
+            "image "
+        ):
+            image_record = v3_record(image_index, "image", 11)
+            try:
+                sequence = int(image_record[1])
+                rootfs_size = int(image_record[5])
+                verity_hash_size = int(image_record[7])
+                verity_data_blocks = int(image_record[10])
+            except ValueError as error:
+                raise GenerationError(
+                    "realization image numeric field is invalid"
+                ) from error
+            if (
+                sequence != len(images)
+                or str(sequence) != image_record[1]
+                or rootfs_size < 1
+                or str(rootfs_size) != image_record[5]
+                or rootfs_size % VERITY_BLOCK_SIZE != 0
+                or verity_hash_size < VERITY_BLOCK_SIZE
+                or str(verity_hash_size) != image_record[7]
+                or verity_hash_size % VERITY_BLOCK_SIZE != 0
+                or verity_data_blocks < 1
+                or str(verity_data_blocks) != image_record[10]
+                or rootfs_size // VERITY_BLOCK_SIZE != verity_data_blocks
+            ):
+                raise GenerationError(
+                    "realization image geometry is invalid"
+                )
+            expected_kind = "base" if sequence == 0 else "layer"
+            if image_record[2] != expected_kind:
+                raise GenerationError(
+                    "realization image order or kind is invalid"
+                )
+            if sequence > len(generation["layers"]):
+                raise GenerationError(
+                    "realization has more images than the generation"
+                )
+            for digest in (
+                image_record[3],
+                image_record[4],
+                image_record[6],
+            ):
+                digest_name(digest)
+            for value, description in (
+                (image_record[8], "root hash"),
+                (image_record[9], "salt"),
+            ):
+                if len(value) != 64 or any(
+                    character not in "0123456789abcdef"
+                    for character in value
+                ):
+                    raise GenerationError(
+                        f"realization image verity {description} is invalid"
+                    )
+            source = (
+                generation["base"]
+                if sequence == 0
+                else generation["layers"][sequence - 1]
+            )
+            if image_record[3] != source["rootfs_digest"]:
+                raise GenerationError(
+                    "realization image source binding differs"
+                )
+            if sequence == 0 and (
+                image_record[4] != source["rootfs_digest"]
+                or rootfs_size != source["rootfs_size"]
+            ):
+                raise GenerationError(
+                    "incremental realization must reuse the exact base image"
+                )
+            images.append(
+                {
+                    "sequence": sequence,
+                    "kind": expected_kind,
+                    "source_digest": image_record[3],
+                    "rootfs_digest": image_record[4],
+                    "rootfs_size": rootfs_size,
+                    "verity": {
+                        "hash_digest": image_record[6],
+                        "hash_size": verity_hash_size,
+                        "root_hash": image_record[8],
+                        "salt": image_record[9],
+                        "data_blocks": verity_data_blocks,
+                        "format": VERITY_FORMAT,
+                        "algorithm": VERITY_ALGORITHM,
+                        "data_block_size": VERITY_BLOCK_SIZE,
+                        "hash_block_size": VERITY_BLOCK_SIZE,
+                        "hash_start_block": 0,
+                        "superblock": False,
+                    },
+                }
+            )
+            image_index += 1
+        expected_images = len(generation["layers"]) + 1
+        if (
+            not images
+            or len(images) != expected_images
+            or len(images) - 1 > MAX_INCREMENTAL_REALIZATION_LAYERS
+        ):
+            raise GenerationError(
+                "realization image count differs from the generation or "
+                f"exceeds {MAX_INCREMENTAL_REALIZATION_LAYERS} layers"
+            )
+        verity_format_record = v3_record(
+            image_index,
+            "verity-format",
+            6,
+        )
+        if verity_format_record[1:] != [
+            str(VERITY_FORMAT),
+            VERITY_ALGORITHM,
+            str(VERITY_BLOCK_SIZE),
+            str(VERITY_BLOCK_SIZE),
+            "no-superblock",
+        ]:
+            raise GenerationError("realization verity format is unsupported")
+        builder_record = v3_record(image_index + 1, "builder", 7)
+        if builder_record[1:] != [
+            "squashfs-tools",
+            "4.7.5",
+            "zstd",
+            "19",
+            "1048576",
+            "reproducible",
+        ]:
+            raise GenerationError("realization builder is unsupported")
+        if image_index + 3 != len(lines):
+            raise GenerationError("realization plan has an invalid record count")
+        return {
+            "generation_digest": generation_record[1],
+            "boot_plan_digest": plan_record[1],
+            "target_id": target_record[1],
+            "build_context_digest": context_record[1],
+            "rootfs_digest": None,
+            "rootfs_size": None,
+            "tree_digest": tree_record[1],
+            "tree_receipt_digest": tree_receipt_digest,
+            "fhs_contract": fhs_record[1],
+            "contract_version": version,
+            "composition": "overlayfs-lowerdir",
+            "whiteout_format": "char-0-0",
+            "images": images,
+            "verity": None,
+            "builder": {
+                "implementation": "squashfs-tools",
+                "version": "4.7.5",
+                "compression": "zstd",
+                "level": 19,
+                "block_size": 1048576,
+                "reproducible": True,
+            },
+        }
+
+    expected_counts = (9, 10) if version == 1 else (12,)
+    if len(lines) not in expected_counts:
+        raise GenerationError("realization plan has an invalid record count")
+    if lines[-1] != "end":
+        raise GenerationError("realization plan framing is invalid")
+
+    def record(index: int, keyword: str, fields: int) -> list[str]:
+        tokens = lines[index].split(" ")
+        if len(tokens) != fields or tokens[0] != keyword or any(
+            token == "" for token in tokens
+        ):
+            raise GenerationError(
+                f"realization plan {keyword} record is malformed"
+            )
+        return tokens
+
+    generation_record = record(1, "generation", 2)
+    plan_record = record(2, "boot-plan", 2)
+    target_record = record(3, "target", 2)
+    context_record = record(4, "context", 2)
+    rootfs_record = record(5, "rootfs", 3)
+    tree_record = record(6, "tree", 2)
+    fhs_contract: str | None = None
+    builder_index = 7
+    if version == 2 or len(lines) == 10:
+        fhs_record = record(7, "fhs", 2)
+        fhs_contract = fhs_record[1]
+        if fhs_contract != FHS_CONTRACT:
+            raise GenerationError("realization FHS contract is unsupported")
+        builder_index = 8
+    verity: dict[str, Any] | None = None
+    if version == 2:
+        verity_record = record(8, "verity", 6)
+        verity_format_record = record(9, "verity-format", 6)
+        builder_index = 10
+        digest_name(verity_record[1])
+        for value, description in (
+            (verity_record[3], "root hash"),
+            (verity_record[4], "salt"),
+        ):
+            if len(value) != 64 or any(
+                character not in "0123456789abcdef" for character in value
+            ):
+                raise GenerationError(
+                    f"realization verity {description} is invalid"
+                )
+        try:
+            verity_hash_size = int(verity_record[2])
+            verity_data_blocks = int(verity_record[5])
+        except ValueError as error:
+            raise GenerationError(
+                "realization verity numeric field is invalid"
+            ) from error
+        if (
+            verity_hash_size < VERITY_BLOCK_SIZE
+            or verity_hash_size % VERITY_BLOCK_SIZE != 0
+            or str(verity_hash_size) != verity_record[2]
+        ):
+            raise GenerationError("realization verity hash size is invalid")
+        if (
+            verity_data_blocks < 1
+            or str(verity_data_blocks) != verity_record[5]
+        ):
+            raise GenerationError("realization verity data blocks are invalid")
+        if verity_format_record[1:] != [
+            str(VERITY_FORMAT),
+            VERITY_ALGORITHM,
+            str(VERITY_BLOCK_SIZE),
+            str(VERITY_BLOCK_SIZE),
+            "no-superblock",
+        ]:
+            raise GenerationError("realization verity format is unsupported")
+        verity = {
+            "hash_digest": verity_record[1],
+            "hash_size": verity_hash_size,
+            "root_hash": verity_record[3],
+            "salt": verity_record[4],
+            "data_blocks": verity_data_blocks,
+            "format": VERITY_FORMAT,
+            "algorithm": VERITY_ALGORITHM,
+            "data_block_size": VERITY_BLOCK_SIZE,
+            "hash_block_size": VERITY_BLOCK_SIZE,
+            "hash_start_block": 0,
+            "superblock": False,
+        }
+    builder_record = record(builder_index, "builder", 7)
+
+    for digest in (
+        generation_record[1],
+        plan_record[1],
+        context_record[1],
+        rootfs_record[1],
+        tree_record[1],
+    ):
+        digest_name(digest)
+    if generation_record[1] != generation_digest:
+        raise GenerationError("realization generation binding differs")
+    if plan_record[1] != boot_plan_digest:
+        raise GenerationError("realization boot-plan binding differs")
+    if target_record[1] != generation["target_id"]:
+        raise GenerationError("realization target binding differs")
+    if context_record[1] != generation["build_context_digest"]:
+        raise GenerationError("realization context binding differs")
+    try:
+        rootfs_size = int(rootfs_record[2])
+    except ValueError as error:
+        raise GenerationError("realization rootfs size is invalid") from error
+    if rootfs_size < 1 or str(rootfs_size) != rootfs_record[2]:
+        raise GenerationError("realization rootfs size is invalid")
+    if verity is not None and (
+        rootfs_size % VERITY_BLOCK_SIZE != 0
+        or rootfs_size // VERITY_BLOCK_SIZE != verity["data_blocks"]
+    ):
+        raise GenerationError(
+            "realization rootfs size does not match verity data blocks"
+        )
+    if builder_record[1:] != [
+        "squashfs-tools",
+        "4.7.5",
+        "zstd",
+        "19",
+        "1048576",
+        "reproducible",
+    ]:
+        raise GenerationError("realization builder is unsupported")
+    return {
+        "generation_digest": generation_record[1],
+        "boot_plan_digest": plan_record[1],
+        "target_id": target_record[1],
+        "build_context_digest": context_record[1],
+        "rootfs_digest": rootfs_record[1],
+        "rootfs_size": rootfs_size,
+        "tree_digest": tree_record[1],
+        "fhs_contract": fhs_contract,
+        "contract_version": version,
+        "composition": "complete-closure",
+        "whiteout_format": None,
+        "images": None,
+        "verity": verity,
+        "builder": {
+            "implementation": "squashfs-tools",
+            "version": "4.7.5",
+            "compression": "zstd",
+            "level": 19,
+            "block_size": 1048576,
+            "reproducible": True,
+        },
+    }
+
+
+def read_signify_file(path: Path, description: str) -> tuple[bytes, str]:
+    require_regular_file(path, description)
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise GenerationError(f"cannot read {description}: {error}") from error
+    if not content or len(content) > SIGNIFY_FILE_LIMIT:
+        raise GenerationError(
+            f"{description} must contain 1 to {SIGNIFY_FILE_LIMIT} bytes"
+        )
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise GenerationError(f"{description} is not ASCII") from error
+    if not text.endswith("\n"):
+        raise GenerationError(f"{description} has no final newline")
+    lines = text.splitlines()
+    if (
+        len(lines) != 2
+        or not lines[0].startswith("untrusted comment: ")
+        or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", lines[1])
+    ):
+        raise GenerationError(f"{description} is not a detached signify file")
+    return content, digest_bytes(content)
+
+
+def public_key_id(path: Path) -> str:
+    content, _ = read_signify_file(path, f"trusted public key {path}")
+    return digest_bytes(content)
+
+
+def realization_signature_records(
+    system: Path,
+    realization_digest: str,
+) -> list[dict[str, str]]:
+    directory = system / "signatures" / digest_name(realization_digest)
+    if not directory.exists() and not directory.is_symlink():
+        return []
+    require_directory(directory, "realization signature directory")
+    records: list[dict[str, str]] = []
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        if (
+            not path.name.endswith(".sig")
+            or len(path.name) != 68
+            or any(
+                character not in "0123456789abcdef"
+                for character in path.name[:-4]
+            )
+        ):
+            raise GenerationError(
+                f"unsafe entry in realization signature directory: {path.name}"
+            )
+        _, signature_digest = read_signify_file(
+            path,
+            f"realization signature {path.name}",
+        )
+        records.append(
+            {
+                "key_id": DIGEST_PREFIX + path.name[:-4],
+                "signature_digest": signature_digest,
+            }
+        )
+    return records
+
+
+def invoke_signify(arguments: list[str], description: str) -> None:
+    try:
+        result = subprocess.run(
+            arguments,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise GenerationError(f"cannot execute signify for {description}: {error}") from error
+    if result.returncode == 0:
+        return
+    detail = result.stderr.strip() or result.stdout.strip() or "verification failed"
+    detail = detail.splitlines()[-1][:512]
+    raise GenerationError(f"{description} failed: {detail}")
+
+
+def verify_realization_signature(
+    system: Path,
+    realization_digest: str,
+    trusted_keys: list[Path],
+    signify_command: str,
+    required: bool,
+) -> list[str]:
+    records = realization_signature_records(system, realization_digest)
+    record_keys = {record["key_id"] for record in records}
+    if not trusted_keys:
+        if required:
+            raise GenerationError(
+                "realization signature verification requires a trusted public key"
+            )
+        return []
+
+    plan = object_path(system, realization_digest)
+    require_regular_file(plan, "signed realization plan")
+    verified: list[str] = []
+    for trusted_key in trusted_keys:
+        key_id = public_key_id(trusted_key)
+        if key_id not in record_keys:
+            continue
+        signature = (
+            system
+            / "signatures"
+            / digest_name(realization_digest)
+            / f"{digest_name(key_id)}.sig"
+        )
+        try:
+            invoke_signify(
+                [
+                    signify_command,
+                    "-V",
+                    "-p",
+                    str(trusted_key),
+                    "-x",
+                    str(signature),
+                    "-m",
+                    str(plan),
+                ],
+                f"realization signature from {key_id}",
+            )
+        except GenerationError:
+            # A signature claiming a configured trusted key must never be
+            # treated as merely absent, including in legacy compatibility mode.
+            raise
+        verified.append(key_id)
+    if required and not verified:
+        raise GenerationError(
+            "realization has no signature from a trusted public key"
+        )
+    return verified
+
+
+def validate_generation_realization(
+    system: Path,
+    generation_digest: str,
+    boot_plan_digest: str,
+    generation: dict[str, Any],
+    required: bool = False,
+    verify_objects: bool = True,
+    verify_image_digests: bool | None = None,
+) -> dict[str, Any] | None:
+    pointer = system / "realizations" / digest_name(generation_digest)
+    if not pointer.exists() and not pointer.is_symlink():
+        if required:
+            raise GenerationError(
+                f"generation has no realized closure: {generation_digest}"
+            )
+        return None
+    realization_digest = read_named_pointer(
+        pointer,
+        f"realization for {generation_digest}",
+    )
+    realization_object = object_path(system, realization_digest)
+    if verify_objects:
+        realization_object = resolve_object(
+            system,
+            {},
+            realization_digest,
+        )
+    else:
+        require_regular_file(realization_object, "realization plan object")
+    try:
+        content = realization_object.read_bytes()
+    except OSError as error:
+        raise GenerationError(
+            f"cannot read realization plan: {realization_object}"
+        ) from error
+    result = parse_realization_plan(
+        content,
+        generation_digest,
+        boot_plan_digest,
+        generation,
+    )
+    if verify_image_digests is None:
+        verify_image_digests = verify_objects
+    if result.get("tree_receipt_digest") is None:
+        # Receipt-free legacy plans never get the lazy publication shortcut.
+        verify_image_digests = verify_objects
+    tree_receipt = None
+    tree_receipt_digest = result.get("tree_receipt_digest")
+    if tree_receipt_digest is not None:
+        receipt_object = object_path(system, tree_receipt_digest)
+        if verify_objects:
+            receipt_object = resolve_object(system, {}, tree_receipt_digest)
+        else:
+            require_regular_file(receipt_object, "parent-tree receipt object")
+        try:
+            receipt_content = receipt_object.read_bytes()
+        except OSError as error:
+            raise GenerationError(
+                f"cannot read parent-tree receipt: {receipt_object}"
+            ) from error
+        tree_receipt = parse_parent_tree_receipt(
+            receipt_content,
+            generation_digest,
+            boot_plan_digest,
+            generation,
+            result["tree_digest"],
+        )
+        validation_index_digest = tree_receipt.get(
+            "validation_index_digest"
+        )
+        if validation_index_digest is not None:
+            validation_index_object = object_path(
+                system,
+                validation_index_digest,
+            )
+            if verify_objects:
+                validation_index_object = resolve_object(
+                    system,
+                    {},
+                    validation_index_digest,
+                )
+            else:
+                require_regular_file(
+                    validation_index_object,
+                    "FHS/ELF validation index object",
+                )
+            if (
+                validation_index_object.stat().st_size
+                != tree_receipt["validation_index_size"]
+            ):
+                raise GenerationError(
+                    "FHS/ELF validation index object size mismatch"
+                )
+            try:
+                validation_index_content = validation_index_object.read_bytes()
+            except OSError as error:
+                raise GenerationError(
+                    "cannot read FHS/ELF validation index object"
+                ) from error
+            tree_receipt["validation_index_records"] = (
+                parse_fhs_elf_validation_index(
+                    validation_index_content,
+                    generation["target_id"],
+                )
+            )
+        tree_state_digest = tree_receipt.get("tree_state_digest")
+        if tree_state_digest is not None:
+            tree_state_object = object_path(system, tree_state_digest)
+            if verify_objects:
+                tree_state_object = resolve_object(system, {}, tree_state_digest)
+            else:
+                require_regular_file(tree_state_object, "tree state object")
+            if tree_state_object.stat().st_size != tree_receipt["tree_state_size"]:
+                raise GenerationError("tree state object size mismatch")
+            try:
+                tree_state_content = tree_state_object.read_bytes()
+            except OSError as error:
+                raise GenerationError("cannot read tree state object") from error
+            tree_receipt["tree_state"] = parse_tree_state(
+                tree_state_content,
+                generation_digest,
+                boot_plan_digest,
+                generation,
+                tree_receipt["validation_index_digest"],
+                tree_receipt["validation_index_size"],
+            )
+    image_records = result["images"]
+    if image_records is None:
+        image_records = [
+            {
+                "rootfs_digest": result["rootfs_digest"],
+                "rootfs_size": result["rootfs_size"],
+                "verity": result["verity"],
+            }
+        ]
+    for image in image_records:
+        rootfs = object_path(system, image["rootfs_digest"])
+        if verify_image_digests:
+            rootfs = resolve_object(system, {}, image["rootfs_digest"])
+        else:
+            require_regular_file(rootfs, "realization rootfs object")
+        require_squashfs(rootfs, image["rootfs_size"])
+        if image["verity"] is None:
+            continue
+        verity_hash = object_path(
+            system,
+            image["verity"]["hash_digest"],
+        )
+        if verify_image_digests:
+            verity_hash = resolve_object(
+                system,
+                {},
+                image["verity"]["hash_digest"],
+            )
+        else:
+            require_regular_file(verity_hash, "realization verity hash object")
+        try:
+            verity_hash_size = verity_hash.stat().st_size
+        except OSError as error:
+            raise GenerationError(
+                f"cannot inspect verity hash object: {verity_hash}"
+            ) from error
+        if verity_hash_size != image["verity"]["hash_size"]:
+            raise GenerationError(
+                "realization verity hash object size mismatch: "
+                f"expected {image['verity']['hash_size']}, "
+                f"got {verity_hash_size}"
+            )
+    result["realization_digest"] = realization_digest
+    result["parent_tree_receipt"] = tree_receipt
+    result["signatures"] = realization_signature_records(
+        system,
+        realization_digest,
+    )
+    return result
+
+
+def read_published_manifest(
+    contracts: dict[str, Any],
+    system: Path,
+    digest: str,
+) -> dict[str, Any]:
+    path = system / "manifests" / f"{digest_name(digest)}.json"
+    manifest, canonical = read_canonical_contract(
+        contracts,
+        path,
+        GENERATION_SCHEMA,
+    )
+    if digest_bytes(canonical) != digest:
+        raise GenerationError(f"generation manifest digest mismatch: {path}")
+    return manifest
+
+
+def read_object_contract(
+    contracts: dict[str, Any],
+    system: Path,
+    supplied: dict[str, Path],
+    digest: str,
+    schema: str,
+) -> dict[str, Any]:
+    path = resolve_object(system, supplied, digest)
+    value, canonical = read_canonical_contract(contracts, path, schema)
+    if digest_bytes(canonical) != digest:
+        raise GenerationError(f"canonical object digest mismatch: {path}")
+    return value
+
+
+def validate_generation_v2_closure(
+    contracts: dict[str, Any],
+    system: Path,
+    generation: dict[str, Any],
+    generation_digest: str,
+    supplied: dict[str, Path],
+) -> list[dict[str, Any]]:
+    context = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        generation["build_context_digest"],
+        BUILD_CONTEXT_SCHEMA,
+    )
+    portage_state = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        generation["portage_state_digest"],
+        PORTAGE_STATE_SCHEMA,
+    )
+    try:
+        contracts["verify_generation_context"](
+            generation,
+            context,
+            portage_state,
+        )
+    except RuntimeError as error:
+        raise GenerationError(str(error)) from error
+
+    base = generation["base"]
+    base_path = resolve_object(system, supplied, base["rootfs_digest"])
+    require_squashfs(base_path, base["rootfs_size"])
+    if not generation["layers"]:
+        if contracts["manifest_digest"](generation) != generation_digest:
+            raise GenerationError(
+                "generation digest changed during closure validation"
+            )
+        return []
+
+    parent_digest = generation["parent_generation_digest"]
+    assert isinstance(parent_digest, str)
+    validate_published_generation(system, parent_digest)
+    parent = read_published_manifest(contracts, system, parent_digest)
+    if parent["schema"] == GENERATION_V2_SCHEMA:
+        parent_portage_state = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            parent["portage_state_digest"],
+            PORTAGE_STATE_SCHEMA,
+        )
+        if context["world_digest"] != parent_portage_state["world_digest"]:
+            raise GenerationError(
+                "update build context world does not match parent PortageState"
+            )
+    layer = generation["layers"][-1]
+    layer_path = resolve_object(
+        system,
+        supplied,
+        layer["rootfs_digest"],
+    )
+    require_squashfs(layer_path, layer["rootfs_size"])
+    tombstone = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        layer["tombstones_digest"],
+        TOMBSTONES_SCHEMA,
+    )
+    transaction = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        layer["transaction_digest"],
+        LAYER_TRANSACTION_SCHEMA,
+    )
+    spec = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        transaction["build_spec_digest"],
+        BUILD_SPEC_SCHEMA,
+    )
+    acquisition = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        transaction["acquisition_digest"],
+        PACKAGE_ACQUISITION_SCHEMA,
+    )
+    catalog = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        acquisition["source_catalog_digest"],
+        PACKAGE_SOURCE_CATALOG_SCHEMA,
+    )
+    changed = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        transaction["filesystem"]["changed_paths_digest"],
+        LAYER_PATHS_SCHEMA,
+    )
+    try:
+        contracts["verify_build_spec_context"](spec, context)
+        contracts["verify_acquisition_closure"](
+            acquisition,
+            spec,
+            context,
+            catalog,
+        )
+        contracts["verify_layer_transaction_closure"](
+            transaction,
+            generation,
+            parent,
+            context,
+            spec,
+            acquisition,
+            changed,
+            tombstone,
+            portage_state,
+        )
+    except RuntimeError as error:
+        raise GenerationError(f"latest layer provenance: {error}") from error
+
+    tombstone_values = [
+        read_object_contract(
+            contracts,
+            system,
+            supplied,
+            item["tombstones_digest"],
+            TOMBSTONES_SCHEMA,
+        )
+        for item in generation["layers"][:-1]
+    ]
+    tombstone_values.append(tombstone)
+    if contracts["manifest_digest"](generation) != generation_digest:
+        raise GenerationError(
+            "generation digest changed during closure validation"
+        )
+    return tombstone_values
+
+
+def validate_generation_closure(
+    contracts: dict[str, Any],
+    system: Path,
+    generation: dict[str, Any],
+    generation_digest: str,
+    supplied: dict[str, Path] | None = None,
+) -> list[dict[str, Any]]:
+    supplied = supplied or {}
+    if generation["schema"] == GENERATION_V2_SCHEMA:
+        return validate_generation_v2_closure(
+            contracts,
+            system,
+            generation,
+            generation_digest,
+            supplied,
+        )
+    context = read_object_contract(
+        contracts,
+        system,
+        supplied,
+        generation["build_context_digest"],
+        BUILD_CONTEXT_SCHEMA,
+    )
+    try:
+        contracts["verify_generation_context"](generation, context)
+    except RuntimeError as error:
+        raise GenerationError(str(error)) from error
+
+    base = generation["base"]
+    base_path = resolve_object(system, supplied, base["rootfs_digest"])
+    require_squashfs(base_path, base["rootfs_size"])
+
+    tombstone_values: list[dict[str, Any]] = []
+    for number, layer in enumerate(generation["layers"]):
+        layer_path = resolve_object(system, supplied, layer["rootfs_digest"])
+        require_squashfs(layer_path, layer["rootfs_size"])
+        tombstone = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            layer["tombstones_digest"],
+            TOMBSTONES_SCHEMA,
+        )
+        transaction = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            layer["transaction_digest"],
+            LAYER_TRANSACTION_SCHEMA,
+        )
+        spec = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            transaction["build_spec_digest"],
+            BUILD_SPEC_SCHEMA,
+        )
+        acquisition = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            transaction["acquisition_digest"],
+            PACKAGE_ACQUISITION_SCHEMA,
+        )
+        catalog = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            acquisition["source_catalog_digest"],
+            PACKAGE_SOURCE_CATALOG_SCHEMA,
+        )
+        changed = read_object_contract(
+            contracts,
+            system,
+            supplied,
+            transaction["filesystem"]["changed_paths_digest"],
+            LAYER_PATHS_SCHEMA,
+        )
+
+        parent = {
+            **generation,
+            "layers": generation["layers"][:number],
+        }
+        parent_digest = contracts["manifest_digest"](parent)
+        if transaction["parent_generation_digest"] != parent_digest:
+            raise GenerationError(
+                f"layer {number} transaction parent does not match "
+                "the generation prefix"
+            )
+        published_parent = read_published_manifest(
+            contracts,
+            system,
+            parent_digest,
+        )
+        if published_parent != parent:
+            raise GenerationError(
+                f"layer {number} published parent differs from "
+                "the generation prefix"
+            )
+        candidate = {
+            **generation,
+            "layers": generation["layers"][: number + 1],
+        }
+        try:
+            contracts["verify_build_spec_context"](spec, context)
+            contracts["verify_acquisition_closure"](
+                acquisition,
+                spec,
+                context,
+                catalog,
+            )
+            contracts["verify_layer_transaction_closure"](
+                transaction,
+                candidate,
+                parent,
+                context,
+                spec,
+                acquisition,
+                changed,
+                tombstone,
+            )
+        except RuntimeError as error:
+            raise GenerationError(f"layer {number} provenance: {error}") from error
+        tombstone_values.append(tombstone)
+
+    if contracts["manifest_digest"](generation) != generation_digest:
+        raise GenerationError("generation digest changed during closure validation")
+    return tombstone_values
+
+
 def _publish_generation(arguments: argparse.Namespace) -> None:
     contracts = load_contracts()
     system = state_system(arguments.state)
@@ -429,64 +1843,16 @@ def _publish_generation(arguments: argparse.Namespace) -> None:
             source,
         )
         if digest in supplied:
-            raise GenerationError(f"duplicate object digest supplied: {digest}")
+            continue
         supplied[digest] = destination
 
-    context_path = resolve_object(
+    tombstone_values = validate_generation_closure(
+        contracts,
         system,
+        generation,
+        generation_digest,
         supplied,
-        generation["build_context_digest"],
     )
-    context = read_contract(contracts, context_path, BUILD_CONTEXT_SCHEMA)
-    if context["target"]["id"] != generation["target_id"]:
-        raise GenerationError("generation and build context targets differ")
-
-    base = generation["base"]
-    base_path = resolve_object(system, supplied, base["rootfs_digest"])
-    require_squashfs(base_path, base["rootfs_size"])
-
-    tombstone_values: list[dict[str, Any]] = []
-    for number, layer in enumerate(generation["layers"]):
-        rootfs_path = resolve_object(system, supplied, layer["rootfs_digest"])
-        require_squashfs(rootfs_path, layer["rootfs_size"])
-        tombstone_path = resolve_object(
-            system,
-            supplied,
-            layer["tombstones_digest"],
-        )
-        tombstone = read_contract(
-            contracts,
-            tombstone_path,
-            TOMBSTONES_SCHEMA,
-        )
-        transaction_path = resolve_object(
-            system,
-            supplied,
-            layer["transaction_digest"],
-        )
-        transaction = read_contract(
-            contracts,
-            transaction_path,
-            LAYER_TRANSACTION_SCHEMA,
-        )
-        if transaction["target_id"] != generation["target_id"]:
-            raise GenerationError(
-                f"layer {number} transaction target differs from generation"
-            )
-        filesystem = transaction["filesystem"]
-        if (
-            filesystem["rootfs_digest"] != layer["rootfs_digest"]
-            or filesystem["rootfs_size"] != layer["rootfs_size"]
-            or filesystem["tombstones_digest"] != layer["tombstones_digest"]
-        ):
-            raise GenerationError(
-                f"layer {number} transaction filesystem references differ"
-            )
-        if filesystem["tombstones_count"] != len(tombstone["paths"]):
-            raise GenerationError(
-                f"layer {number} transaction tombstone count differs"
-            )
-        tombstone_values.append(tombstone)
 
     manifest_path = (
         system / "manifests" / f"{digest_name(generation_digest)}.json"
@@ -517,7 +1883,12 @@ def _publish_generation(arguments: argparse.Namespace) -> None:
         atomic_write(plan_pointer, pointer_value, 0o444)
 
     if arguments.activate:
-        select_digest(system, generation_digest)
+        select_digest(
+            system,
+            generation_digest,
+            arguments.expected_current,
+            arguments.require_realization,
+        )
     print(f"published generation {generation_digest}")
 
 
@@ -540,7 +1911,11 @@ def read_pointer(system: Path, name: str, required: bool = True) -> str | None:
     return value
 
 
-def validate_published_generation(system: Path, digest: str) -> None:
+def validate_published_generation(
+    system: Path,
+    digest: str,
+    verify_realization_images: bool = True,
+) -> str:
     contracts = load_contracts()
     manifest = system / "manifests" / f"{digest_name(digest)}.json"
     require_regular_file(manifest, "generation manifest")
@@ -561,52 +1936,101 @@ def validate_published_generation(system: Path, digest: str) -> None:
     if actual_plan_digest != plan_digest:
         raise GenerationError(f"boot plan digest mismatch: {plan}")
 
-    context_path = object_path(system, generation["build_context_digest"])
-    context = read_contract(contracts, context_path, BUILD_CONTEXT_SCHEMA)
-    if context["target"]["id"] != generation["target_id"]:
-        raise GenerationError("published generation target mismatch")
+    realization = validate_generation_realization(
+        system,
+        digest,
+        plan_digest,
+        generation,
+        verify_image_digests=verify_realization_images,
+    )
+    if realization is not None:
+        context = read_object_contract(
+            contracts,
+            system,
+            {},
+            generation["build_context_digest"],
+            BUILD_CONTEXT_SCHEMA,
+        )
+        portage_state = None
+        if generation["schema"] == GENERATION_V2_SCHEMA:
+            portage_state = read_object_contract(
+                contracts,
+                system,
+                {},
+                generation["portage_state_digest"],
+                PORTAGE_STATE_SCHEMA,
+            )
+        try:
+            contracts["verify_generation_context"](
+                generation,
+                context,
+                portage_state,
+            )
+        except RuntimeError as error:
+            raise GenerationError(str(error)) from error
+        return plan_digest
 
-    base = generation["base"]
-    base_path = object_path(system, base["rootfs_digest"])
-    require_squashfs(base_path, base["rootfs_size"])
-    tombstone_values = []
-    for number, layer in enumerate(generation["layers"]):
-        layer_path = object_path(system, layer["rootfs_digest"])
-        require_squashfs(layer_path, layer["rootfs_size"])
-        tombstone_path = object_path(system, layer["tombstones_digest"])
-        tombstone = read_contract(
-            contracts,
-            tombstone_path,
-            TOMBSTONES_SCHEMA,
-        )
-        transaction_path = object_path(system, layer["transaction_digest"])
-        transaction = read_contract(
-            contracts,
-            transaction_path,
-            LAYER_TRANSACTION_SCHEMA,
-        )
-        if transaction["target_id"] != generation["target_id"]:
-            raise GenerationError(f"layer {number} target mismatch")
-        filesystem = transaction["filesystem"]
-        if (
-            filesystem["rootfs_digest"] != layer["rootfs_digest"]
-            or filesystem["rootfs_size"] != layer["rootfs_size"]
-            or filesystem["tombstones_digest"] != layer["tombstones_digest"]
-            or filesystem["tombstones_count"] != len(tombstone["paths"])
-        ):
-            raise GenerationError(f"layer {number} closure mismatch")
-        tombstone_values.append(tombstone)
+    tombstone_values = validate_generation_closure(
+        contracts,
+        system,
+        generation,
+        digest,
+    )
     expected_plan = boot_plan(digest, generation, tombstone_values)
     if plan.read_bytes() != expected_plan:
         raise GenerationError("published boot plan differs from generation")
+    return plan_digest
 
 
-def select_digest(system: Path, digest: str) -> None:
-    validate_published_generation(system, digest)
+def select_digest(
+    system: Path,
+    digest: str,
+    expected_current: str | None,
+    require_realization: bool = False,
+    require_signature: bool = False,
+    trusted_keys: list[Path] | None = None,
+    signify_command: str = "signify",
+    verify_realization_images: bool = True,
+) -> None:
+    plan_digest = validate_published_generation(
+        system,
+        digest,
+        verify_realization_images=verify_realization_images,
+    )
+    if require_realization or require_signature:
+        contracts = load_contracts()
+        generation = read_contract(
+            contracts,
+            system / "manifests" / f"{digest_name(digest)}.json",
+            GENERATION_SCHEMA,
+        )
+        realization = validate_generation_realization(
+            system,
+            digest,
+            plan_digest,
+            generation,
+            required=True,
+        )
+        assert realization is not None
+        if require_signature:
+            verify_realization_signature(
+                system,
+                realization["realization_digest"],
+                trusted_keys or [],
+                signify_command,
+                required=True,
+            )
     current = read_pointer(system, "current", required=False)
     if current == digest:
         print(f"generation already selected: {digest}")
         return
+    if current != expected_current:
+        expected = expected_current if expected_current is not None else "none"
+        actual = current if current is not None else "none"
+        raise GenerationError(
+            "current generation changed before selection: "
+            f"expected {expected}, found {actual}"
+        )
     if current is not None:
         try:
             validate_published_generation(system, current)
@@ -629,7 +2053,576 @@ def select_digest(system: Path, digest: str) -> None:
 def select_generation(arguments: argparse.Namespace) -> None:
     system = state_system(arguments.state)
     with mutation_lock(system):
-        select_digest(system, arguments.digest)
+        select_digest(
+            system,
+            arguments.digest,
+            arguments.expected_current,
+            arguments.require_realization,
+            arguments.require_signature,
+            arguments.trusted_key,
+            arguments.signify,
+        )
+
+
+def record_realization(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        generation_digest = resolve_digest_argument(
+            system,
+            arguments.digest,
+        )
+        expected_plan_digest = arguments.boot_plan_digest
+        digest_name(expected_plan_digest)
+        digest_name(arguments.tree_digest)
+        if arguments.fhs_contract != FHS_CONTRACT:
+            raise GenerationError(
+                f"unsupported FHS contract: {arguments.fhs_contract}"
+            )
+        plan_digest = validate_published_generation(
+            system,
+            generation_digest,
+        )
+        if plan_digest != expected_plan_digest:
+            raise GenerationError(
+                "boot plan changed before realization publication: "
+                f"expected {expected_plan_digest}, found {plan_digest}"
+            )
+        contracts = load_contracts()
+        generation = read_contract(
+            contracts,
+            system
+            / "manifests"
+            / f"{digest_name(generation_digest)}.json",
+            GENERATION_SCHEMA,
+        )
+        rootfs_digest, rootfs_size, rootfs_object = publish_object(
+            system,
+            arguments.rootfs,
+        )
+        require_squashfs(rootfs_object, rootfs_size)
+        verity = None
+        verity_arguments = (
+            arguments.verity_hash,
+            arguments.verity_root_hash,
+            arguments.verity_salt,
+            arguments.verity_data_blocks,
+        )
+        if any(value is not None for value in verity_arguments):
+            if not all(value is not None for value in verity_arguments):
+                raise GenerationError(
+                    "all verity realization arguments must be provided together"
+                )
+            assert arguments.verity_hash is not None
+            assert arguments.verity_root_hash is not None
+            assert arguments.verity_salt is not None
+            assert arguments.verity_data_blocks is not None
+            if (
+                rootfs_size % VERITY_BLOCK_SIZE != 0
+                or rootfs_size // VERITY_BLOCK_SIZE
+                != arguments.verity_data_blocks
+            ):
+                raise GenerationError(
+                    "rootfs size does not match --verity-data-blocks"
+                )
+            for value, description in (
+                (arguments.verity_root_hash, "root hash"),
+                (arguments.verity_salt, "salt"),
+            ):
+                if len(value) != 64 or any(
+                    character not in "0123456789abcdef"
+                    for character in value
+                ):
+                    raise GenerationError(
+                        f"verity {description} must be 64 lowercase hex digits"
+                    )
+            hash_digest, hash_size, _ = publish_object(
+                system,
+                arguments.verity_hash,
+            )
+            if hash_size < VERITY_BLOCK_SIZE or hash_size % VERITY_BLOCK_SIZE:
+                raise GenerationError(
+                    "verity hash object must be a non-empty 4096-byte multiple"
+                )
+            verity = {
+                "hash_digest": hash_digest,
+                "hash_size": hash_size,
+                "root_hash": arguments.verity_root_hash,
+                "salt": arguments.verity_salt,
+                "data_blocks": arguments.verity_data_blocks,
+            }
+        content = realization_plan(
+            generation_digest,
+            plan_digest,
+            generation,
+            rootfs_digest,
+            rootfs_size,
+            arguments.tree_digest,
+            arguments.fhs_contract,
+            verity,
+        )
+        realization_digest, _, _ = publish_object(
+            system,
+            arguments.rootfs,
+            content,
+        )
+        pointer = system / "realizations" / digest_name(generation_digest)
+        pointer_content = f"{realization_digest}\n".encode("ascii")
+        if pointer.exists() or pointer.is_symlink():
+            require_regular_file(pointer, "generation realization pointer")
+            if pointer.read_bytes() != pointer_content:
+                raise GenerationError(
+                    f"generation realization collision: {pointer}"
+                )
+        else:
+            atomic_write(pointer, pointer_content, 0o444)
+        validate_generation_realization(
+            system,
+            generation_digest,
+            plan_digest,
+            generation,
+            required=True,
+        )
+        if arguments.activate:
+            select_digest(
+                system,
+                generation_digest,
+                arguments.expected_current,
+                require_realization=True,
+                verify_realization_images=False,
+            )
+    print(
+        f"recorded realization {realization_digest} "
+        f"for generation {generation_digest}"
+    )
+
+
+def record_incremental_realization(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        generation_digest = resolve_digest_argument(
+            system,
+            arguments.digest,
+        )
+        contracts = load_contracts()
+        manifest_path = (
+            system
+            / "manifests"
+            / f"{digest_name(generation_digest)}.json"
+        )
+        generation, generation_content = read_canonical_contract(
+            contracts,
+            manifest_path,
+            GENERATION_SCHEMA,
+        )
+        if digest_bytes(generation_content) != generation_digest:
+            raise GenerationError(
+                f"generation manifest digest mismatch: {manifest_path}"
+            )
+        plan_pointer = system / "plans" / digest_name(generation_digest)
+        plan_digest = read_named_pointer(
+            plan_pointer,
+            f"boot plan for {generation_digest}",
+        )
+        resolve_object(system, {}, plan_digest)
+        require_regular_file(arguments.plan, "incremental realization plan")
+        try:
+            content = arguments.plan.read_bytes()
+        except OSError as error:
+            raise GenerationError(
+                f"cannot read incremental realization plan: {error}"
+            ) from error
+        if len(content) > 1024 * 1024:
+            raise GenerationError(
+                "incremental realization plan exceeds 1048576 bytes"
+            )
+        result = parse_realization_plan(
+            content,
+            generation_digest,
+            plan_digest,
+            generation,
+        )
+        if result["contract_version"] != 3:
+            raise GenerationError(
+                "incremental realization requires a v3 plan"
+            )
+
+        supplied: dict[str, Path] = {}
+        for path in arguments.object:
+            digest, _ = digest_file(path)
+            existing = supplied.get(digest)
+            if existing is not None and existing != path:
+                raise GenerationError(
+                    f"duplicate supplied incremental object: {digest}"
+                )
+            supplied[digest] = path
+        referenced = {
+            reference
+            for image in result["images"]
+            for reference in (
+                image["rootfs_digest"],
+                image["verity"]["hash_digest"],
+            )
+        }
+        tree_receipt = None
+        tree_receipt_digest = result.get("tree_receipt_digest")
+        if tree_receipt_digest is not None:
+            referenced.add(tree_receipt_digest)
+            receipt_path = supplied.get(
+                tree_receipt_digest,
+                object_path(system, tree_receipt_digest),
+            )
+            require_regular_file(receipt_path, "parent-tree receipt object")
+            try:
+                receipt_content = receipt_path.read_bytes()
+            except OSError as error:
+                raise GenerationError(
+                    f"cannot read parent-tree receipt: {receipt_path}"
+                ) from error
+            if digest_bytes(receipt_content) != tree_receipt_digest:
+                raise GenerationError(
+                    f"parent-tree receipt digest mismatch: {receipt_path}"
+                )
+            tree_receipt = parse_parent_tree_receipt(
+                receipt_content,
+                generation_digest,
+                plan_digest,
+                generation,
+                result["tree_digest"],
+            )
+            validation_index_digest = tree_receipt.get(
+                "validation_index_digest"
+            )
+            if validation_index_digest is not None:
+                referenced.add(validation_index_digest)
+            tree_state_digest = tree_receipt.get("tree_state_digest")
+            if tree_state_digest is not None:
+                referenced.add(tree_state_digest)
+                tree_state_path = supplied.get(
+                    tree_state_digest,
+                    object_path(system, tree_state_digest),
+                )
+                require_regular_file(tree_state_path, "tree state object")
+                try:
+                    tree_state_content = tree_state_path.read_bytes()
+                except OSError as error:
+                    raise GenerationError(
+                        f"cannot read tree state object: {tree_state_path}"
+                    ) from error
+                if digest_bytes(tree_state_content) != tree_state_digest:
+                    raise GenerationError(
+                        f"tree state digest mismatch: {tree_state_path}"
+                    )
+                if len(tree_state_content) != tree_receipt["tree_state_size"]:
+                    raise GenerationError("tree state object size mismatch")
+                tree_receipt["tree_state"] = parse_tree_state(
+                    tree_state_content,
+                    generation_digest,
+                    plan_digest,
+                    generation,
+                    tree_receipt["validation_index_digest"],
+                    tree_receipt["validation_index_size"],
+                )
+        else:
+            # Legacy v3 plans predate authenticated tree receipts and retain
+            # the eager publication checks.
+            validate_published_generation(system, generation_digest)
+
+        unexpected = sorted(set(supplied) - referenced)
+        if unexpected:
+            raise GenerationError(
+                "supplied incremental object is not referenced by the plan: "
+                + unexpected[0]
+            )
+
+        inherited: set[str] = set()
+        if (
+            tree_receipt is not None
+            and tree_receipt["parent_generation_digest"] is not None
+            and tree_receipt["parent_realization_digest"] is not None
+        ):
+            parent_digest = tree_receipt["parent_generation_digest"]
+            parent_manifest = read_published_manifest(
+                contracts,
+                system,
+                parent_digest,
+            )
+            parent_plan_digest = read_named_pointer(
+                system / "plans" / digest_name(parent_digest),
+                f"boot plan for direct parent {parent_digest}",
+            )
+            resolve_object(system, {}, parent_plan_digest)
+            expected_parent_realization = tree_receipt[
+                "parent_realization_digest"
+            ]
+            actual_parent_realization = read_named_pointer(
+                system / "realizations" / digest_name(parent_digest),
+                f"realization for direct parent {parent_digest}",
+            )
+            if actual_parent_realization != expected_parent_realization:
+                raise GenerationError(
+                    "parent-tree receipt realization pointer changed"
+                )
+            parent_realization_path = resolve_object(
+                system,
+                {},
+                actual_parent_realization,
+            )
+            try:
+                parent_realization_content = parent_realization_path.read_bytes()
+            except OSError as error:
+                raise GenerationError(
+                    "cannot read direct-parent realization plan: "
+                    f"{parent_realization_path}"
+                ) from error
+            parent_result = parse_realization_plan(
+                parent_realization_content,
+                parent_digest,
+                parent_plan_digest,
+                parent_manifest,
+            )
+            if parent_result["contract_version"] != 3:
+                raise GenerationError(
+                    "parent-tree receipt does not name a v3 realization"
+                )
+            parent_validation = validate_generation_realization(
+                system,
+                parent_digest,
+                parent_plan_digest,
+                parent_manifest,
+                required=True,
+                verify_objects=False,
+                verify_image_digests=False,
+            )
+            assert parent_validation is not None
+            parent_receipt = parent_validation.get("parent_tree_receipt")
+            expected_parent_tree_state = (
+                parent_receipt.get("tree_state_digest")
+                if parent_receipt is not None
+                else None
+            )
+            current_tree_state = tree_receipt.get("tree_state")
+            actual_parent_tree_state = (
+                current_tree_state.get("parent_tree_state_digest")
+                if current_tree_state is not None
+                else None
+            )
+            if actual_parent_tree_state != expected_parent_tree_state:
+                raise GenerationError(
+                    "tree state direct-parent binding differs"
+                )
+            parent_images = parent_result["images"]
+            for sequence, image in enumerate(result["images"]):
+                if sequence >= len(parent_images) or image != parent_images[sequence]:
+                    continue
+                inherited.add(image["rootfs_digest"])
+                inherited.add(image["verity"]["hash_digest"])
+
+        for digest in sorted(referenced):
+            if digest in supplied:
+                published_digest, _, _ = publish_object(
+                    system,
+                    supplied[digest],
+                )
+                if published_digest != digest:
+                    raise AssertionError("published object digest changed")
+            elif digest in inherited:
+                inherited_path = object_path(system, digest)
+                require_regular_file(
+                    inherited_path,
+                    "direct-parent inherited object",
+                )
+                matching_images = [
+                    image
+                    for image in result["images"]
+                    if digest
+                    in (
+                        image["rootfs_digest"],
+                        image["verity"]["hash_digest"],
+                    )
+                ]
+                for image in matching_images:
+                    if digest == image["rootfs_digest"]:
+                        require_squashfs(inherited_path, image["rootfs_size"])
+                    if digest == image["verity"]["hash_digest"]:
+                        try:
+                            actual_size = inherited_path.stat().st_size
+                        except OSError as error:
+                            raise GenerationError(
+                                "cannot inspect inherited verity object: "
+                                f"{inherited_path}"
+                            ) from error
+                        if actual_size != image["verity"]["hash_size"]:
+                            raise GenerationError(
+                                "direct-parent inherited verity object size mismatch"
+                            )
+            else:
+                resolve_object(system, {}, digest)
+
+        realization_digest, _, _ = publish_object(
+            system,
+            arguments.plan,
+            content,
+        )
+        pointer = system / "realizations" / digest_name(generation_digest)
+        pointer_content = f"{realization_digest}\n".encode("ascii")
+        if pointer.exists() or pointer.is_symlink():
+            require_regular_file(pointer, "generation realization pointer")
+            if pointer.read_bytes() != pointer_content:
+                raise GenerationError(
+                    f"generation realization collision: {pointer}"
+                )
+        else:
+            atomic_write(pointer, pointer_content, 0o444)
+        validate_generation_realization(
+            system,
+            generation_digest,
+            plan_digest,
+            generation,
+            required=True,
+            verify_objects=False,
+        )
+        if arguments.activate:
+            select_digest(
+                system,
+                generation_digest,
+                arguments.expected_current,
+                require_realization=True,
+                verify_realization_images=False,
+            )
+    print(
+        f"recorded incremental realization {realization_digest} "
+        f"for generation {generation_digest}"
+    )
+
+
+def sign_realization(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    signature_temporary: Path | None = None
+    with mutation_lock(system):
+        generation_digest = resolve_digest_argument(system, arguments.digest)
+        plan_digest = validate_published_generation(
+            system,
+            generation_digest,
+            verify_realization_images=False,
+        )
+        contracts = load_contracts()
+        generation = read_contract(
+            contracts,
+            system
+            / "manifests"
+            / f"{digest_name(generation_digest)}.json",
+            GENERATION_SCHEMA,
+        )
+        realization = validate_generation_realization(
+            system,
+            generation_digest,
+            plan_digest,
+            generation,
+            required=True,
+            verify_image_digests=False,
+        )
+        assert realization is not None
+        realization_digest = realization["realization_digest"]
+        realization_object = object_path(system, realization_digest)
+        require_regular_file(arguments.secret_key, "realization secret key")
+        key_id = public_key_id(arguments.trusted_key)
+        signature_temporary = (
+            system
+            / "staging"
+            / (
+                f".signature-{digest_name(realization_digest)}-"
+                f"{digest_name(key_id)}-{os.getpid()}"
+            )
+        )
+        if signature_temporary.exists() or signature_temporary.is_symlink():
+            raise GenerationError(
+                f"signature staging path already exists: {signature_temporary}"
+            )
+        try:
+            invoke_signify(
+                [
+                    arguments.signify,
+                    "-S",
+                    "-s",
+                    str(arguments.secret_key),
+                    "-x",
+                    str(signature_temporary),
+                    "-m",
+                    str(realization_object),
+                ],
+                f"signing realization {realization_digest}",
+            )
+            signature_content, _ = read_signify_file(
+                signature_temporary,
+                "generated realization signature",
+            )
+            signature_content = (
+                b"untrusted comment: Volatoo realization signature\n"
+                + signature_content.split(b"\n", 1)[1]
+            )
+            try:
+                signature_temporary.write_bytes(signature_content)
+            except OSError as error:
+                raise GenerationError(
+                    f"cannot normalize generated realization signature: {error}"
+                ) from error
+            invoke_signify(
+                [
+                    arguments.signify,
+                    "-V",
+                    "-p",
+                    str(arguments.trusted_key),
+                    "-x",
+                    str(signature_temporary),
+                    "-m",
+                    str(realization_object),
+                ],
+                f"generated realization signature from {key_id}",
+            )
+            directory = system / "signatures" / digest_name(realization_digest)
+            ensure_safe_directory(
+                directory,
+                "realization signature directory",
+                create=True,
+            )
+            destination = directory / f"{digest_name(key_id)}.sig"
+            if destination.exists() or destination.is_symlink():
+                require_regular_file(
+                    destination,
+                    f"realization signature from {key_id}",
+                )
+                if destination.read_bytes() != signature_content:
+                    raise GenerationError(
+                        "realization already has a different signature "
+                        f"from {key_id}"
+                    )
+            else:
+                atomic_write(destination, signature_content, 0o444)
+            verify_realization_signature(
+                system,
+                realization_digest,
+                [arguments.trusted_key],
+                arguments.signify,
+                required=True,
+            )
+        finally:
+            signature_temporary.unlink(missing_ok=True)
+
+        if arguments.activate:
+            select_digest(
+                system,
+                generation_digest,
+                arguments.expected_current,
+                require_realization=True,
+                require_signature=True,
+                trusted_keys=[arguments.trusted_key],
+                signify_command=arguments.signify,
+                verify_realization_images=False,
+            )
+    print(
+        f"signed realization {realization_digest} "
+        f"for generation {generation_digest} with {key_id}"
+    )
 
 
 def rollback_generation(arguments: argparse.Namespace) -> None:
@@ -798,20 +2791,44 @@ def generation_roles(system: Path, digest: str) -> list[str]:
 def inspect_generation(arguments: argparse.Namespace) -> None:
     system = state_system(arguments.state)
     digest = resolve_digest_argument(system, arguments.digest)
-    validate_published_generation(system, digest)
+    plan_digest = validate_published_generation(system, digest)
     contracts = load_contracts()
     manifest_path = system / "manifests" / f"{digest_name(digest)}.json"
     generation = read_contract(contracts, manifest_path, GENERATION_SCHEMA)
+    realization = validate_generation_realization(
+        system,
+        digest,
+        plan_digest,
+        generation,
+    )
+    portage_state = None
+    if generation["schema"] == GENERATION_V2_SCHEMA:
+        portage_state = read_object_contract(
+            contracts,
+            system,
+            {},
+            generation["portage_state_digest"],
+            PORTAGE_STATE_SCHEMA,
+        )
     result = {
+        "schema": generation["schema"],
         "generation_digest": digest,
+        "boot_plan_digest": plan_digest,
         "roles": generation_roles(system, digest),
         "target_id": generation["target_id"],
         "build_context_digest": generation["build_context_digest"],
+        "portage_state_digest": generation.get("portage_state_digest"),
+        "portage_state": portage_state,
+        "parent_generation_digest": generation.get(
+            "parent_generation_digest"
+        ),
         "base": generation["base"],
         "layer_count": len(generation["layers"]),
         "layers": generation["layers"],
         "compressed_size": generation["base"]["rootfs_size"]
         + sum(layer["rootfs_size"] for layer in generation["layers"]),
+        "realized": realization is not None,
+        "realization": realization,
         "valid": True,
     }
     print(json.dumps(result, sort_keys=True, separators=(",", ":")))
@@ -860,9 +2877,9 @@ def iter_digests(value: Any, field: str = "") -> Any:
 
 def load_json_object(path: Path) -> dict[str, Any] | None:
     try:
-        raw = path.read_bytes()
-        if len(raw) > 1024 * 1024:
+        if path.stat().st_size > 1024 * 1024:
             return None
+        raw = path.read_bytes()
         value = json.loads(raw.decode("utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError):
         return None
@@ -874,15 +2891,57 @@ def garbage_roots(system: Path) -> set[str]:
     for name in ("current", "previous"):
         digest = read_pointer(system, name, required=False)
         if digest is not None:
-            validate_published_generation(system, digest)
             roots.add(digest)
     for path in sorted((system / "pins").iterdir(), key=lambda item: item.name):
         if require_pin_name(path.name) != path.name:
             raise AssertionError("unreachable")
         digest = read_named_pointer(path, f"pin {path.name}")
-        validate_published_generation(system, digest)
         roots.add(digest)
     return roots
+
+
+def realization_referenced_objects(
+    realization: dict[str, Any],
+) -> set[str]:
+    receipt_digest = realization.get("tree_receipt_digest")
+    tree_receipt = realization.get("parent_tree_receipt")
+    validation_index_digest = (
+        tree_receipt.get("validation_index_digest")
+        if tree_receipt is not None
+        else None
+    )
+    tree_state_digest = (
+        tree_receipt.get("tree_state_digest")
+        if tree_receipt is not None
+        else None
+    )
+    images = realization["images"]
+    if images is None:
+        references = {realization["rootfs_digest"]}
+        if realization["verity"] is not None:
+            references.add(realization["verity"]["hash_digest"])
+        if receipt_digest is not None:
+            references.add(receipt_digest)
+        if validation_index_digest is not None:
+            references.add(validation_index_digest)
+        if tree_state_digest is not None:
+            references.add(tree_state_digest)
+        return references
+    references = {
+        digest
+        for image in images
+        for digest in (
+            image["rootfs_digest"],
+            image["verity"]["hash_digest"],
+        )
+    }
+    if receipt_digest is not None:
+        references.add(receipt_digest)
+    if validation_index_digest is not None:
+        references.add(validation_index_digest)
+    if tree_state_digest is not None:
+        references.add(tree_state_digest)
+    return references
 
 
 def mark_reachable(
@@ -925,6 +2984,19 @@ def mark_reachable(
             f"boot plan for {digest}",
         )
         object_queue.append(plan_digest)
+        realization = validate_generation_realization(
+            system,
+            digest,
+            plan_digest,
+            value,
+            verify_objects=False,
+        )
+        reachable_objects.add(plan_digest)
+        if realization is not None:
+            reachable_objects.add(realization["realization_digest"])
+            reachable_objects.update(
+                realization_referenced_objects(realization)
+            )
 
     while object_queue:
         digest = object_queue.pop()
@@ -964,8 +3036,69 @@ def mark_reachable(
                 f"boot plan for {generation_digest}",
             )
             object_queue.append(plan_digest)
+            realization = validate_generation_realization(
+                system,
+                generation_digest,
+                plan_digest,
+                manifest_value,
+                verify_objects=False,
+            )
+            reachable_objects.add(plan_digest)
+            if realization is not None:
+                reachable_objects.add(realization["realization_digest"])
+                reachable_objects.update(
+                    realization_referenced_objects(realization)
+                )
 
     return reachable_generations, reachable_objects
+
+
+def scrub_generations(arguments: argparse.Namespace) -> None:
+    system = state_system(arguments.state)
+    with mutation_lock(system):
+        roots = garbage_roots(system)
+        reachable_generations, reachable_objects = mark_reachable(system, roots)
+        trusted_signatures = 0
+        for generation_digest in sorted(reachable_generations):
+            contracts = load_contracts()
+            generation = read_contract(
+                contracts,
+                system
+                / "manifests"
+                / f"{digest_name(generation_digest)}.json",
+                GENERATION_SCHEMA,
+            )
+            plan_digest = read_named_pointer(
+                system / "plans" / digest_name(generation_digest),
+                f"boot plan for {generation_digest}",
+            )
+            realization = validate_generation_realization(
+                system,
+                generation_digest,
+                plan_digest,
+                generation,
+                required=arguments.require_signature,
+                verify_objects=False,
+            )
+            if realization is not None:
+                trusted_signatures += len(
+                    verify_realization_signature(
+                        system,
+                        realization["realization_digest"],
+                        arguments.trusted_key,
+                        arguments.signify,
+                        required=arguments.require_signature,
+                    )
+                )
+    result = {
+        "schema": "org.volatoo.system-scrub/v1",
+        "status": "verified",
+        "roots": len(roots),
+        "generations": len(reachable_generations),
+        "objects": len(reachable_objects),
+        "trusted_signatures": trusted_signatures,
+    }
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
 
 
 def digest_entries(
@@ -983,6 +3116,23 @@ def digest_entries(
     return entries
 
 
+def signature_directories(system: Path) -> dict[str, Path]:
+    entries: dict[str, Path] = {}
+    directory = system / "signatures"
+    for path in sorted(directory.iterdir(), key=lambda item: item.name):
+        if len(path.name) != 64 or any(
+            character not in "0123456789abcdef" for character in path.name
+        ):
+            raise GenerationError(
+                f"unsafe entry in realization signatures: {path.name}"
+            )
+        require_directory(path, "realization signature directory")
+        digest = DIGEST_PREFIX + path.name
+        realization_signature_records(system, digest)
+        entries[digest] = path
+    return entries
+
+
 def garbage_collection(arguments: argparse.Namespace) -> None:
     system = state_system(arguments.state)
     with mutation_lock(system):
@@ -995,12 +3145,18 @@ def garbage_collection(arguments: argparse.Namespace) -> None:
         manifests = digest_entries(system / "manifests", ".json")
         plans = digest_entries(system / "plans")
         objects = digest_entries(system / "objects/sha256")
+        realizations = digest_entries(system / "realizations")
+        signatures = signature_directories(system)
         activations = digest_entries(system / "activations", ".json")
         compactions = digest_entries(system / "compactions", ".json")
         garbage = {
             "manifests": sorted(set(manifests) - reachable_generations),
             "plans": sorted(set(plans) - reachable_generations),
             "objects": sorted(set(objects) - reachable_objects),
+            "realizations": sorted(
+                set(realizations) - reachable_generations
+            ),
+            "signatures": sorted(set(signatures) - reachable_objects),
             "activations": sorted(set(activations) - reachable_generations),
             "compactions": sorted(set(compactions) - reachable_generations),
         }
@@ -1013,10 +3169,27 @@ def garbage_collection(arguments: argparse.Namespace) -> None:
                 "manifests": manifests,
                 "plans": plans,
                 "objects": objects,
+                "realizations": realizations,
                 "activations": activations,
                 "compactions": compactions,
             }
             for category, digests in garbage.items():
+                if category == "signatures":
+                    for digest in digests:
+                        directory = signatures[digest]
+                        for signature in sorted(
+                            directory.iterdir(),
+                            key=lambda item: item.name,
+                        ):
+                            require_regular_file(
+                                signature,
+                                "garbage realization signature",
+                            )
+                            signature.unlink()
+                        directory.rmdir()
+                    if digests:
+                        fsync_directory(system / "signatures")
+                    continue
                 for digest in digests:
                     mappings[category][digest].unlink()
                 if digests:
@@ -1044,12 +3217,41 @@ def compact_manifest(arguments: argparse.Namespace) -> None:
     contracts = load_contracts()
     source_path = system / "manifests" / f"{digest_name(digest)}.json"
     source = read_contract(contracts, source_path, GENERATION_SCHEMA)
+    source_context = read_object_contract(
+        contracts,
+        system,
+        {},
+        source["build_context_digest"],
+        BUILD_CONTEXT_SCHEMA,
+    )
+    source_portage_state = None
+    if source["schema"] == GENERATION_V2_SCHEMA:
+        source_portage_state = read_object_contract(
+            contracts,
+            system,
+            {},
+            source["portage_state_digest"],
+            PORTAGE_STATE_SCHEMA,
+        )
     base_digest, base_size = digest_file(arguments.base)
     require_squashfs(arguments.base, base_size)
+    compacted_context = {
+        **source_context,
+        "base": {
+            "generation": f"compact-{digest_name(base_digest)[:16]}",
+            "rootfs_digest": base_digest,
+        },
+    }
+    if source_portage_state is not None:
+        compacted_context["world_digest"] = source_portage_state[
+            "world_digest"
+        ]
+    context_content = contracts["canonical_bytes"](compacted_context)
+    context_digest = digest_bytes(context_content)
     compacted = {
-        "schema": GENERATION_SCHEMA,
+        "schema": source["schema"],
         "target_id": source["target_id"],
-        "build_context_digest": source["build_context_digest"],
+        "build_context_digest": context_digest,
         "base": {
             "rootfs_digest": base_digest,
             "rootfs_size": base_size,
@@ -1057,15 +3259,37 @@ def compact_manifest(arguments: argparse.Namespace) -> None:
         },
         "layers": [],
     }
+    if source_portage_state is not None:
+        compacted["portage_state_digest"] = source[
+            "portage_state_digest"
+        ]
+        compacted["parent_generation_digest"] = None
+    try:
+        contracts["verify_generation_context"](
+            compacted,
+            compacted_context,
+            source_portage_state,
+        )
+    except RuntimeError as error:
+        raise GenerationError(str(error)) from error
     content = contracts["canonical_bytes"](compacted)
-    if arguments.output.exists() or arguments.output.is_symlink():
-        raise GenerationError(f"output already exists: {arguments.output}")
+    for output in (arguments.context_output, arguments.output):
+        if output.exists() or output.is_symlink():
+            raise GenerationError(f"output already exists: {output}")
+    if (
+        arguments.receipt is not None
+        and (
+            arguments.receipt.exists()
+            or arguments.receipt.is_symlink()
+        )
+    ):
+        raise GenerationError(f"output already exists: {arguments.receipt}")
     arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    arguments.context_output.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write(arguments.context_output, context_content)
     atomic_write(arguments.output, content)
     compacted_digest = digest_bytes(content)
     if arguments.receipt is not None:
-        if arguments.receipt.exists() or arguments.receipt.is_symlink():
-            raise GenerationError(f"output already exists: {arguments.receipt}")
         digest_name(arguments.tree_digest)
         receipt = {
             "schema": COMPACTION_SCHEMA,
@@ -1216,12 +3440,139 @@ def parse_arguments() -> argparse.Namespace:
         help="referenced object to verify and publish; repeat as needed",
     )
     publish.add_argument("--activate", action="store_true")
+    publish.add_argument(
+        "--require-realization",
+        action="store_true",
+        help="reject activation unless a realized closure is published",
+    )
+    publish.add_argument(
+        "--expected-current",
+        type=expected_current_value,
+        default=EXPECTED_CURRENT_UNSET,
+        metavar="DIGEST|none",
+        help="current generation required before activation",
+    )
     publish.set_defaults(handler=publish_generation)
 
     select = subparsers.add_parser("select")
     select.add_argument("--state", type=Path, required=True)
+    select.add_argument(
+        "--expected-current",
+        type=expected_current_value,
+        default=EXPECTED_CURRENT_UNSET,
+        metavar="DIGEST|none",
+        help="current generation required before selection",
+    )
+    select.add_argument(
+        "--require-realization",
+        action="store_true",
+        help="reject selection unless a realized closure is published",
+    )
+    select.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="require a realization signature from --trusted-key",
+    )
+    select.add_argument(
+        "--trusted-key",
+        action="append",
+        type=Path,
+        default=[],
+        help="trusted signify public key; repeat during key rotation",
+    )
+    select.add_argument(
+        "--signify",
+        default="signify",
+        help="signify executable used for verification",
+    )
     select.add_argument("digest")
     select.set_defaults(handler=select_generation)
+
+    realize = subparsers.add_parser("record-realization")
+    realize.add_argument("--state", type=Path, required=True)
+    realize.add_argument(
+        "--generation",
+        dest="digest",
+        default="current",
+        help="generation digest, current (default), or previous",
+    )
+    realize.add_argument("--boot-plan-digest", required=True)
+    realize.add_argument("--rootfs", type=Path, required=True)
+    realize.add_argument("--tree-digest", required=True)
+    realize.add_argument("--fhs-contract", required=True)
+    realize.add_argument(
+        "--verity-hash",
+        type=Path,
+        help="dm-verity hash tree; enables the realization-v2 contract",
+    )
+    realize.add_argument("--verity-root-hash")
+    realize.add_argument("--verity-salt")
+    realize.add_argument("--verity-data-blocks", type=int)
+    realize.add_argument("--activate", action="store_true")
+    realize.add_argument(
+        "--expected-current",
+        type=expected_current_value,
+        default=EXPECTED_CURRENT_UNSET,
+        metavar="DIGEST|none",
+        help="current generation required before activation",
+    )
+    realize.set_defaults(handler=record_realization)
+
+    incremental = subparsers.add_parser("record-incremental-realization")
+    incremental.add_argument("--state", type=Path, required=True)
+    incremental.add_argument(
+        "--generation",
+        dest="digest",
+        default="current",
+        help="generation digest, current (default), or previous",
+    )
+    incremental.add_argument(
+        "--plan",
+        type=Path,
+        required=True,
+        help="canonical realization-v3 plan",
+    )
+    incremental.add_argument(
+        "--object",
+        action="append",
+        type=Path,
+        default=[],
+        help="rootfs or verity object referenced by the plan; repeat as needed",
+    )
+    incremental.add_argument("--activate", action="store_true")
+    incremental.add_argument(
+        "--expected-current",
+        type=expected_current_value,
+        default=EXPECTED_CURRENT_UNSET,
+        metavar="DIGEST|none",
+        help="current generation required before activation",
+    )
+    incremental.set_defaults(handler=record_incremental_realization)
+
+    sign = subparsers.add_parser("sign-realization")
+    sign.add_argument("--state", type=Path, required=True)
+    sign.add_argument(
+        "--generation",
+        dest="digest",
+        default="current",
+        help="generation digest, current (default), or previous",
+    )
+    sign.add_argument("--secret-key", type=Path, required=True)
+    sign.add_argument("--trusted-key", type=Path, required=True)
+    sign.add_argument(
+        "--signify",
+        default="signify",
+        help="signify executable used for signing and verification",
+    )
+    sign.add_argument("--activate", action="store_true")
+    sign.add_argument(
+        "--expected-current",
+        type=expected_current_value,
+        default=EXPECTED_CURRENT_UNSET,
+        metavar="DIGEST|none",
+        help="current generation required before activation",
+    )
+    sign.set_defaults(handler=sign_realization)
 
     rollback = subparsers.add_parser("rollback")
     rollback.add_argument("--state", type=Path, required=True)
@@ -1282,6 +3633,27 @@ def parse_arguments() -> argparse.Namespace:
     )
     gc.set_defaults(handler=garbage_collection)
 
+    scrub = subparsers.add_parser("scrub")
+    scrub.add_argument("--state", type=Path, required=True)
+    scrub.add_argument(
+        "--trusted-key",
+        action="append",
+        type=Path,
+        default=[],
+        help="trusted signify public key; repeat during key rotation",
+    )
+    scrub.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="require every reachable root to have a trusted signature",
+    )
+    scrub.add_argument(
+        "--signify",
+        default="signify",
+        help="signify executable used for verification",
+    )
+    scrub.set_defaults(handler=scrub_generations)
+
     compact = subparsers.add_parser("compact-manifest")
     compact.add_argument("--state", type=Path, required=True)
     compact.add_argument(
@@ -1291,6 +3663,7 @@ def parse_arguments() -> argparse.Namespace:
         help="generation digest, current (default), or previous",
     )
     compact.add_argument("--base", type=Path, required=True)
+    compact.add_argument("--context-output", type=Path, required=True)
     compact.add_argument("--output", type=Path, required=True)
     compact.add_argument("--receipt", type=Path)
     compact.add_argument(
@@ -1309,6 +3682,75 @@ def parse_arguments() -> argparse.Namespace:
 def main() -> int:
     arguments = parse_arguments()
     try:
+        if arguments.command == "publish":
+            if (
+                arguments.activate
+                and arguments.expected_current is EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--activate requires --expected-current DIGEST|none"
+                )
+            if (
+                not arguments.activate
+                and arguments.expected_current is not EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--expected-current requires --activate"
+                )
+        if (
+            arguments.command == "select"
+            and arguments.expected_current is EXPECTED_CURRENT_UNSET
+        ):
+            raise GenerationError(
+                "select requires --expected-current DIGEST|none"
+            )
+        if arguments.command == "select":
+            if arguments.require_signature and not arguments.trusted_key:
+                raise GenerationError(
+                    "--require-signature requires at least one --trusted-key"
+                )
+            if arguments.trusted_key and not arguments.require_signature:
+                raise GenerationError(
+                    "--trusted-key requires --require-signature"
+                )
+        if arguments.command == "record-realization":
+            if (
+                arguments.activate
+                and arguments.expected_current is EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--activate requires --expected-current DIGEST|none"
+                )
+            if (
+                not arguments.activate
+                and arguments.expected_current is not EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--expected-current requires --activate"
+                )
+        if arguments.command == "sign-realization":
+            if (
+                arguments.activate
+                and arguments.expected_current is EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--activate requires --expected-current DIGEST|none"
+                )
+            if (
+                not arguments.activate
+                and arguments.expected_current is not EXPECTED_CURRENT_UNSET
+            ):
+                raise GenerationError(
+                    "--expected-current requires --activate"
+                )
+        if (
+            arguments.command == "scrub"
+            and arguments.require_signature
+            and not arguments.trusted_key
+        ):
+            raise GenerationError(
+                "--require-signature requires at least one --trusted-key"
+            )
         if arguments.command == "compact-manifest":
             if (arguments.receipt is None) != (arguments.tree_digest is None):
                 raise GenerationError(

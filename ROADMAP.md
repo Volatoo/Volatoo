@@ -1,6 +1,8 @@
 # Volatoo Roadmap
 
-Goal: a Gentoo-based distribution whose root filesystem is a tmpfs, populated at boot from a compressed image, with declarative opt-in persistence.
+Goal: a Gentoo-based distribution with NixOS-style immutable,
+content-addressed system generations, a persistent read-only system lower, a
+disposable tmpfs writable root, and declarative opt-in persistence.
 
 Phases are sequential; each ends with something bootable or measurable.
 
@@ -50,7 +52,13 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Parameterize signed stage3 resolution and Catalyst spec rendering
   - [x] Add init-specific persistence integration to both image roots
   - [x] Complete the first systemd Catalyst build and overlay-root BIOS/UEFI boot
-  - [ ] Complete the default full-copy systemd boot performance Gate
+  - [x] Retire full-copy as the release-default candidate after performance data
+    - [x] Add an auditable native x86_64/KVM root-mode benchmark
+    - [x] Select persistent `store-overlay` as the NixOS-style release default
+    - [ ] Record reference-hardware `store-overlay` boot and memory metrics
+  - [x] Cover generation payloads in store/copy/RAM overlays and selectable firmware QEMU lanes
+  - [x] Add a RAM-backed SquashFS overlay that releases the source image device
+  - [x] Add an explicit store-backed overlay and make it the default root mode
 - [ ] Let installers and image tooling select `openrc` or `systemd` explicitly
 - [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
 - [ ] Run the image, boot, update and rollback CI matrix against both init systems
@@ -73,7 +81,41 @@ system generations. See `docs/design/atomic-package-updates.md`.
   - [x] Add generation pinning, inspection and mark-and-sweep garbage collection
   - [x] Add verified Docker base compaction and compaction receipts
   - [x] Add the canonical Portage Engine adapter and mocked control-plane Gate
+  - [x] Require complete generation provenance, parent-chain validation and CAS activation
+  - [x] Reconstruct and verify the selected parent before planning or composing a layer
+  - [x] Model Portage config, world, repository and toolchain transitions in generation v2
+  - [x] Realize one complete immutable system closure before generation activation
+  - [x] Boot a realized closure without replaying package layers or tombstones
+  - [x] Enforce the Gentoo/FHS runtime contract before closure realization
+    - [x] Resolve ABI-compatible ELF `DT_NEEDED` providers inside the closure
+  - [x] Expose the system store read-only to the host and give only the update
+        service a private writable publication view
+  - [x] Add authenticated lazy reads with dm-verity and move full object
+        hashing from every boot to import/scrub
+    - [x] Publish deterministic verity trees in realization v2
+    - [x] Reject data-block and hash-tree tampering in QEMU
+  - [x] Publish an incremental realization that authenticates the base and
+        FHS update layers independently, reserving full closure rebuilds for
+        compaction and release images
+    - [x] Reuse verified dm-verity metadata for unchanged v3 base and layer
+          images instead of rebuilding their hash trees for every descendant
+    - [x] Retain the materializer's verified object snapshots for the rest of
+          one realization instead of rereading mutable state paths
+    - [x] Bind an authenticated parent-tree receipt to v3 and avoid repeated
+          publication hashing for exact direct-parent inherited objects
+    - [x] Replace ordinary complete-tree snapshot hashing with receipt-v3
+          compositional tree state bound to the plan and validation index
+    - [x] Validate affected FHS/ELF state from the authenticated parent tree
+      - [x] Bind a canonical path and ELF validation index from the receipt
+      - [x] Merge direct-parent index state with tombstones and changed paths
+            and retain periodic independent full-tree validation
+      - [x] Scan only the new layer and re-evaluate affected shebang, loader
+            and ELF dependency edges against the merged parent index
   - [ ] Publish stable OpenRC/systemd Engine targets and run the real signed E2E
+    - [x] Authenticate exact realization plans with an initramfs-embedded
+          Ed25519 trust key before accepting dm-verity root hashes
+    - [x] Boot signed OpenRC and systemd realization-v3 fixtures with their real
+          PID 1 under BIOS and UEFI in the OrbStack QEMU runner
 
 ## Phase 4 — Installable release
 

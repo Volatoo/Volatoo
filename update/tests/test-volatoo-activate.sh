@@ -6,6 +6,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 generation_tool=$repo_root/update/volatoo-generation
 activation_tool=$repo_root/update/volatoo-activate
 manifest=$repo_root/update/volatoo-manifest
+fixture_tool=$repo_root/update/tests/make-generation-fixture.py
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-activate-test.XXXXXX")
 
 cleanup()
@@ -18,17 +19,6 @@ fail()
 {
 	echo "error: $*" >&2
 	exit 1
-}
-
-raw_digest()
-{
-	python3 - "$1" <<'PY'
-import hashlib
-import pathlib
-import sys
-
-print("sha256:" + hashlib.sha256(pathlib.Path(sys.argv[1]).read_bytes()).hexdigest())
-PY
 }
 
 canonical_digest()
@@ -53,38 +43,25 @@ mkdir -p \
 printf '1\n' >"$state/volatoo/layout-version"
 "$generation_tool" migrate-state --state "$state" >/dev/null
 
-"$manifest" canonicalize \
-	"$repo_root/update/examples/build-context-v1.json" \
-	>"$work_dir/context.json"
-target_id=$(jq -r '.target.id' "$work_dir/context.json")
-context_digest=$(canonical_digest "$work_dir/context.json")
 printf 'hsqsactivation-base\n' >"$work_dir/base.squashfs"
-base_digest=$(raw_digest "$work_dir/base.squashfs")
-base_size=$(wc -c <"$work_dir/base.squashfs" | tr -d ' ')
-jq -n \
-	--arg target "$target_id" \
-	--arg context "$context_digest" \
-	--arg base "$base_digest" \
-	--argjson size "$base_size" \
-	'{
-	  schema: "org.volatoo.generation/v1",
-	  target_id: $target,
-	  build_context_digest: $context,
-	  base: {
-	    rootfs_digest: $base,
-	    rootfs_size: $size,
-	    format: "squashfs"
-	  },
-	  layers: []
-	}' |
-	"$manifest" canonicalize - >"$work_dir/generation-0.json"
+python3 "$fixture_tool" context \
+	--build-context "$repo_root/update/examples/build-context-v1.json" \
+	--base "$work_dir/base.squashfs" \
+	--output-dir "$work_dir/provenance"
+context=$work_dir/provenance/build-context.json
+build_spec=$work_dir/provenance/build-spec.json
+source_catalog=$work_dir/provenance/source-catalog.json
+acquisition=$work_dir/provenance/acquisition.json
+base_generation=$work_dir/provenance/base-generation.json
+target_id=$(jq -r '.target.id' "$context")
 "$generation_tool" publish \
 	--state "$state" \
-	--generation "$work_dir/generation-0.json" \
-	--object "$work_dir/context.json" \
+	--generation "$base_generation" \
+	--object "$context" \
 	--object "$work_dir/base.squashfs" \
-	--activate >/dev/null
-generation_zero=$(canonical_digest "$work_dir/generation-0.json")
+	--activate \
+	--expected-current none >/dev/null
+generation_zero=$(canonical_digest "$base_generation")
 printf '%s\n' "$generation_zero" >"$root/.volatoo/generation-id"
 printf 'old-binary\n' >"$root/usr/bin/web"
 printf 'old-config\n' >"$root/etc/web.conf"
@@ -99,17 +76,9 @@ make_candidate()
 	local layer=$work_dir/layer-$number.squashfs
 	local changed=$work_dir/changed-$number.json
 	local tombstones=$work_dir/tombstones-$number.json
-	local transaction=$work_dir/transaction-$number.json
-	local generation=$work_dir/generation-$number.json
-	local layer_digest
-	local layer_size
-	local changed_digest
-	local tombstones_digest
-	local transaction_digest
+	local output=$work_dir/candidate-$number
 
 	printf 'hsqsactivation-layer-%s\n' "$number" >"$layer"
-	layer_digest=$(raw_digest "$layer")
-	layer_size=$(wc -c <"$layer" | tr -d ' ')
 	jq -n \
 		--arg target "$target_id" \
 		'{
@@ -130,7 +99,6 @@ make_candidate()
 		  ]
 		}' |
 		"$manifest" canonicalize - >"$changed"
-	changed_digest=$(canonical_digest "$changed")
 	jq -n \
 		--arg target "$target_id" \
 		'{
@@ -139,55 +107,34 @@ make_candidate()
 		  paths: ["/etc/obsolete"]
 		}' |
 		"$manifest" canonicalize - >"$tombstones"
-	tombstones_digest=$(canonical_digest "$tombstones")
-	jq \
-		--arg target "$target_id" \
-		--arg context "$context_digest" \
-		--arg parent "$parent" \
-		--arg layer "$layer_digest" \
-		--argjson size "$layer_size" \
-		--arg changed "$changed_digest" \
-		--arg tombstones "$tombstones_digest" \
-		'
-		.target_id = $target
-		| .build_context_digest = $context
-		| .parent_generation_digest = $parent
-		| .filesystem.rootfs_digest = $layer
-		| .filesystem.rootfs_size = $size
-		| .filesystem.changed_paths_digest = $changed
-		| .filesystem.changed_paths_count = 11
-		| .filesystem.tombstones_digest = $tombstones
-		| .filesystem.tombstones_count = 1
-		' \
-		"$repo_root/update/examples/layer-transaction-v1.json" |
-		"$manifest" canonicalize - >"$transaction"
-	transaction_digest=$(canonical_digest "$transaction")
-	jq \
-		--arg layer "$layer_digest" \
-		--argjson size "$layer_size" \
-		--arg tombstones "$tombstones_digest" \
-		--arg transaction "$transaction_digest" \
-		'.layers += [{
-		  rootfs_digest: $layer,
-		  rootfs_size: $size,
-		  format: "squashfs",
-		  tombstones_digest: $tombstones,
-		  transaction_digest: $transaction
-		}]' \
-		"$parent_manifest" |
-		"$manifest" canonicalize - >"$generation"
+	python3 "$fixture_tool" layer \
+		--generation-version 2 \
+		--build-context "$context" \
+		--build-spec "$build_spec" \
+		--acquisition "$acquisition" \
+		--parent "$parent_manifest" \
+		--changed-paths "$changed" \
+		--tombstones "$tombstones" \
+		--layer "$layer" \
+		--output-dir "$output"
 	"$generation_tool" publish \
 		--state "$state" \
-		--generation "$generation" \
+		--generation "$output/generation.json" \
+		--object "$context" \
+		--object "$build_spec" \
+		--object "$source_catalog" \
+		--object "$acquisition" \
 		--object "$layer" \
 		--object "$changed" \
 		--object "$tombstones" \
-		--object "$transaction" \
-		--activate >/dev/null
+		--object "$output/transaction.json" \
+		--object "$output/portage-state.json" \
+		--activate \
+		--expected-current "$parent" >/dev/null
 }
 
-make_candidate 1 "$generation_zero" "$work_dir/generation-0.json"
-generation_one=$(canonical_digest "$work_dir/generation-1.json")
+make_candidate 1 "$generation_zero" "$base_generation"
+generation_one=$(canonical_digest "$work_dir/candidate-1/generation.json")
 
 mkdir -p \
 	"$work_dir/prepared-1/etc" \
@@ -295,8 +242,8 @@ jq -e \
 [[ -f $system/activations/${generation_one#sha256:}.json ]] ||
 	fail "successful activation receipt is missing"
 
-make_candidate 2 "$generation_one" "$work_dir/generation-1.json"
-generation_two=$(canonical_digest "$work_dir/generation-2.json")
+make_candidate 2 "$generation_one" "$work_dir/candidate-1/generation.json"
+generation_two=$(canonical_digest "$work_dir/candidate-2/generation.json")
 mkdir -p \
 	"$work_dir/prepared-2/etc" \
 	"$work_dir/prepared-2/usr/bin" \

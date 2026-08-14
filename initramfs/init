@@ -22,6 +22,7 @@ rescue_shell() {
 	echo "loop device: ${loop_device:-none}"
 	echo "expected sha256: ${image_sha256:-not configured}"
 	echo "actual sha256: ${actual_image_sha256:-not computed}"
+	echo "RAM image sha256: ${ram_image_sha256:-not computed}"
 	echo "root mode: ${root_mode:-unset}"
 	echo "target init: ${target_init:-unset}"
 	echo "tmpfs size: ${tmpfs_size:-unset}"
@@ -29,9 +30,18 @@ rescue_shell() {
 	echo "state required: ${state_required:-unset}"
 	echo "state device: ${state_device:-not found}"
 	echo "state mounted: ${state_mounted:-0}"
+	echo "system store read-only: ${system_store_readonly:-0}"
 	echo "system layout: ${system_layout_version:-none}"
 	echo "generation mode: ${generation_mode:-unset}"
+	echo "signature policy: ${signature_policy:-unset}"
+	echo "release signature verified: ${generation_signature_verified:-0}"
+	echo "signature key: ${generation_signature_key_id:-none}"
 	echo "generation selected: ${generation_digest:-legacy image}"
+	echo "generation realized: ${generation_realized:-0}"
+	echo "realization: ${generation_realization_digest:-none}"
+	echo "realization contract: ${generation_realization_version:-none}"
+	echo "dm-verity: ${generation_verity:-0}"
+	echo "FHS contract: ${generation_fhs_contract:-none}"
 	echo "generation error: ${generation_error:-none}"
 	echo
 	echo "=== Block devices and filesystems ==="
@@ -85,6 +95,29 @@ load_module() {
 	else
 		modprobe "$module" 2>/dev/null || true
 	fi
+}
+
+protect_system_store() {
+	state_root=$1
+	system_path=$state_root/volatoo/system
+	if [ ! -e "$system_path" ] && [ ! -L "$system_path" ]; then
+		return
+	fi
+	if [ -L "$system_path" ] || [ ! -d "$system_path" ]; then
+		fatal state.system-store \
+			"system store is not a safe directory"
+	fi
+	if ! mount --bind "$system_path" "$system_path"; then
+		fatal state.system-store \
+			"could not create the system-store protection mount"
+	fi
+	if ! mount -o remount,bind,ro "$system_path"; then
+		umount "$system_path" 2>/dev/null || true
+		fatal state.system-store \
+			"could not make the public system store read-only"
+	fi
+	system_store_readonly=1
+	echo "[volatoo] public system store mounted read-only"
 }
 
 resolve_device_spec() {
@@ -403,6 +436,52 @@ valid_generation_digest() {
 	esac
 }
 
+valid_sha256_hex() {
+	candidate_sha256=$1
+	if [ "${#candidate_sha256}" -ne 64 ]; then
+		return 1
+	fi
+	case $candidate_sha256 in
+		'' | *[!0-9a-f]*) return 1 ;;
+	esac
+}
+
+valid_positive_decimal() {
+	case $1 in
+		'' | 0* | *[!0-9]*) return 1 ;;
+		*) return 0 ;;
+	esac
+}
+
+valid_nonnegative_decimal() {
+	case $1 in
+		0 | [1-9] | [1-9][0-9]*) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+verify_generation_file_shape() {
+	verify_path=$1
+	verify_size=$2
+
+	if [ -L "$verify_path" ] || [ ! -f "$verify_path" ]; then
+		generation_error="missing or unsafe object: $verify_path"
+		return 1
+	fi
+	if ! valid_positive_decimal "$verify_size"; then
+		generation_error="object has invalid declared size: $verify_path"
+		return 1
+	fi
+	if ! actual_size=$(stat -c %s "$verify_path" 2>/dev/null); then
+		generation_error="could not inspect object size: $verify_path"
+		return 1
+	fi
+	if [ "$actual_size" -ne "$verify_size" ]; then
+		generation_error="object size mismatch: $verify_path"
+		return 1
+	fi
+}
+
 verify_generation_file() {
 	verify_path=$1
 	verify_digest=$2
@@ -431,7 +510,10 @@ verify_generation_file() {
 			generation_error="object has invalid declared size: $verify_path"
 			return 1
 		fi
-		actual_size=$(wc -c <"$verify_path")
+		if ! actual_size=$(stat -c %s "$verify_path" 2>/dev/null); then
+			generation_error="could not inspect object size: $verify_path"
+			return 1
+		fi
 		if [ "$actual_size" -ne "$verify_size" ]; then
 			generation_error="object size mismatch: $verify_path"
 			return 1
@@ -439,10 +521,554 @@ verify_generation_file() {
 	fi
 }
 
+verify_generation_realization_signature() {
+	signed_realization_path=$1
+	signed_realization_digest=$2
+	signature_directory=/state/volatoo/system/signatures/${signed_realization_digest#sha256:}
+	signature_key_count=0
+	signature_match_count=0
+	signature_invalid=0
+
+	if [ -L "$signature_directory" ] || \
+		{ [ -e "$signature_directory" ] && [ ! -d "$signature_directory" ]; }; then
+		generation_error="realization signature directory is unsafe"
+		return 1
+	fi
+	if ! command -v signify >/dev/null 2>&1; then
+		if [ "$signature_policy" = required ]; then
+			generation_error="required realization signature verifier is unavailable"
+			return 1
+		fi
+		echo "[volatoo] warning: signify is unavailable; accepting unsigned development generation"
+		return 0
+	fi
+
+	for trusted_key in /etc/volatoo/trusted.d/*.pub; do
+		if [ ! -e "$trusted_key" ] && [ ! -L "$trusted_key" ]; then
+			continue
+		fi
+		if [ -L "$trusted_key" ] || [ ! -f "$trusted_key" ]; then
+			generation_error="embedded realization trust key is unsafe"
+			return 1
+		fi
+		signature_key_name=${trusted_key##*/}
+		signature_key_hex=${signature_key_name%.pub}
+		if [ "$signature_key_name" = "$signature_key_hex" ] || \
+			! valid_sha256_hex "$signature_key_hex"; then
+			generation_error="embedded realization trust key name is malformed"
+			return 1
+		fi
+		if ! signature_key_checksum=$(sha256sum "$trusted_key" 2>/dev/null) || \
+			[ "${signature_key_checksum%% *}" != "$signature_key_hex" ]; then
+			generation_error="embedded realization trust key digest differs"
+			return 1
+		fi
+		signature_key_count=$((signature_key_count + 1))
+		signature_path=$signature_directory/$signature_key_hex.sig
+		if [ ! -e "$signature_path" ] && [ ! -L "$signature_path" ]; then
+			continue
+		fi
+		signature_match_count=$((signature_match_count + 1))
+		if [ -L "$signature_path" ] || [ ! -f "$signature_path" ]; then
+			generation_error="realization signature is unsafe"
+			return 1
+		fi
+		if signify -V \
+			-p "$trusted_key" \
+			-x "$signature_path" \
+			-m "$signed_realization_path" \
+			>/dev/null 2>&1; then
+			generation_signature_verified=1
+			generation_signature_key_id=sha256:$signature_key_hex
+			echo "[volatoo] realization signature verified: $generation_signature_key_id"
+			return 0
+		fi
+		signature_invalid=1
+	done
+
+	if [ "$signature_invalid" -eq 1 ]; then
+		generation_error="realization signature from a trusted key is invalid"
+		return 1
+	fi
+	if [ "$signature_policy" = required ]; then
+		if [ "$signature_key_count" -eq 0 ]; then
+			generation_error="no realization trust key is embedded"
+		elif [ "$signature_match_count" -eq 0 ]; then
+			generation_error="realization has no signature from an embedded trust key"
+		else
+			generation_error="realization signature verification failed"
+		fi
+		return 1
+	fi
+	echo "[volatoo] warning: accepting unsigned development realization"
+	return 0
+}
+
 generation_object_path() {
 	object_digest=$1
 	printf '/state/volatoo/system/objects/sha256/%s\n' \
-		"${object_digest#sha256:}"
+			"${object_digest#sha256:}"
+}
+
+prepare_incremental_realization() {
+	rm -f /generation/realization-images
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="incremental realization has no tree record"
+		return 1
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != tree ] || \
+		! valid_generation_digest "$2"; then
+		generation_error="incremental realization tree record is malformed"
+		return 1
+	fi
+	generation_realization_tree_digest=$2
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="incremental realization has no FHS contract"
+		return 1
+	fi
+	case $realization_line in
+		tree-receipt\ *)
+			set -f
+			# shellcheck disable=SC2086
+			set -- $realization_line
+			set +f
+			if [ "$#" -ne 2 ] || [ "$1" != tree-receipt ] || \
+				! valid_generation_digest "$2"; then
+				generation_error="incremental parent-tree receipt record is malformed"
+				return 1
+			fi
+			generation_parent_tree_receipt_digest=$2
+			generation_parent_tree_receipt_path=$(
+				generation_object_path "$generation_parent_tree_receipt_digest"
+			)
+			if ! verify_generation_file \
+				"$generation_parent_tree_receipt_path" \
+				"$generation_parent_tree_receipt_digest"; then
+				return 1
+			fi
+			if ! IFS= read -r realization_line <&5; then
+				generation_error="incremental realization has no FHS contract"
+				return 1
+			fi
+			;;
+	esac
+	if [ "$realization_line" != "fhs org.volatoo.gentoo-fhs/v1" ]; then
+		generation_error="incremental realization FHS contract is unsupported"
+		return 1
+	fi
+	generation_fhs_contract=org.volatoo.gentoo-fhs/v1
+	if ! IFS= read -r realization_line <&5 || \
+		[ "$realization_line" != \
+			"composition overlayfs-lowerdir whiteout-char-0-0" ]; then
+		generation_error="incremental realization composition is unsupported"
+		return 1
+	fi
+
+	expected_image_sequence=0
+	while IFS= read -r realization_line <&5; do
+		if [ "$realization_line" = \
+			"verity-format 1 sha256 4096 4096 no-superblock" ]; then
+			break
+		fi
+		set -f
+		# Intentional splitting parses the token-only image record.
+		# shellcheck disable=SC2086
+		set -- $realization_line
+		set +f
+		if [ "$#" -ne 11 ] || [ "$1" != image ] || \
+			! valid_nonnegative_decimal "$2" || \
+			[ "$2" -ne "$expected_image_sequence" ] || \
+			! valid_generation_digest "$4" || \
+			! valid_generation_digest "$5" || \
+			! valid_positive_decimal "$6" || \
+			! valid_generation_digest "$7" || \
+			! valid_positive_decimal "$8" || \
+			! valid_sha256_hex "$9" || \
+			! valid_sha256_hex "${10}" || \
+			! valid_positive_decimal "${11}"; then
+			generation_error="incremental realization image record is malformed"
+			return 1
+		fi
+		if [ "$expected_image_sequence" -eq 0 ]; then
+			if [ "$3" != base ] || [ "$4" != "$5" ]; then
+				generation_error="incremental realization base binding differs"
+				return 1
+			fi
+		elif [ "$3" != layer ]; then
+			generation_error="incremental realization image order differs"
+			return 1
+		fi
+		incremental_rootfs_size=$6
+		incremental_hash_size=$8
+		incremental_data_blocks=${11}
+		if [ "$expected_image_sequence" -gt 64 ] || \
+			[ "${#incremental_rootfs_size}" -gt 12 ] || \
+			[ "${#incremental_hash_size}" -gt 12 ] || \
+			[ "${#incremental_data_blocks}" -gt 12 ] || \
+			[ $((incremental_rootfs_size % 4096)) -ne 0 ] || \
+			[ $((incremental_hash_size % 4096)) -ne 0 ] || \
+			[ $((incremental_rootfs_size / 4096)) -ne \
+				"$incremental_data_blocks" ]; then
+			generation_error="incremental realization image geometry is invalid"
+			return 1
+		fi
+		incremental_rootfs_path=$(generation_object_path "$5")
+		incremental_hash_path=$(generation_object_path "$7")
+		if ! verify_generation_file_shape \
+			"$incremental_rootfs_path" "$6" || \
+			! verify_generation_file_shape \
+				"$incremental_hash_path" "$8"; then
+			return 1
+		fi
+		printf '%s %s %s %s %s %s %s %s %s %s %s\n' \
+			"$2" \
+			"$3" \
+			"$5" \
+			"$6" \
+			"$incremental_rootfs_path" \
+			"$7" \
+			"$8" \
+			"$incremental_hash_path" \
+			"$9" \
+			"${10}" \
+			"${11}" \
+			>>/generation/realization-images
+		expected_image_sequence=$((expected_image_sequence + 1))
+	done
+	if [ "$realization_line" != \
+		"verity-format 1 sha256 4096 4096 no-superblock" ] || \
+		[ "$expected_image_sequence" -eq 0 ]; then
+		generation_error="incremental realization has no complete image stack"
+		return 1
+	fi
+	if ! IFS= read -r realization_line <&5 || \
+		[ "$realization_line" != \
+			"builder squashfs-tools 4.7.5 zstd 19 1048576 reproducible" ]; then
+		generation_error="incremental realization builder is unsupported"
+		return 1
+	fi
+	if ! IFS= read -r realization_line <&5 || \
+		[ "$realization_line" != end ]; then
+		generation_error="incremental realization has no end record"
+		return 1
+	fi
+	if IFS= read -r _ <&5; then
+		generation_error="incremental realization contains records after end"
+		return 1
+	fi
+	IFS=' ' read -r \
+		_incremental_sequence \
+		_incremental_kind \
+		generation_base_digest \
+		generation_base_size \
+		generation_base_path \
+		_incremental_rest \
+		</generation/realization-images
+	generation_incremental=1
+	generation_incremental_image_count=$expected_image_sequence
+	generation_layer_count=0
+	generation_realized=1
+	generation_verity=1
+	echo "[volatoo] incremental authenticated realization selected: $expected_image_sequence images"
+	return 0
+}
+
+prepare_generation_realization() {
+	realization_generation=$1
+	realization_plan_digest=$2
+	realization_target_id=$3
+	realization_context_digest=$4
+	realization_name=${realization_generation#sha256:}
+	realization_pointer=/state/volatoo/system/realizations/$realization_name
+
+	if [ ! -e "$realization_pointer" ] && [ ! -L "$realization_pointer" ]; then
+		return 1
+	fi
+	if [ -L "$realization_pointer" ] || [ ! -f "$realization_pointer" ]; then
+		generation_error="realization pointer is unsafe"
+		return 2
+	fi
+	realization_pointer_lines=$(wc -l <"$realization_pointer")
+	if [ "$realization_pointer_lines" -ne 1 ] || \
+		! IFS= read -r generation_realization_digest \
+			<"$realization_pointer" || \
+		! valid_generation_digest "$generation_realization_digest"; then
+		generation_error="realization pointer is malformed"
+		return 2
+	fi
+	generation_realization_plan=$(
+		generation_object_path "$generation_realization_digest"
+	)
+	if ! verify_generation_file \
+		"$generation_realization_plan" \
+		"$generation_realization_digest"; then
+		return 2
+	fi
+	if ! verify_generation_realization_signature \
+		"$generation_realization_plan" \
+		"$generation_realization_digest"; then
+		return 2
+	fi
+
+	exec 5<"$generation_realization_plan"
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has an invalid header"
+		exec 5<&-
+		return 2
+	fi
+	case $realization_line in
+		VOLATOO_REALIZATION_V1) generation_realization_version=1 ;;
+		VOLATOO_REALIZATION_V2) generation_realization_version=2 ;;
+		VOLATOO_REALIZATION_V3) generation_realization_version=3 ;;
+		*)
+			generation_error="realization plan has an invalid header"
+			exec 5<&-
+			return 2
+			;;
+	esac
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no generation record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# Intentional splitting parses the token-only realization records.
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != generation ] || \
+		[ "$2" != "$realization_generation" ]; then
+		generation_error="realization generation binding differs"
+		exec 5<&-
+		return 2
+	fi
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no boot-plan record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != boot-plan ] || \
+		[ "$2" != "$realization_plan_digest" ]; then
+		generation_error="realization boot-plan binding differs"
+		exec 5<&-
+		return 2
+	fi
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no target record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != target ] || \
+		[ "$2" != "$realization_target_id" ]; then
+		generation_error="realization target binding differs"
+		exec 5<&-
+		return 2
+	fi
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no context record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != context ] || \
+		[ "$2" != "$realization_context_digest" ]; then
+		generation_error="realization context binding differs"
+		exec 5<&-
+		return 2
+	fi
+	if [ "$generation_realization_version" -eq 3 ]; then
+		if ! prepare_incremental_realization; then
+			exec 5<&-
+			return 2
+		fi
+		exec 5<&-
+		return 0
+	fi
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no rootfs record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 3 ] || [ "$1" != rootfs ] || \
+		! valid_generation_digest "$2" || \
+		! valid_positive_decimal "$3"; then
+		generation_error="realization rootfs record is malformed"
+		exec 5<&-
+		return 2
+	fi
+	realization_rootfs_digest=$2
+	realization_rootfs_size=$3
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no tree record"
+		exec 5<&-
+		return 2
+	fi
+	set -f
+	# shellcheck disable=SC2086
+	set -- $realization_line
+	set +f
+	if [ "$#" -ne 2 ] || [ "$1" != tree ] || \
+		! valid_generation_digest "$2"; then
+		generation_error="realization tree record is malformed"
+		exec 5<&-
+		return 2
+	fi
+	generation_realization_tree_digest=$2
+
+	if ! IFS= read -r realization_line <&5; then
+		generation_error="realization plan has no builder record"
+		exec 5<&-
+		return 2
+	fi
+	case $realization_line in
+		fhs\ *)
+			set -f
+			# shellcheck disable=SC2086
+			set -- $realization_line
+			set +f
+			if [ "$#" -ne 2 ] || [ "$1" != fhs ] || \
+				[ "$2" != org.volatoo.gentoo-fhs/v1 ]; then
+				generation_error="realization FHS contract is unsupported"
+				exec 5<&-
+				return 2
+			fi
+			generation_fhs_contract=$2
+			if ! IFS= read -r realization_line <&5; then
+				generation_error="realization plan has no builder record"
+				exec 5<&-
+				return 2
+			fi
+			;;
+	esac
+	if [ "$generation_realization_version" -eq 2 ]; then
+		if [ -z "$generation_fhs_contract" ]; then
+			generation_error="realization v2 has no FHS contract"
+			exec 5<&-
+			return 2
+		fi
+		set -f
+		# shellcheck disable=SC2086
+		set -- $realization_line
+		set +f
+		if [ "$#" -ne 6 ] || [ "$1" != verity ] || \
+			! valid_generation_digest "$2" || \
+			! valid_positive_decimal "$3" || \
+			! valid_sha256_hex "$4" || \
+			! valid_sha256_hex "$5" || \
+			! valid_positive_decimal "$6"; then
+			generation_error="realization verity record is malformed"
+			exec 5<&-
+			return 2
+		fi
+		generation_verity_hash_digest=$2
+		generation_verity_hash_size=$3
+		generation_verity_root_hash=$4
+		generation_verity_salt=$5
+		generation_verity_data_blocks=$6
+		if [ $((generation_verity_hash_size % 4096)) -ne 0 ]; then
+			generation_error="realization verity hash size is unaligned"
+			exec 5<&-
+			return 2
+		fi
+		if [ $((realization_rootfs_size % 4096)) -ne 0 ] || \
+			[ $((realization_rootfs_size / 4096)) -ne \
+				"$generation_verity_data_blocks" ]; then
+			generation_error="realization rootfs size differs from verity geometry"
+			exec 5<&-
+			return 2
+		fi
+		if ! IFS= read -r realization_line <&5 || \
+			[ "$realization_line" != \
+				"verity-format 1 sha256 4096 4096 no-superblock" ]; then
+			generation_error="realization verity format is unsupported"
+			exec 5<&-
+			return 2
+		fi
+		if ! IFS= read -r realization_line <&5; then
+			generation_error="realization plan has no builder record"
+			exec 5<&-
+			return 2
+		fi
+	fi
+	if [ "$realization_line" != \
+		"builder squashfs-tools 4.7.5 zstd 19 1048576 reproducible" ]; then
+		generation_error="realization builder record is unsupported"
+		exec 5<&-
+		return 2
+	fi
+	if ! IFS= read -r realization_line <&5 || \
+		[ "$realization_line" != end ]; then
+		generation_error="realization plan has no end record"
+		exec 5<&-
+		return 2
+	fi
+	if IFS= read -r _ <&5; then
+		generation_error="realization plan contains records after end"
+		exec 5<&-
+		return 2
+	fi
+	exec 5<&-
+
+	realization_rootfs_path=$(
+		generation_object_path "$realization_rootfs_digest"
+	)
+	if [ "$generation_realization_version" -eq 2 ]; then
+		generation_verity_hash_path=$(
+			generation_object_path "$generation_verity_hash_digest"
+		)
+		if ! verify_generation_file_shape \
+			"$realization_rootfs_path" \
+			"$realization_rootfs_size" || \
+			! verify_generation_file_shape \
+				"$generation_verity_hash_path" \
+				"$generation_verity_hash_size"; then
+			return 2
+		fi
+		generation_verity=1
+	else
+		if ! verify_generation_file \
+			"$realization_rootfs_path" \
+			"$realization_rootfs_digest" \
+			"$realization_rootfs_size"; then
+			return 2
+		fi
+	fi
+	generation_base_digest=$realization_rootfs_digest
+	generation_base_size=$realization_rootfs_size
+	generation_base_path=$realization_rootfs_path
+	generation_layer_count=0
+	generation_realized=1
+	if [ "$generation_verity" -eq 1 ]; then
+		echo "[volatoo] realized generation selected for dm-verity: $generation_base_digest"
+	else
+		echo "[volatoo] realized generation closure verified: $generation_base_digest"
+	fi
+	return 0
 }
 
 valid_generation_path() {
@@ -473,7 +1099,26 @@ prepare_generation() {
 	generation_base_digest=
 	generation_base_size=
 	generation_base_path=
+	generation_realized=0
+	generation_realization_digest=
+	generation_realization_version=
+	generation_realization_tree_digest=
+	generation_parent_tree_receipt_digest=
+	generation_parent_tree_receipt_path=
+	generation_fhs_contract=
+	generation_verity=0
+	generation_verity_hash_digest=
+	generation_verity_hash_size=
+	generation_verity_hash_path=
+	generation_verity_root_hash=
+	generation_verity_salt=
+	generation_verity_data_blocks=
+	generation_incremental=0
+	generation_incremental_image_count=0
+	generation_signature_verified=0
+	generation_signature_key_id=
 	rm -f /generation/layers
+	rm -f /generation/realization-images
 	for stale_tombstones in /generation/tombstones.*; do
 		if [ -e "$stale_tombstones" ] || [ -L "$stale_tombstones" ]; then
 			rm -f "$stale_tombstones"
@@ -584,10 +1229,42 @@ prepare_generation() {
 	generation_context_digest=$2
 	context_object=$(generation_object_path "$generation_context_digest")
 	if ! verify_generation_file \
-		"$context_object" "$generation_context_digest"; then
+			"$context_object" "$generation_context_digest"; then
+			exec 4<&-
+			return 1
+		fi
+
+	prepare_generation_realization \
+		"$candidate_generation" \
+		"$generation_plan_digest" \
+		"$generation_target_id" \
+		"$generation_context_digest"
+	realization_status=$?
+	case $realization_status in
+		0)
+			exec 4<&-
+			generation_digest=$candidate_generation
+			generation_selected=1
+			image_sha256=${candidate_generation#sha256:}
+			if [ "$generation_verity" -eq 1 ]; then
+				echo "[volatoo] generation binding verified for authenticated reads: $generation_digest"
+			else
+				echo "[volatoo] generation verified from realized closure: $generation_digest"
+			fi
+			return 0
+			;;
+		1) ;;
+		*)
+			exec 4<&-
+			return 1
+			;;
+	esac
+	if [ "$signature_policy" = required ]; then
+		generation_error="signed release policy requires a realized generation"
 		exec 4<&-
 		return 1
 	fi
+	echo "[volatoo] warning: accepting unsigned legacy generation plan"
 
 	if ! IFS= read -r plan_line <&4; then
 		generation_error="boot plan has no base record"
@@ -840,6 +1517,141 @@ apply_generation_layers() {
 	done </generation/layers
 }
 
+mount_incremental_realization() {
+	if [ "$generation_incremental" -ne 1 ]; then
+		return
+	fi
+	if ! command -v veritysetup >/dev/null 2>&1; then
+		fatal generation.verity-helper \
+			"realization v3 requires veritysetup in early userspace"
+	fi
+	mkdir -p /dev/mapper /run/cryptsetup /lower
+	rm -f /generation/verity-devices
+	incremental_lowerdirs=
+	while IFS=' ' read -r \
+		incremental_sequence \
+		_incremental_kind \
+		_incremental_rootfs_digest \
+		incremental_rootfs_size \
+		incremental_rootfs_path \
+		_incremental_hash_digest \
+		_incremental_hash_size \
+		incremental_hash_path \
+		incremental_root_hash \
+		incremental_salt \
+		incremental_data_blocks; do
+		incremental_data_loop=$(losetup -f)
+		if [ -z "$incremental_data_loop" ] || \
+			! losetup -r \
+				"$incremental_data_loop" \
+				"$incremental_rootfs_path"; then
+			fatal generation.incremental-data-loop \
+				"could not attach realization image $incremental_sequence"
+		fi
+		incremental_hash_loop=$(losetup -f)
+		if [ -z "$incremental_hash_loop" ] || \
+			! losetup -r \
+				"$incremental_hash_loop" \
+				"$incremental_hash_path"; then
+			losetup -d "$incremental_data_loop" 2>/dev/null || true
+			fatal generation.incremental-hash-loop \
+				"could not attach realization hash $incremental_sequence"
+		fi
+		incremental_mapping=volatoo-lower-$incremental_sequence
+		if ! veritysetup open \
+			"$incremental_data_loop" \
+			"$incremental_mapping" \
+			"$incremental_hash_loop" \
+			"$incremental_root_hash" \
+			--no-superblock \
+			--hash=sha256 \
+			--data-block-size=4096 \
+			--hash-block-size=4096 \
+			--data-blocks="$incremental_data_blocks" \
+			--salt="$incremental_salt"; then
+			losetup -d "$incremental_hash_loop" 2>/dev/null || true
+			losetup -d "$incremental_data_loop" 2>/dev/null || true
+			fatal generation.incremental-verity-open \
+				"could not authenticate realization image $incremental_sequence"
+		fi
+		incremental_device=/dev/mapper/$incremental_mapping
+		incremental_wait=0
+		while [ ! -b "$incremental_device" ] && \
+			[ "$incremental_wait" -lt 100 ]; do
+			incremental_wait=$((incremental_wait + 1))
+			sleep 0.1
+		done
+		if [ ! -b "$incremental_device" ]; then
+			fatal generation.incremental-verity-device \
+				"authenticated image device did not appear: $incremental_sequence"
+		fi
+		incremental_mount=/lower/$incremental_sequence
+		mkdir "$incremental_mount"
+		if ! mount -t squashfs -o ro \
+			"$incremental_device" "$incremental_mount"; then
+			fatal generation.incremental-squashfs \
+				"could not mount realization image $incremental_sequence"
+		fi
+		if [ -n "$incremental_lowerdirs" ]; then
+			incremental_lowerdirs=$incremental_mount:$incremental_lowerdirs
+		else
+			incremental_lowerdirs=$incremental_mount
+		fi
+		printf '%s %s %s %s %s\n' \
+			"$incremental_sequence" \
+			"$incremental_mapping" \
+			"$incremental_data_loop" \
+			"$incremental_hash_loop" \
+			"$incremental_mount" \
+			>>/generation/verity-devices
+		echo "[volatoo] authenticated realization image ready: $incremental_sequence"
+	done </generation/realization-images
+	if [ -z "$incremental_lowerdirs" ] || \
+		! mount -t overlay \
+			-o "lowerdir=$incremental_lowerdirs" \
+			overlay /image; then
+		fatal generation.incremental-overlay \
+			"could not compose the authenticated FHS layer stack"
+	fi
+	echo "[volatoo] authenticated incremental FHS root composed"
+}
+
+release_incremental_realization() {
+	if [ "$generation_incremental" -ne 1 ]; then
+		return
+	fi
+	while IFS=' ' read -r \
+		_incremental_sequence \
+		incremental_mapping \
+		incremental_data_loop \
+		incremental_hash_loop \
+		incremental_mount; do
+		umount "$incremental_mount" || true
+		veritysetup close "$incremental_mapping" || true
+		losetup -d "$incremental_hash_loop" || true
+		losetup -d "$incremental_data_loop" || true
+	done </generation/verity-devices
+}
+
+preserve_incremental_mounts() {
+	if [ "$generation_incremental" -ne 1 ]; then
+		return
+	fi
+	mkdir -p /newroot/.volatoo/layers
+	while IFS=' ' read -r \
+		incremental_sequence \
+		_incremental_mapping \
+		_incremental_data_loop \
+		_incremental_hash_loop \
+		incremental_mount; do
+		incremental_destination=/newroot/.volatoo/layers/$incremental_sequence
+		mkdir "$incremental_destination"
+		mount --move "$incremental_mount" "$incremental_destination" ||
+			fatal root.move-incremental-layer \
+				"could not preserve realization image $incremental_sequence"
+	done </generation/verity-devices
+}
+
 config_file=/etc/volatoo/initramfs.conf
 if [ -r "$config_file" ]; then
 	# The configuration is trusted input baked into the initramfs.
@@ -851,24 +1663,30 @@ image_spec=${VOLATOO_IMAGE:-/dev/vda}
 image_file=${VOLATOO_IMAGE_FILE:-}
 image_sha256=${VOLATOO_IMAGE_SHA256:-}
 actual_image_sha256=
+ram_image_sha256=
 target_init=${VOLATOO_INIT:-/sbin/init}
-root_mode=${VOLATOO_ROOT_MODE:-copy}
+root_mode=${VOLATOO_ROOT_MODE:-store-overlay}
 tmpfs_size=${VOLATOO_TMPFS_SIZE:-80%}
 state_spec=${VOLATOO_STATE:-LABEL=VOLATOO-STATE}
 state_required=${VOLATOO_STATE_REQUIRED:-no}
 generation_mode=${VOLATOO_GENERATION:-auto}
+signature_policy=${VOLATOO_SIGNATURE_POLICY:-required}
 state_device=
 state_mounted=0
+system_store_readonly=0
 state_layout_version=
 system_layout_version=
 generation_selected=0
 generation_digest=
 generation_error=
+generation_incremental=0
+generation_incremental_image_count=0
 persist_config=
 persist_sync_configured=0
 
 mkdir -p \
-	/dev /generation /image /layer /newroot /overlay /proc /source /state /sys
+		/dev /generation /image /layer /lower /newroot /overlay /proc /ramimage \
+	/source /state /sys
 
 if ! mount -t devtmpfs devtmpfs /dev; then
 	fatal mount.devtmpfs "could not mount devtmpfs at /dev"
@@ -895,6 +1713,7 @@ for argument in $(cat /proc/cmdline 2>/dev/null); do
 		volatoo.state=*) state_spec=${argument#volatoo.state=} ;;
 		volatoo.state-required=*) state_required=${argument#volatoo.state-required=} ;;
 		volatoo.generation=*) generation_mode=${argument#volatoo.generation=} ;;
+		volatoo.signature-policy=*) signature_policy=${argument#volatoo.signature-policy=} ;;
 	esac
 done
 
@@ -954,7 +1773,7 @@ case $target_init in
 esac
 
 case $root_mode in
-	copy | overlay) ;;
+	copy | overlay | ram-overlay | store-overlay) ;;
 	*)
 		fatal config.root-mode "unsupported root mode: $root_mode"
 		;;
@@ -1021,6 +1840,14 @@ case $generation_mode in
 		;;
 esac
 
+case $signature_policy in
+	required | allow-unsigned) ;;
+	*)
+		fatal config.signature-policy \
+			"signature-policy must be required or allow-unsigned: $signature_policy"
+		;;
+esac
+
 echo "[volatoo] kernel: $(uname -srmo)"
 echo "[volatoo] command line: $(cat /proc/cmdline 2>/dev/null)"
 
@@ -1031,6 +1858,10 @@ load_module xhci_pci
 load_module usb_storage
 load_module sd_mod
 load_module loop
+load_module dm_mod
+load_module dm_bufio
+load_module reed_solomon
+load_module dm_verity
 load_module squashfs
 load_module overlay
 load_module ext4
@@ -1181,17 +2012,91 @@ elif [ "$generation_mode" != auto ] && [ "$generation_mode" != none ]; then
 fi
 
 image_source=$image_device
+image_copy_source=$image_device
+ram_image_expected_sha256=$image_sha256
 loop_device=
+verity_data_loop_device=
+verity_hash_loop_device=
+verity_mapping=
 source_mounted=0
 if [ "$generation_selected" -eq 1 ]; then
-	loop_device=$(losetup -f)
-	if [ -z "$loop_device" ] || \
-		! losetup -r "$loop_device" "$generation_base_path"; then
-		fatal generation.base-loop \
-			"could not attach selected generation base"
+	if [ "$generation_incremental" -eq 1 ]; then
+		if [ "$root_mode" = ram-overlay ]; then
+			fatal generation.incremental-ram-overlay \
+				"realization v3 currently requires store-overlay, overlay, or copy mode"
+		fi
+	else
+		image_copy_source=$generation_base_path
+		ram_image_expected_sha256=${generation_base_digest#sha256:}
 	fi
-	image_source=$loop_device
-	echo "[volatoo] selected generation base attached: $generation_base_digest"
+	if [ "$generation_incremental" -ne 1 ] && \
+		[ "$root_mode" != ram-overlay ]; then
+		if [ "$generation_verity" -eq 1 ]; then
+			if ! command -v veritysetup >/dev/null 2>&1; then
+				fatal generation.verity-helper \
+					"realization v2 requires veritysetup in early userspace"
+			fi
+			mkdir -p /dev/mapper /run/cryptsetup
+			verity_data_loop_device=$(losetup -f)
+			if [ -z "$verity_data_loop_device" ] || \
+				! losetup -r \
+					"$verity_data_loop_device" \
+					"$generation_base_path"; then
+				fatal generation.verity-data-loop \
+					"could not attach the dm-verity data object"
+			fi
+			verity_hash_loop_device=$(losetup -f)
+			if [ -z "$verity_hash_loop_device" ] || \
+				! losetup -r \
+					"$verity_hash_loop_device" \
+					"$generation_verity_hash_path"; then
+				losetup -d "$verity_data_loop_device" 2>/dev/null || true
+				fatal generation.verity-hash-loop \
+					"could not attach the dm-verity hash object"
+			fi
+			verity_mapping=volatoo-root
+			if ! veritysetup open \
+				"$verity_data_loop_device" \
+				"$verity_mapping" \
+				"$verity_hash_loop_device" \
+				"$generation_verity_root_hash" \
+				--no-superblock \
+				--hash=sha256 \
+				--data-block-size=4096 \
+				--hash-block-size=4096 \
+				--data-blocks="$generation_verity_data_blocks" \
+				--salt="$generation_verity_salt"; then
+				losetup -d "$verity_hash_loop_device" 2>/dev/null || true
+				losetup -d "$verity_data_loop_device" 2>/dev/null || true
+				fatal generation.verity-open \
+					"could not create the authenticated root mapping"
+			fi
+			image_source=/dev/mapper/$verity_mapping
+			verity_wait=0
+			while [ ! -b "$image_source" ] && \
+				[ "$verity_wait" -lt 100 ]; do
+				verity_wait=$((verity_wait + 1))
+				sleep 0.1
+			done
+			if [ ! -b "$image_source" ]; then
+				veritysetup close "$verity_mapping" 2>/dev/null || true
+				losetup -d "$verity_hash_loop_device" 2>/dev/null || true
+				losetup -d "$verity_data_loop_device" 2>/dev/null || true
+				fatal generation.verity-device \
+					"dm-verity mapping did not publish a block device"
+			fi
+			echo "[volatoo] authenticated generation mapping ready: $image_source"
+		else
+			loop_device=$(losetup -f)
+			if [ -z "$loop_device" ] || \
+				! losetup -r "$loop_device" "$generation_base_path"; then
+				fatal generation.base-loop \
+					"could not attach selected generation base"
+			fi
+			image_source=$loop_device
+			echo "[volatoo] selected generation base attached: $generation_base_digest"
+		fi
+	fi
 elif [ -n "$image_file" ]; then
 	echo "[volatoo] mounting image container from $image_device"
 	if ! mount -o ro "$image_device" /source; then
@@ -1206,24 +2111,88 @@ elif [ -n "$image_file" ]; then
 	fi
 
 	verify_image_integrity "/source$image_file"
+	image_copy_source=/source$image_file
 
-	loop_device=$(losetup -f)
-	if [ -z "$loop_device" ] || \
-		! losetup -r "$loop_device" "/source$image_file"; then
-		fatal image.loop-setup \
-			"could not create a read-only loop device for: $image_file"
+	if [ "$root_mode" != ram-overlay ]; then
+		loop_device=$(losetup -f)
+		if [ -z "$loop_device" ] || \
+			! losetup -r "$loop_device" "/source$image_file"; then
+			fatal image.loop-setup \
+				"could not create a read-only loop device for: $image_file"
+		fi
+		image_source=$loop_device
+		echo "[volatoo] squashfs file attached: $image_file -> $loop_device"
 	fi
-	image_source=$loop_device
-	echo "[volatoo] squashfs file attached: $image_file -> $loop_device"
 else
 	verify_image_integrity "$image_device"
 fi
 
-echo "[volatoo] mounting squashfs from $image_source"
-if ! mount -t squashfs -o ro "$image_source" /image; then
-	fatal image.squashfs-mount \
-		"could not mount squashfs from: $image_source"
+if [ "$root_mode" = ram-overlay ]; then
+	if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" \
+		tmpfs /ramimage; then
+		fatal root.ram-image-tmpfs \
+			"could not mount tmpfs for the compressed root image"
+	fi
+
+	if [ -z "$ram_image_expected_sha256" ]; then
+		echo "[volatoo] calculating an untrusted source snapshot digest"
+		if ! checksum_output=$(sha256sum "$image_copy_source" 2>/dev/null); then
+			fatal root.ram-image-source-hash \
+				"could not hash the source image before copying it to RAM"
+		fi
+		ram_image_expected_sha256=${checksum_output%% *}
+	fi
+
+	ram_copy_started=$(date +%s)
+	echo "[volatoo] copying the compressed root image into RAM"
+	if ! cp "$image_copy_source" /ramimage/root.squashfs; then
+		fatal root.ram-image-copy \
+			"could not copy the compressed root image into RAM"
+	fi
+	if ! checksum_output=$(sha256sum /ramimage/root.squashfs 2>/dev/null); then
+		fatal root.ram-image-hash \
+			"could not hash the RAM-backed root image"
+	fi
+	ram_image_sha256=${checksum_output%% *}
+	if [ "$ram_image_sha256" != "$ram_image_expected_sha256" ]; then
+		fatal root.ram-image-integrity \
+			"RAM-backed root image SHA-256 mismatch"
+	fi
+	ram_copy_finished=$(date +%s)
+	echo "[volatoo] compressed root copied and verified in $((ram_copy_finished - ram_copy_started))s"
+
+	if ! mount -o remount,ro /ramimage; then
+		fatal root.ram-image-readonly \
+			"could not make the RAM-backed root image read-only"
+	fi
+	if [ "$source_mounted" -eq 1 ]; then
+		if ! umount /source; then
+			fatal root.ram-image-source-unmount \
+				"could not release the source image container"
+		fi
+		source_mounted=0
+	fi
+
+	loop_device=$(losetup -f)
+	if [ -z "$loop_device" ] || \
+		! losetup -r "$loop_device" /ramimage/root.squashfs; then
+		fatal root.ram-image-loop \
+			"could not attach the RAM-backed root image"
+	fi
+	image_source=$loop_device
+	echo "[volatoo] source image released; RAM lower attached: $loop_device"
 fi
+
+if [ "$generation_incremental" -eq 1 ]; then
+	mount_incremental_realization
+else
+	echo "[volatoo] mounting squashfs from $image_source"
+	if ! mount -t squashfs -o ro "$image_source" /image; then
+		fatal image.squashfs-mount \
+			"could not mount squashfs from: $image_source"
+	fi
+fi
+echo "[volatoo] root authentication stage complete"
 
 case $root_mode in
 	copy)
@@ -1241,7 +2210,7 @@ case $root_mode in
 
 		echo "[volatoo] root copy completed in $((copy_finished - copy_started))s"
 		;;
-	overlay)
+	overlay | store-overlay)
 		if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" tmpfs /overlay; then
 			fatal root.overlay-tmpfs \
 				"could not mount the overlay write layer"
@@ -1253,7 +2222,25 @@ case $root_mode in
 			fatal root.overlay-mount \
 				"could not mount the overlay root"
 		fi
-		echo "[volatoo] overlay root ready"
+		if [ "$root_mode" = store-overlay ]; then
+			echo "[volatoo] immutable store overlay root ready"
+		else
+			echo "[volatoo] legacy overlay root ready"
+		fi
+		;;
+	ram-overlay)
+		if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" tmpfs /overlay; then
+			fatal root.ram-overlay-tmpfs \
+				"could not mount the RAM overlay write layer"
+		fi
+		mkdir -p /overlay/upper /overlay/work
+		if ! mount -t overlay \
+			-o lowerdir=/image,upperdir=/overlay/upper,workdir=/overlay/work \
+			overlay /newroot; then
+			fatal root.ram-overlay-mount \
+				"could not mount the RAM-backed overlay root"
+		fi
+		echo "[volatoo] RAM-backed overlay root ready"
 		;;
 esac
 
@@ -1275,6 +2262,61 @@ if [ "$generation_selected" -eq 1 ]; then
 		fatal generation.identity \
 			"could not publish the selected generation id"
 	fi
+	if [ "$generation_realized" -eq 1 ]; then
+		if ! printf '%s\n' "$generation_realization_digest" \
+			>/newroot/.volatoo/realization-id || \
+			! printf '%s\n' "$generation_realization_tree_digest" \
+			>/newroot/.volatoo/realization-tree-id; then
+			fatal generation.identity \
+				"could not publish the realized generation identity"
+		fi
+		if [ -n "$generation_fhs_contract" ] && \
+			! printf '%s\n' "$generation_fhs_contract" \
+				>/newroot/.volatoo/fhs-contract; then
+			fatal generation.identity \
+				"could not publish the realized FHS contract"
+		fi
+		if ! printf '%s\n' "$generation_realization_version" \
+			>/newroot/.volatoo/realization-version; then
+			fatal generation.identity \
+				"could not publish the realization contract version"
+		fi
+		if [ "$generation_incremental" -eq 1 ]; then
+			if ! printf 'dm-verity-layer-stack\n' \
+				>/newroot/.volatoo/root-authentication || \
+				! printf '%s\n' "$generation_incremental_image_count" \
+					>/newroot/.volatoo/authenticated-image-count; then
+				fatal generation.identity \
+					"could not publish the authenticated layer-stack identity"
+			fi
+		elif [ "$generation_verity" -eq 1 ] && \
+			[ "$root_mode" != ram-overlay ]; then
+			if ! printf 'dm-verity\n' \
+				>/newroot/.volatoo/root-authentication || \
+				! printf '%s\n' "$generation_verity_root_hash" \
+					>/newroot/.volatoo/verity-root-hash; then
+				fatal generation.identity \
+					"could not publish the dm-verity identity"
+			fi
+		elif ! printf 'sha256-eager\n' \
+			>/newroot/.volatoo/root-authentication; then
+			fatal generation.identity \
+				"could not publish the root authentication mode"
+		fi
+	fi
+	if [ "$generation_signature_verified" -eq 1 ]; then
+		if ! printf 'signify-ed25519\n' \
+			>/newroot/.volatoo/release-authentication || \
+			! printf '%s\n' "$generation_signature_key_id" \
+				>/newroot/.volatoo/signature-key; then
+			fatal generation.identity \
+				"could not publish the release signature identity"
+		fi
+	elif ! printf 'unsigned\n' \
+		>/newroot/.volatoo/release-authentication; then
+		fatal generation.identity \
+			"could not publish the unsigned release identity"
+	fi
 fi
 
 if [ ! -x "/newroot$target_init" ]; then
@@ -1287,6 +2329,7 @@ if [ "$state_mounted" -eq 1 ]; then
 	mount --move /state /newroot/.volatoo/state ||
 		fatal state.move "could not preserve the state partition mount"
 	echo "[volatoo] state partition available at /.volatoo/state"
+	protect_system_store /newroot/.volatoo/state
 	if [ ! -x /newroot/usr/libexec/volatoo-persist-early ]; then
 		fatal persist.helper-missing \
 			"early persistence helper is not executable"
@@ -1303,28 +2346,54 @@ if [ "$persist_sync_configured" -eq 1 ]; then
 	fi
 fi
 
-if [ "$root_mode" = copy ]; then
-	umount /image || true
-	if [ -n "$loop_device" ]; then
-		losetup -d "$loop_device" || true
-	fi
-	if [ "$source_mounted" -eq 1 ]; then
-		umount /source || true
-	fi
-else
-	# Keep the overlay's lower and writable backing mounts alive after the
-	# initramfs is discarded by moving them beneath the new root.
-	mkdir -p /newroot/.volatoo/lower /newroot/.volatoo/writable
-	mount --move /image /newroot/.volatoo/lower ||
-		fatal root.move-lower "could not preserve the squashfs lower mount"
-	mount --move /overlay /newroot/.volatoo/writable ||
-		fatal root.move-writable "could not preserve the overlay write mount"
-	if [ "$source_mounted" -eq 1 ]; then
-		mkdir -p /newroot/.volatoo/source
-		mount --move /source /newroot/.volatoo/source ||
-			fatal root.move-source "could not preserve the image container mount"
-	fi
-fi
+case $root_mode in
+	copy)
+		umount /image || true
+		if [ "$generation_incremental" -eq 1 ]; then
+			release_incremental_realization
+		elif [ -n "$verity_mapping" ]; then
+			veritysetup close "$verity_mapping" || true
+			losetup -d "$verity_hash_loop_device" || true
+			losetup -d "$verity_data_loop_device" || true
+		elif [ -n "$loop_device" ]; then
+			losetup -d "$loop_device" || true
+		fi
+		if [ "$source_mounted" -eq 1 ]; then
+			umount /source || true
+		fi
+		;;
+	overlay | store-overlay)
+		# Keep the overlay's lower and writable backing mounts alive after the
+		# initramfs is discarded by moving them beneath the new root.
+		mkdir -p /newroot/.volatoo/lower /newroot/.volatoo/writable
+		preserve_incremental_mounts
+		mount --move /image /newroot/.volatoo/lower ||
+			fatal root.move-lower "could not preserve the immutable lower mount"
+		mount --move /overlay /newroot/.volatoo/writable ||
+			fatal root.move-writable "could not preserve the overlay write mount"
+		if [ "$source_mounted" -eq 1 ]; then
+			mkdir -p /newroot/.volatoo/source
+			mount --move /source /newroot/.volatoo/source ||
+				fatal root.move-source \
+					"could not preserve the image container mount"
+		fi
+		;;
+	ram-overlay)
+		# Preserve both RAM mounts. The lower-image tmpfs is read-only, while
+		# all runtime writes stay in the separate overlay tmpfs.
+		mkdir -p \
+			/newroot/.volatoo/lower \
+			/newroot/.volatoo/ram-lower \
+			/newroot/.volatoo/writable
+		mount --move /image /newroot/.volatoo/lower ||
+			fatal root.move-lower "could not preserve the squashfs lower mount"
+		mount --move /ramimage /newroot/.volatoo/ram-lower ||
+			fatal root.move-ram-lower \
+				"could not preserve the RAM-backed lower image"
+		mount --move /overlay /newroot/.volatoo/writable ||
+			fatal root.move-writable "could not preserve the overlay write mount"
+		;;
+esac
 mkdir -p /newroot/dev /newroot/proc /newroot/sys
 mount --move /proc /newroot/proc ||
 	fatal root.move-proc "could not move /proc into the new root"

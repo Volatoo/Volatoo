@@ -9,9 +9,10 @@ Usage:
   update/tests/prepare-generation-qemu-fixture.sh \
     INIT_SYSTEM BASE_SQUASHFS BUILD_CONTEXT OUTPUT_DIRECTORY
 
-Create a layout-v2 state image containing two selected fixture generations.
+Create a state image containing two selected generation-v2 fixtures.
 INIT_SYSTEM must be openrc or systemd. The output directory receives
   state.ext4, current.digest, previous.digest and boot.digest.
+  A realized fixture also writes realization.digest.
 
 Optional environment variables:
   VOLATOO_STATE_SIZE  State filesystem size (default: 1G)
@@ -19,6 +20,14 @@ Optional environment variables:
                        Corrupt the current-only layer: yes or no
   VOLATOO_GENERATION_FIXTURE_INTERRUPT_SELECTION
                        Simulate interruption before current replacement: yes or no
+  VOLATOO_GENERATION_FIXTURE_REALIZE
+                       Publish a complete realized closure: yes or no
+  VOLATOO_GENERATION_FIXTURE_REALIZATION_VERSION
+                       Realization contract for a realized fixture: 2 or 3
+  VOLATOO_GENERATION_FIXTURE_SIGNING_KEY
+                       Optional signify secret key for the realized closure
+  VOLATOO_GENERATION_FIXTURE_TRUSTED_KEY
+                       Matching signify public key; required with signing key
 EOF
 }
 
@@ -33,20 +42,50 @@ context_source=$3
 output_dir=$4
 corrupt_current=${VOLATOO_GENERATION_FIXTURE_CORRUPT_CURRENT:-no}
 interrupt_selection=${VOLATOO_GENERATION_FIXTURE_INTERRUPT_SELECTION:-no}
+realize_generation=${VOLATOO_GENERATION_FIXTURE_REALIZE:-no}
+realization_version=${VOLATOO_GENERATION_FIXTURE_REALIZATION_VERSION:-2}
+signing_key=${VOLATOO_GENERATION_FIXTURE_SIGNING_KEY:-}
+trusted_key=${VOLATOO_GENERATION_FIXTURE_TRUSTED_KEY:-}
 
 if [[ $init_system != openrc && $init_system != systemd ]]; then
 	echo "error: INIT_SYSTEM must be openrc or systemd" >&2
 	exit 2
 fi
-for setting in "$corrupt_current" "$interrupt_selection"; do
+for setting in "$corrupt_current" "$interrupt_selection" "$realize_generation"; do
 	[[ $setting == yes || $setting == no ]] || {
 		echo "error: fixture fault settings must be yes or no" >&2
 		exit 2
 	}
 done
+if [[ $realization_version != 2 && $realization_version != 3 ]]; then
+	echo "error: fixture realization version must be 2 or 3" >&2
+	exit 2
+fi
 if [[ $corrupt_current == yes && $interrupt_selection == yes ]]; then
 	echo "error: select only one fixture fault" >&2
 	exit 2
+fi
+if [[ $corrupt_current == yes && $realize_generation == yes ]]; then
+	echo "error: corrupt-current and realized fixtures cannot be combined" >&2
+	exit 2
+fi
+if [[ -n $signing_key || -n $trusted_key ]]; then
+	[[ -n $signing_key && -n $trusted_key ]] || {
+		echo "error: fixture signing and trusted keys are required together" >&2
+		exit 2
+	}
+	[[ $realize_generation == yes ]] || {
+		echo "error: fixture signing requires realization" >&2
+		exit 2
+	}
+	for key_path in "$signing_key" "$trusted_key"; do
+		[[ -f $key_path && ! -L $key_path ]] || {
+			echo "error: fixture key is missing or unsafe: $key_path" >&2
+			exit 1
+		}
+	done
+	signing_key=$(cd -- "$(dirname -- "$signing_key")" && pwd)/$(basename -- "$signing_key")
+	trusted_key=$(cd -- "$(dirname -- "$trusted_key")" && pwd)/$(basename -- "$trusted_key")
 fi
 for path in "$base_image" "$context_source"; do
 	[[ -f $path ]] || {
@@ -58,6 +97,7 @@ done
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 manifest=$repo_root/update/volatoo-manifest
 generation_tool=$repo_root/update/volatoo-generation
+fixture_tool=$repo_root/update/tests/make-generation-fixture.py
 compressor_image=volatoo-layer-compressor:generation-qemu
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-generation-qemu.XXXXXX")
 
@@ -84,7 +124,22 @@ canonical_digest()
 
 mkdir -p "$output_dir"
 output_dir=$(cd -- "$output_dir" && pwd)
-for name in state.ext4 current.digest previous.digest boot.digest; do
+for name in \
+	state.ext4 \
+	current.digest \
+	previous.digest \
+	boot.digest \
+	realization.digest \
+	realization-rootfs.digest \
+	verity-hash.digest \
+	parent-tree-receipt.digest \
+	validation-index.digest \
+	validation-index \
+	tree-state.digest \
+	tree-state \
+	reuse-report \
+	signature-key.digest
+do
 	[[ ! -e $output_dir/$name ]] || {
 		echo "error: output already exists: $output_dir/$name" >&2
 		exit 1
@@ -92,8 +147,16 @@ for name in state.ext4 current.digest previous.digest boot.digest; do
 done
 base_image=$(cd -- "$(dirname -- "$base_image")" && pwd)/$(basename -- "$base_image")
 
-"$manifest" canonicalize "$context_source" >"$work_dir/context.json"
-target_id=$(jq -r '.target.id' "$work_dir/context.json")
+python3 "$fixture_tool" context \
+	--build-context "$context_source" \
+	--base "$base_image" \
+	--output-dir "$work_dir/provenance"
+context=$work_dir/provenance/build-context.json
+build_spec=$work_dir/provenance/build-spec.json
+source_catalog=$work_dir/provenance/source-catalog.json
+acquisition=$work_dir/provenance/acquisition.json
+base_generation=$work_dir/provenance/base-generation.json
+target_id=$(jq -r '.target.id' "$context")
 case $target_id in
 	*/"$init_system"/*) ;;
 	*)
@@ -101,17 +164,69 @@ case $target_id in
 		exit 1
 		;;
 esac
-context_digest=$(canonical_digest "$work_dir/context.json")
-base_digest=$(raw_digest "$base_image")
-base_size=$(wc -c <"$base_image" | tr -d ' ')
 
 mkdir -p \
 	"$work_dir/layer-root-1/etc" \
+	"$work_dir/layer-root-1/usr/libexec" \
 	"$work_dir/layer-root-2/etc" \
 	"$work_dir/compressed-1" \
 	"$work_dir/compressed-2"
 printf 'layer-one\n' >"$work_dir/layer-root-1/etc/volatoo-layer-one"
 printf 'replacement-v1\n' >"$work_dir/layer-root-1/etc/volatoo-replaced"
+cp "$repo_root/update/volatoo-update-view" \
+	"$work_dir/layer-root-1/usr/libexec/volatoo-update-view"
+chmod 0755 "$work_dir/layer-root-1/usr/libexec/volatoo-update-view"
+
+# Emit an init-owned readiness marker before the test waits for a serial
+# login. This separates service startup from QEMU tty discovery latency.
+printf '%s\n' \
+	'#!/bin/sh' \
+	'printf "[volatoo] service readiness reached\n" >/dev/console' \
+	>"$work_dir/layer-root-1/usr/libexec/volatoo-qemu-ready"
+chmod 0755 "$work_dir/layer-root-1/usr/libexec/volatoo-qemu-ready"
+if [[ $init_system == openrc ]]; then
+	mkdir -p \
+		"$work_dir/layer-root-1/etc/init.d" \
+		"$work_dir/layer-root-1/etc/runlevels/boot"
+	printf '%s\n' \
+		'#!/sbin/openrc-run' \
+		'description="Report Volatoo QEMU service readiness"' \
+		'' \
+		'depend() {' \
+		'    need localmount' \
+		'    after bootmisc' \
+		'}' \
+		'' \
+		'start() {' \
+		'    ebegin "Reporting Volatoo QEMU service readiness"' \
+		'    /usr/libexec/volatoo-qemu-ready' \
+		'    eend $?' \
+		'}' \
+		>"$work_dir/layer-root-1/etc/init.d/volatoo-qemu-ready"
+	chmod 0755 "$work_dir/layer-root-1/etc/init.d/volatoo-qemu-ready"
+	ln -s /etc/init.d/volatoo-qemu-ready \
+		"$work_dir/layer-root-1/etc/runlevels/boot/volatoo-qemu-ready"
+else
+	mkdir -p \
+		"$work_dir/layer-root-1/etc/systemd/system/basic.target.wants" \
+		"$work_dir/layer-root-1/usr/lib/systemd/system"
+	printf '%s\n' \
+		'[Unit]' \
+		'Description=Report Volatoo QEMU service readiness' \
+		'DefaultDependencies=no' \
+		'After=local-fs.target systemd-udev-trigger.service' \
+		'Before=basic.target' \
+		'' \
+		'[Service]' \
+		'Type=oneshot' \
+		'ExecStart=/usr/libexec/volatoo-qemu-ready' \
+		'' \
+		'[Install]' \
+		'WantedBy=basic.target' \
+		>"$work_dir/layer-root-1/usr/lib/systemd/system/volatoo-qemu-ready.service"
+	ln -s /usr/lib/systemd/system/volatoo-qemu-ready.service \
+		"$work_dir/layer-root-1/etc/systemd/system/basic.target.wants/volatoo-qemu-ready.service"
+fi
 printf 'replacement-v2\n' >"$work_dir/layer-root-2/etc/volatoo-replaced"
 printf 'layer-two\n' >"$work_dir/layer-root-2/etc/volatoo-layer-two"
 
@@ -148,89 +263,51 @@ jq -n \
 	}' |
 	"$manifest" canonicalize - >"$work_dir/tombstones-2.json"
 
-declare -a layer_digests=()
-declare -a layer_sizes=()
-declare -a tombstone_digests=()
-declare -a transaction_digests=()
 for number in 1 2; do
-	layer=$work_dir/compressed-$number/layer.squashfs
-	layer_digests[number]=$(raw_digest "$layer")
-	layer_sizes[number]=$(wc -c <"$layer" | tr -d ' ')
-	tombstone_digests[number]=$(
-		canonical_digest "$work_dir/tombstones-$number.json"
-	)
-	tombstone_count=$(jq '.paths | length' "$work_dir/tombstones-$number.json")
-	jq \
-		--arg target "$target_id" \
-		--arg context_digest "$context_digest" \
-		--arg rootfs_digest "${layer_digests[$number]}" \
-		--argjson rootfs_size "${layer_sizes[$number]}" \
-		--arg tombstones_digest "${tombstone_digests[$number]}" \
-		--argjson tombstones_count "$tombstone_count" \
-		'
-		.target_id = $target
-		| .build_context_digest = $context_digest
-		| .filesystem.rootfs_digest = $rootfs_digest
-		| .filesystem.rootfs_size = $rootfs_size
-		| .filesystem.tombstones_digest = $tombstones_digest
-		| .filesystem.tombstones_count = $tombstones_count
-		' \
-		"$repo_root/update/examples/layer-transaction-v1.json" |
-		"$manifest" canonicalize - >"$work_dir/transaction-$number.json"
-	transaction_digests[number]=$(
-		canonical_digest "$work_dir/transaction-$number.json"
-	)
-done
-
-write_generation()
-{
-	local count=$1
-	local output=$2
 	jq -n \
 		--arg target "$target_id" \
-		--arg context_digest "$context_digest" \
-		--arg base_digest "$base_digest" \
-		--argjson base_size "$base_size" \
-		--arg layer_one_digest "${layer_digests[1]}" \
-		--argjson layer_one_size "${layer_sizes[1]}" \
-		--arg tombstone_one_digest "${tombstone_digests[1]}" \
-		--arg transaction_one_digest "${transaction_digests[1]}" \
-		--arg layer_two_digest "${layer_digests[2]}" \
-		--argjson layer_two_size "${layer_sizes[2]}" \
-		--arg tombstone_two_digest "${tombstone_digests[2]}" \
-		--arg transaction_two_digest "${transaction_digests[2]}" \
-		--argjson count "$count" \
+		--arg first "/etc/volatoo-layer-$number" \
+		--arg second /etc/volatoo-replaced \
+		--arg update_view /usr/libexec/volatoo-update-view \
+		--argjson number "$number" \
 		'{
-		  schema: "org.volatoo.generation/v1",
+		  schema: "org.volatoo.layer-paths/v1",
 		  target_id: $target,
-		  build_context_digest: $context_digest,
-		  base: {
-		    rootfs_digest: $base_digest,
-		    rootfs_size: $base_size,
-		    format: "squashfs"
-		  },
-		  layers: [
-		    {
-		      rootfs_digest: $layer_one_digest,
-		      rootfs_size: $layer_one_size,
-		      format: "squashfs",
-		      tombstones_digest: $tombstone_one_digest,
-		      transaction_digest: $transaction_one_digest
-		    },
-		    {
-		      rootfs_digest: $layer_two_digest,
-		      rootfs_size: $layer_two_size,
-		      format: "squashfs",
-		      tombstones_digest: $tombstone_two_digest,
-		      transaction_digest: $transaction_two_digest
-		    }
-		  ][0:$count]
+		  paths: (
+		    [$first, $second]
+		    + if $number == 1 then [$update_view] else [] end
+		  )
 		}' |
-		"$manifest" canonicalize - >"$output"
-}
+		"$manifest" canonicalize - >"$work_dir/changed-$number.json"
+done
 
-write_generation 1 "$work_dir/generation-1.json"
-write_generation 2 "$work_dir/generation-2.json"
+python3 "$fixture_tool" layer \
+	--generation-version 2 \
+	--build-context "$context" \
+	--build-spec "$build_spec" \
+	--acquisition "$acquisition" \
+	--parent "$base_generation" \
+	--changed-paths "$work_dir/changed-1.json" \
+	--tombstones "$work_dir/tombstones-1.json" \
+	--layer "$work_dir/compressed-1/layer.squashfs" \
+	--output-dir "$work_dir/generation-1"
+python3 "$fixture_tool" layer \
+	--generation-version 2 \
+	--build-context "$context" \
+	--build-spec "$build_spec" \
+	--acquisition "$acquisition" \
+	--parent "$work_dir/generation-1/generation.json" \
+	--changed-paths "$work_dir/changed-2.json" \
+	--tombstones "$work_dir/tombstones-2.json" \
+	--layer "$work_dir/compressed-2/layer.squashfs" \
+	--output-dir "$work_dir/generation-2"
+
+declare -a layer_digests=()
+for number in 1 2; do
+	layer_digests[number]=$(
+		raw_digest "$work_dir/compressed-$number/layer.squashfs"
+	)
+done
 
 state_root=$work_dir/state-root
 mkdir -p \
@@ -244,28 +321,77 @@ printf '1\n' >"$state_root/volatoo/layout-version"
 "$generation_tool" migrate-state --state "$state_root" >/dev/null
 
 common_objects=(
-	--object "$work_dir/context.json"
+	--object "$context"
+	--object "$build_spec"
+	--object "$source_catalog"
+	--object "$acquisition"
 	--object "$base_image"
 	--object "$work_dir/compressed-1/layer.squashfs"
+	--object "$work_dir/changed-1.json"
 	--object "$work_dir/tombstones-1.json"
-	--object "$work_dir/transaction-1.json"
+	--object "$work_dir/generation-1/transaction.json"
+	--object "$work_dir/generation-1/portage-state.json"
 )
 "$generation_tool" publish \
 	--state "$state_root" \
-	--generation "$work_dir/generation-1.json" \
-	"${common_objects[@]}" \
-	--activate >/dev/null
+	--generation "$base_generation" \
+	--object "$context" \
+	--object "$base_image" \
+	--activate \
+	--expected-current none >/dev/null
+base_generation_digest=$(canonical_digest "$base_generation")
 "$generation_tool" publish \
 	--state "$state_root" \
-	--generation "$work_dir/generation-2.json" \
+	--generation "$work_dir/generation-1/generation.json" \
+	"${common_objects[@]}" \
+	--activate \
+	--expected-current "$base_generation_digest" >/dev/null
+previous_digest=$(
+	canonical_digest "$work_dir/generation-1/generation.json"
+)
+"$generation_tool" publish \
+	--state "$state_root" \
+	--generation "$work_dir/generation-2/generation.json" \
 	"${common_objects[@]}" \
 	--object "$work_dir/compressed-2/layer.squashfs" \
+	--object "$work_dir/changed-2.json" \
 	--object "$work_dir/tombstones-2.json" \
-	--object "$work_dir/transaction-2.json" \
-	--activate >/dev/null
+	--object "$work_dir/generation-2/transaction.json" \
+	--object "$work_dir/generation-2/portage-state.json" \
+	--activate \
+	--expected-current "$previous_digest" >/dev/null
 
-current_digest=$(canonical_digest "$work_dir/generation-2.json")
-previous_digest=$(canonical_digest "$work_dir/generation-1.json")
+current_digest=$(canonical_digest "$work_dir/generation-2/generation.json")
+if [[ $realize_generation == yes ]]; then
+	declare -a realization_arguments=()
+	if [[ -n $signing_key ]]; then
+		realization_arguments+=(
+			--signing-key "$signing_key"
+			--trusted-key "$trusted_key"
+		)
+	fi
+	if [[ $realization_version == 3 ]]; then
+		VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+			"$repo_root/update/realize-generation-incremental-docker.sh" \
+			--state "$state_root" \
+			--generation "$previous_digest" \
+			--output-dir "$work_dir/realized-parent" \
+			"${realization_arguments[@]}"
+		VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+			"$repo_root/update/realize-generation-incremental-docker.sh" \
+			--state "$state_root" \
+			--generation "$current_digest" \
+			--output-dir "$work_dir/realized" \
+			"${realization_arguments[@]}"
+	else
+		VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+			"$repo_root/update/realize-generation-docker.sh" \
+			--state "$state_root" \
+			--generation "$current_digest" \
+			--output-dir "$work_dir/realized" \
+			"${realization_arguments[@]}"
+	fi
+fi
 if [[ $interrupt_selection == yes ]]; then
 	# This is the durable intermediate state after previous was written but
 	# before current was atomically replaced during a gen1 -> gen2 selection.
@@ -289,12 +415,79 @@ else
 	[[ $boot_digest == "$current_digest" ]]
 fi
 
-VOLATOO_STATE_SIZE=${VOLATOO_STATE_SIZE:-1G} \
+default_state_size=1G
+if [[ $realize_generation == yes ]]; then
+	default_state_size=2G
+fi
+VOLATOO_STATE_SIZE=${VOLATOO_STATE_SIZE:-$default_state_size} \
 	"$repo_root/scripts/build-state-image.sh" \
 	--source "$state_root" \
 	"$output_dir/state.ext4" >/dev/null
 cp "$state_root/volatoo/system/current" "$output_dir/current.digest"
 cp "$state_root/volatoo/system/previous" "$output_dir/previous.digest"
 printf '%s\n' "$boot_digest" >"$output_dir/boot.digest"
+if [[ $realize_generation == yes ]]; then
+	cp \
+		"$state_root/volatoo/system/realizations/${current_digest#sha256:}" \
+		"$output_dir/realization.digest"
+	realization_inspection=$(
+		"$generation_tool" inspect \
+			--state "$state_root" \
+			"$current_digest"
+	)
+	jq -er --argjson version "$realization_version" \
+		'.realization.contract_version == $version' \
+		<<<"$realization_inspection" >/dev/null
+	jq -r \
+		'if .realization.contract_version == 3
+		 then .realization.images[-1].rootfs_digest
+		 else .realization.rootfs_digest
+		 end' \
+		<<<"$realization_inspection" \
+		>"$output_dir/realization-rootfs.digest"
+	jq -r \
+		'if .realization.contract_version == 3
+		 then .realization.images[0].verity.hash_digest
+		 else .realization.verity.hash_digest
+		 end' \
+		<<<"$realization_inspection" \
+		>"$output_dir/verity-hash.digest"
+	if [[ $realization_version == 3 ]]; then
+		jq -er '
+			.realization.parent_tree_receipt.contract_version == 3
+			and .realization.parent_tree_receipt.validation == "indexed-fhs-elf-v1"
+			and (.realization.parent_tree_receipt.validation_index_size > 0)
+			and (.realization.parent_tree_receipt.tree_state_size > 0)
+			and .realization.parent_tree_receipt.tree_state.composition == "generation-plan-and-index-v1"
+		' \
+			<<<"$realization_inspection" >/dev/null
+		jq -r '.realization.tree_receipt_digest' \
+			<<<"$realization_inspection" \
+			>"$output_dir/parent-tree-receipt.digest"
+		jq -r '.realization.parent_tree_receipt.validation_index_digest' \
+			<<<"$realization_inspection" \
+			>"$output_dir/validation-index.digest"
+		cp "$work_dir/realized/validation-index" \
+			"$output_dir/validation-index"
+		jq -r '.realization.parent_tree_receipt.tree_state_digest' \
+			<<<"$realization_inspection" \
+			>"$output_dir/tree-state.digest"
+		cp "$work_dir/realized/tree-state" "$output_dir/tree-state"
+		cp "$work_dir/realized/reuse-report" "$output_dir/reuse-report"
+		grep -Fx 'reused 2' "$output_dir/reuse-report" >/dev/null
+		grep -Fx 'generated 1' "$output_dir/reuse-report" >/dev/null
+		grep -E '^validation indexed-delta(-audited)?$' \
+			"$output_dir/reuse-report" >/dev/null
+	fi
+	if [[ -n $trusted_key ]]; then
+		trusted_key_digest=$(raw_digest "$trusted_key")
+		jq -e \
+			--arg key "$trusted_key_digest" \
+			'.realization.signatures | map(.key_id) | index($key) != null' \
+			<<<"$realization_inspection" >/dev/null
+		printf '%s\n' "$trusted_key_digest" \
+			>"$output_dir/signature-key.digest"
+	fi
+fi
 
 echo "prepared $init_system generation fixture: $output_dir/state.ext4"

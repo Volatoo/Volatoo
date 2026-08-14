@@ -201,7 +201,13 @@ An update operates on a complete transaction, not an isolated package file:
 7. Write the changed files to a read-only SquashFS system layer.
 8. Write removals to a canonical tombstone object.
 9. Create a new generation manifest that appends the layer.
-10. Publish all objects before atomically advancing the `current` pointer.
+10. Verify the complete provenance and published parent chain.
+11. Materialize and validate the complete Gentoo/FHS and ELF runtime tree
+    without relocating packages.
+12. Realize the base and FHS layers as independently authenticated immutable
+    images; transform only layers whose tombstones require OverlayFS metadata.
+13. Publish their signed generation/boot-plan binding before conditionally
+    advancing the `current` pointer.
 
 Tombstones are applied before the corresponding layer so that a transaction
 may remove an old path and create a replacement at the same location.
@@ -211,10 +217,16 @@ unreviewable tree.
 
 ## Generation model
 
-A generation is a small immutable manifest:
+A generation is a small immutable manifest. Generation v2 also binds the
+resulting Portage desired state:
 
 ```text
-Generation = hard target + base object + ordered system layers
+Generation =
+    hard target
+  + base object
+  + ordered system layers
+  + exact parent generation
+  + PortageState(config, world, repositories, profile, toolchain)
 ```
 
 Objects are addressed by SHA-256. The manifest digest is the generation
@@ -226,16 +238,34 @@ identity. System-generation sublayout version 1 is:
 ├── objects/sha256/<digest>
 ├── manifests/<generation-digest>.json
 ├── plans/<generation-digest>
+├── realizations/<generation-digest>
 ├── staging/
 ├── current
 └── previous
 ```
 
 `current` and `previous` contain manifest digests, not mutable directory
-names. Publication writes and verifies objects and the manifest first, then
-atomically replaces the pointer. Garbage collection retains the selected
-generation, rollback generations, pinned generations and every referenced
-object.
+names. Every layer transaction must name the digest of the exact generation
+it appends to, and that parent manifest must already be published. Version 2
+stores that parent digest explicitly rather than assuming every historical
+layer shares the latest BuildContext. Its transition context begins with the
+parent PortageState world, while the resulting world is measured after clean
+binary-only staging. Repository, profile, configuration and toolchain inputs
+become the new content-addressed PortageState.
+Publication writes and verifies the full provenance closure and manifest
+first. Incremental realization reconstructs only those verified inputs,
+validates the final tree, and publishes an immutable binding to the exact
+generation, boot plan, ordered runtime images and independent dm-verity roots.
+Selection then replaces the pointer only if `current` still equals the
+caller's expected digest. Garbage collection retains the selected generation,
+rollback generations, pinned generations, realized closures or image stacks
+and every referenced object. It follows v2 parent links, so context
+transitions cannot orphan the provenance of an active descendant. Compaction
+preserves the exact PortageState and resets the new layer-free generation's
+parent to `null`.
+
+The detailed transition and compatibility invariants are in
+[`generation-v2.md`](generation-v2.md).
 
 The top-level Phase 2 state layout remains version 1. Enabling generation
 storage is an explicit, resumable additive migration and carries its own
@@ -327,10 +357,12 @@ normal acquisition compatibility check.
 - [x] Emit a canonical, reviewable BuildSpec and package-source query.
 - [x] Fail closed on unpinned repositories or an incompatible target.
 
-The P3U-1 implementation is `update/volatoo-plan`. Portage does not currently
-offer a stable machine-readable resolver output, so Volatoo does not parse
-`emerge --pretend` terminal text. A versioned adapter calls the Portage 3.0
-resolver in-process and converts its result into
+The P3U-1 host entry point is `update/plan-generation-docker.sh`. It validates
+the selected published generation, reconstructs its immutable object closure
+and chroots into that exact root before invoking `update/volatoo-plan`.
+Portage does not currently offer a stable machine-readable resolver output,
+so Volatoo does not parse `emerge --pretend` terminal text. A versioned adapter
+calls the Portage 3.0 resolver in-process and converts its result into
 `org.volatoo.build-spec/v1`. The adapter is private implementation detail; the
 canonical manifest is the interface consumed by later phases.
 
@@ -378,11 +410,17 @@ three Volatoo metadata fields described above.
 - [x] Reconstruct and verify the complete generation before publication.
 
 The initial implementation is `update/volatoo-layer`, orchestrated by
-`update/compose-layer-docker.sh`. Before mutation it verifies the complete
-acquisition and the active target/profile/repository context. Only the
-acquired GPKGs are exposed through a temporary PKGDIR; both the pretend pass
-and installation use `--usepkgonly`, `--binpkg-respect-use=y` and
-`--binpkg-changed-deps=y`.
+`update/compose-layer-docker.sh`. The orchestrator accepts a state store and
+generation selector rather than a stage image. It validates the published
+closure, snapshots and hashes the manifest, boot plan and referenced objects
+in a private volume while materializing the parent, and chroots Portage into
+that reconstructed root.
+The materializer also requires the boot-plan digest returned by inspection, so
+a concurrent generation-to-plan pointer change fails before extraction.
+Before mutation it verifies the complete acquisition and the active
+target/profile/repository context. Only the acquired GPKGs are exposed through
+a temporary PKGDIR; both the pretend pass and installation use `--usepkgonly`,
+`--binpkg-respect-use=y` and `--binpkg-changed-deps=y`.
 
 Filesystem snapshots exclude container mounts and volatile Portage caches,
 logs and temporary directories. Changed paths are copied with numeric
@@ -391,11 +429,12 @@ SquashFS creation is isolated in a minimal compressor image and normalizes
 filesystem and image timestamps. Finalization appends one candidate layer but
 does not publish or select it.
 
-The staging tree and compressor exchange data through a Docker volume so that
-Linux ownership, ACLs and xattrs never pass through a macOS bind mount. The
-OpenRC/systemd integration matrix extracts each finished layer, proves that a
-second compression is byte-identical, applies it to a fresh matching stage3
-root and verifies both the installed payload and Portage VDB.
+The reconstructed parent, staging tree and compressor exchange data through
+Docker volumes so that Linux ownership, ACLs and xattrs never pass through a
+macOS bind mount. The OpenRC/systemd integration matrix publishes real base
+generations, plans and composes inside their reconstructed roots, proves that
+a second layer compression is byte-identical, publishes the candidate and
+materializes it again to verify both the installed payload and Portage VDB.
 
 ### P3U-4 — Atomic generation boot
 
@@ -406,36 +445,65 @@ root and verifies both the installed payload and Portage VDB.
   lanes.
 
 `update/volatoo-generation` publishes a generation only after its complete
-context, base, layer, tombstone and transaction closure has been verified and
-stored by SHA-256. It derives a strict, content-addressed early-boot plan from
-the canonical generation manifest, then publishes the immutable manifest and
-plan before changing either selection pointer.
+BuildContext, base, BuildSpec, source catalog, acquisition, changed-path,
+layer, tombstone and transaction closure has been verified and stored by
+SHA-256. The generation base must equal the BuildContext base. Each transaction
+must name the exact published generation it extends and must bind its
+transition context, BuildSpec, acquisition result, resulting PortageState and
+filesystem manifests. Version 1 retains the same-context prefix rule for
+compatibility; version 2 verifies explicit parents whose contexts may differ.
+The tool
+derives a strict, content-addressed early-boot plan from the canonical
+generation manifest, then publishes the immutable manifest and plan before
+changing either selection pointer.
 
 Selection writes `previous` first and atomically replaces `current` last. A
 power loss between those operations therefore leaves the old current
-generation bootable. Rollback performs the same safe ordering in reverse.
-The initramfs verifies the selected manifest, boot plan and every referenced
-object before mounting the base or applying a tombstone. If automatic current
-verification fails, it verifies and boots `previous`; explicit digest or
-`previous` selections fail closed instead of silently choosing another
-generation.
+generation bootable. Activation is compare-and-swap: the caller supplies the
+current digest used during planning, or `none` for the first generation, and a
+stale caller cannot overwrite a newer selection. Rollback performs the same
+safe pointer ordering in reverse.
+The initramfs verifies the selected manifest, boot plan and small realization
+binding. Release mode first authenticates the exact realization-plan bytes
+with an Ed25519 key embedded in the initramfs. Realization v2 binds a complete
+closure and one deterministic dm-verity tree. Realization v3 binds the base
+and ordered FHS layers to independent dm-verity roots and encodes tombstones as
+OverlayFS whiteouts or opaque directories. The kernel authenticates requested
+SquashFS blocks against the signed roots, so boot does not hash the whole
+closure or replay tombstones into the writable root. A missing or wrong
+signature, corrupt binding or failed authenticated read rejects the generation
+rather than downgrading to layer replay. Realization v1 retains eager
+full-object SHA-256 and may be signed by the same mechanism. Unbound version-1
+generations require the explicit `allow-unsigned` recovery policy. If
+automatic current verification fails, the initramfs independently verifies
+`previous`; explicit digest or `previous` selections fail closed instead of
+silently choosing another generation.
 
 The top-level Phase 2 state layout remains version 1 for compatibility with
 already-built persistence and identity tools. Generation storage has its own
 `/volatoo/system/layout-version` marker. This additive migration avoids making
 a legacy recovery boot unusable merely because generation support was enabled.
 
-The QEMU fixture uses two layers so it exercises ordinary additions, removals
-and removal followed by replacement. OpenRC and systemd both pass BIOS and
-UEFI normal selection, corrupt-current fallback and interrupted-selection
-boots with their real PID 1.
+The QEMU fixture uses two generation-v2 layers so it exercises ordinary
+additions, removals, removal followed by replacement and the explicit parent
+chain. OpenRC and systemd both pass BIOS and UEFI normal selection,
+corrupt-current fallback and interrupted-selection boots with their real
+PID 1.
 
 ### P3U-5 — Operations
 
 - [x] Add service activation policies and health checks.
 - [x] Add pinning, inspection, rollback and garbage collection.
 - [x] Compact long layer chains into a new base without changing desired state.
+- [x] Enforce complete provenance, exact parent prefixes and CAS activation.
 - [x] Add the canonical Portage Engine adapter and mocked control-plane Gate.
+- [x] Realize and directly boot one complete immutable system closure.
+- [x] Add dm-verity lazy authentication and an explicit reachable-object scrub.
+- [x] Authenticate exact realization plans with a rotatable Ed25519 release
+  key embedded in the initramfs.
+- [x] Model Portage configuration, world, repository, profile and toolchain
+  transitions in generation v2.
+- [x] Publish an independently authenticated incremental FHS layer stack.
 - [ ] Exercise a real local build, release binhost and Portage Engine end to
   end.
 
@@ -460,13 +528,38 @@ and `previous` form the GC root set. Collection recursively retains boot
 closure and stored provenance objects, refuses invalid roots and is dry-run by
 default. Dropping `previous` requires its exact digest as confirmation.
 
+`realize-generation-incremental-docker.sh` reconstructs and validates a
+verified generation in a private Linux volume, reuses ordinary FHS SquashFS
+images, translates tombstones only where required, creates and verifies
+independent dm-verity trees, and publishes realization v3.
+`realize-generation-docker.sh` remains the reproducible complete-SquashFS v2
+path for release images and compaction. Both validate
+`org.volatoo.gentoo-fhs/v1`; when release keys are supplied they sign the exact
+realization plan inside the pinned network-disabled container and verify that
+signature before activation. With `--activate --expected-current`, the
+compare-and-swap selection occurs only after all runtime images, verity trees,
+binding and signature are durable. Boot can therefore consume the
+already-realized result with an authenticated metadata-to-block chain instead
+of repeating composition or full-object hashing. `volatoo-generation scrub`
+performs the explicit full hash pass over every reachable object and can
+require trusted signatures for every retained root.
+
+The content-addressed store is not a package runtime prefix. Portage keeps
+installing normal Gentoo paths into the private staging root; atomicity is
+introduced at the complete system-closure boundary. See
+[`fhs-compatibility.md`](fhs-compatibility.md). Incremental composition and
+whiteout semantics are specified in
+[`incremental-realization.md`](incremental-realization.md).
+
 Docker compaction reconstructs only verified immutable objects, applies all
 tombstones and layers in order, and builds a layer-free generation with the
-same target and build context. It compares content, file types, numeric
-ownership, modes, link metadata, ACLs and xattrs before publication and
-records a compaction receipt. The source remains `previous` when the compacted
-generation is selected, so old layers are collectible only after the operator
-pins them or explicitly gives up that rollback point.
+same target and a new BuildContext bound to the compacted base digest. It
+compares content, file types, numeric ownership, modes, link metadata, ACLs
+and xattrs before publication and records a compaction receipt. Selection uses
+the current digest captured before reconstruction as its compare-and-swap
+precondition. The source remains `previous` when the compacted generation
+replaces it, so old layers are collectible only after the operator pins them
+or explicitly gives up that rollback point.
 
 ## Non-goals for the first implementation
 

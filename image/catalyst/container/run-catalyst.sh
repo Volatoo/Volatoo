@@ -21,6 +21,7 @@ required = {
     "snapshot_treeish",
     "source_subpath",
     "stage4/fsscript",
+    "stage4/empty",
     "stage4/packages",
     "stage4/root_overlay",
     "subarch",
@@ -36,6 +37,14 @@ if values["compression_mode"] != "squashfs_zstd":
     raise SystemExit("the Volatoo image must use squashfs_zstd")
 if not values["stage4/packages"]:
     raise SystemExit("the package set is empty")
+required_empty = {
+    "/var/cache/binpkgs",
+    "/var/cache/distfiles",
+    "/var/tmp/portage",
+    "/work",
+}
+if not required_empty.issubset(set(values["stage4/empty"])):
+    raise SystemExit("the release cleanup set is incomplete")
 if any("@" in str(value) for value in values.values()):
     raise SystemExit("the rendered spec still contains a placeholder")
 

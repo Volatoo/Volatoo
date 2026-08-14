@@ -5,10 +5,18 @@ on:
     paths:
       - ".github/workflows/update-contracts.yml"
       - "docs/design/atomic-package-updates.md"
+      - "docs/design/fhs-compatibility.md"
+      - "docs/design/generation-v2.md"
+      - "docs/design/incremental-realization.md"
+      - "docs/design/release-trust.md"
       - "docs/design/state-layout.md"
       - "initramfs/**"
+      - "kernel/**"
       - "scripts/build-initramfs.sh"
+      - "scripts/prepare-verity-root-docker.sh"
+      - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-state-image.sh"
+      - "scripts/measure-native-root-modes.sh"
       - "scripts/run-phase0-qemu.sh"
       - "scripts/test-qemu-boot.sh"
       - "update/**"
@@ -16,10 +24,18 @@ on:
     paths:
       - ".github/workflows/update-contracts.yml"
       - "docs/design/atomic-package-updates.md"
+      - "docs/design/fhs-compatibility.md"
+      - "docs/design/generation-v2.md"
+      - "docs/design/incremental-realization.md"
+      - "docs/design/release-trust.md"
       - "docs/design/state-layout.md"
       - "initramfs/**"
+      - "kernel/**"
       - "scripts/build-initramfs.sh"
+      - "scripts/prepare-verity-root-docker.sh"
+      - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-state-image.sh"
+      - "scripts/measure-native-root-modes.sh"
       - "scripts/run-phase0-qemu.sh"
       - "scripts/test-qemu-boot.sh"
       - "update/**"
@@ -43,23 +59,45 @@ jobs:
           shellcheck \
             initramfs/init \
             scripts/build-initramfs.sh \
+            scripts/prepare-verity-root-docker.sh \
+            scripts/prepare-signify-root-docker.sh \
             scripts/build-state-image.sh \
+            scripts/measure-native-root-modes.sh \
             scripts/run-phase0-qemu.sh \
             scripts/test-qemu-boot.sh \
+            scripts/test-qemu-boot-docker.sh \
+            update/plan-generation-docker.sh \
             update/compose-layer-docker.sh \
             update/compact-generation-docker.sh \
+            update/realize-generation-docker.sh \
+            update/realize-generation-incremental-docker.sh \
+            update/volatoo-update-view \
+            update/layer-container/materialize-generation.sh \
+            update/layer-container/prepare-incremental-realization.sh \
+            update/layer-container/validate-fhs.sh \
             update/layer-container/compact-generation.sh \
             update/layer-container/compress-layer.sh \
             update/tests/prepare-generation-qemu-fixture.sh \
+            update/tests/corrupt-state-object-docker.sh \
+            update/tests/corrupt-state-signature-docker.sh \
+            update/tests/prepare-stage-generation-docker.sh \
             update/tests/test-volatoo-manifest.sh \
             update/tests/test-volatoo-plan-docker.sh \
             update/tests/test-volatoo-acquire-docker.sh \
             update/tests/test-volatoo-layer-docker.sh \
             update/tests/test-volatoo-generation.sh \
+            update/tests/test-volatoo-generation-v2.sh \
+            update/tests/test-volatoo-incremental-realization.sh \
+            update/tests/test-volatoo-incremental-overlay-docker.sh \
+            update/tests/test-volatoo-incremental-verity-reuse-docker.sh \
+            update/tests/test-volatoo-signatures-docker.sh \
             update/tests/test-volatoo-activate.sh \
             update/tests/test-volatoo-engine.sh \
+            update/tests/test-volatoo-elf-closure.sh \
+            update/tests/test-volatoo-update-view-docker.sh \
             update/tests/test-volatoo-compaction-docker.sh \
             update/tests/test-volatoo-generation-qemu.sh
+          awk -f update/layer-container/validate-elf-closure.awk </dev/null
 
       - name: Check Python and JSON syntax
         run: |
@@ -71,7 +109,8 @@ jobs:
             update/volatoo-generation \
             update/volatoo-activate \
             update/volatoo-engine \
-            update/tests/fake-portage-engine.py
+            update/tests/fake-portage-engine.py \
+            update/tests/make-generation-fixture.py
           for schema in update/schemas/*.json; do
             python3 -m json.tool "$schema" >/dev/null
           done
@@ -81,6 +120,21 @@ jobs:
 
       - name: Test generation publication and rollback
         run: update/tests/test-volatoo-generation.sh
+
+      - name: Test generation v2 Portage transitions
+        run: update/tests/test-volatoo-generation-v2.sh
+
+      - name: Test incremental realization contracts
+        run: update/tests/test-volatoo-incremental-realization.sh
+
+      - name: Test incremental OverlayFS semantics
+        run: update/tests/test-volatoo-incremental-overlay-docker.sh
+
+      - name: Test incremental dm-verity reuse
+        run: update/tests/test-volatoo-incremental-verity-reuse-docker.sh
+
+      - name: Test realization release signatures
+        run: update/tests/test-volatoo-signatures-docker.sh
 
       - name: Test live service activation
         run: update/tests/test-volatoo-activate.sh
@@ -96,6 +150,12 @@ jobs:
 
       - name: Test binary-only layer composition
         run: update/tests/test-volatoo-layer-docker.sh
+
+      - name: Test ELF dependency closure
+        run: update/tests/test-volatoo-elf-closure.sh
+
+      - name: Test private update state view
+        run: update/tests/test-volatoo-update-view-docker.sh
 
       - name: Test base compaction
         run: update/tests/test-volatoo-compaction-docker.sh

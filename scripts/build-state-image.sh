@@ -171,6 +171,8 @@ docker run "${docker_args[@]}" \
 				system/objects/sha256 \
 				system/plans \
 				system/pins \
+				system/realizations \
+				system/signatures \
 				system/activations \
 				system/compactions \
 				system/staging
@@ -192,6 +194,8 @@ docker run "${docker_args[@]}" \
 				"$state_root/volatoo/system/objects/sha256" \
 				"$state_root/volatoo/system/plans" \
 				"$state_root/volatoo/system/pins" \
+				"$state_root/volatoo/system/realizations" \
+				"$state_root/volatoo/system/signatures" \
 				"$state_root/volatoo/system/activations" \
 				"$state_root/volatoo/system/compactions"
 			printf "1\n" >"$state_root/volatoo/layout-version"

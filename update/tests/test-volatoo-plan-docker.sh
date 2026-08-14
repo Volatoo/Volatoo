@@ -6,6 +6,7 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 openrc_stage3=gentoo/stage3@sha256:ffc1ede408d1f7f0194c13259679630533913a9473e7adcef367375932c7e8cb
 systemd_stage3=gentoo/stage3@sha256:0107bcedb0f12f4e905aa9dd4c7e00054b3339fe8cb7080b06e160e5a166c22d
 portage_image=gentoo/portage@sha256:6c49dbf51f9e52e3edeb43ca83e79025394b0a9b4c6cab1ed2b2f629e05c78e8
+runtime_image=volatoo-layer-compressor:plan-test
 platform=linux/amd64
 repo_container=volatoo-plan-portage-$$
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-plan-test.XXXXXX")
@@ -71,28 +72,33 @@ for init_system in openrc systemd; do
 		"$context_example" \
 		>"$work_dir/context-$init_system.json"
 
-	docker run --rm \
-		--platform "$platform" \
-		--volumes-from "$repo_container" \
-		--mount "type=bind,src=$repo_root,dst=/work,readonly" \
-		--mount "type=bind,src=$work_dir,dst=/result" \
-		--entrypoint /usr/bin/python3 \
+	VOLATOO_LAYER_COMPRESSOR_IMAGE=$runtime_image \
+		"$repo_root/update/tests/prepare-stage-generation-docker.sh" \
 		"$stage3_image" \
-		/work/update/volatoo-plan \
-			--build-context "/result/context-$init_system.json" \
-			--output "/result/build-spec-$init_system.json" \
-			--query-output "/result/query-$init_system.json" \
-			app-misc/jq
+		"$work_dir/context-$init_system.json" \
+		"$work_dir/parent-$init_system"
+	cp "$work_dir/parent-$init_system/provenance/build-context.json" \
+		"$work_dir/context-$init_system-final.json"
+
+	VOLATOO_LAYER_COMPRESSOR_IMAGE=$runtime_image \
+		"$repo_root/update/plan-generation-docker.sh" \
+		--state "$work_dir/parent-$init_system/state" \
+		--generation current \
+		--build-context "$work_dir/context-$init_system-final.json" \
+		--output "$work_dir/build-spec-$init_system.json" \
+		--query-output "$work_dir/query-$init_system.json" \
+		--portage-image "$portage_image" \
+		app-misc/jq
 
 	"$repo_root/update/volatoo-manifest" \
 		verify-build-spec \
 		"$work_dir/build-spec-$init_system.json" \
-		"$work_dir/context-$init_system.json"
+		"$work_dir/context-$init_system-final.json"
 	"$repo_root/update/volatoo-manifest" \
 		verify-package-source-query \
 		"$work_dir/query-$init_system.json" \
 		"$work_dir/build-spec-$init_system.json" \
-		"$work_dir/context-$init_system.json"
+		"$work_dir/context-$init_system-final.json"
 
 	package_count=$(
 		jq '.packages | length' \
@@ -110,11 +116,30 @@ for init_system in openrc systemd; do
 		fail "$init_system: jq is missing from the resolved closure"
 done
 
+jq '.world_digest = ("f" * 64 | "sha256:" + .)' \
+	"$work_dir/context-openrc-final.json" \
+	>"$work_dir/wrong-parent-context.json"
+if VOLATOO_LAYER_COMPRESSOR_IMAGE=$runtime_image \
+	"$repo_root/update/plan-generation-docker.sh" \
+	--state "$work_dir/parent-openrc/state" \
+	--generation current \
+	--build-context "$work_dir/wrong-parent-context.json" \
+	--output "$work_dir/wrong-parent-spec.json" \
+	--query-output "$work_dir/wrong-parent-query.json" \
+	--portage-image "$portage_image" \
+	app-misc/jq >"$work_dir/wrong-parent.log" 2>&1
+then
+	fail "generation planner accepted a context outside the selected parent"
+fi
+grep -Fq "generation v1 requires an unchanged build context" \
+	"$work_dir/wrong-parent.log" ||
+	fail "generation planner did not diagnose the parent/context mismatch"
+
 jq '
 	.target.init = "systemd"
 	| .target.id = "volatoo/amd64/glibc/systemd/23.0/base-v1"
 	| .target.profile_id = "volatoo/amd64/glibc/systemd/base-v1"
-' "$work_dir/context-openrc.json" >"$work_dir/wrong-init.json"
+' "$work_dir/context-openrc-final.json" >"$work_dir/wrong-init.json"
 if docker run --rm \
 	--platform "$platform" \
 	--volumes-from "$repo_container" \
@@ -136,7 +161,7 @@ grep -Fq "init system does not match build context" \
 
 jq '
 	.sources[0].revision = ("f" * 40)
-' "$work_dir/context-openrc.json" >"$work_dir/wrong-revision.json"
+' "$work_dir/context-openrc-final.json" >"$work_dir/wrong-revision.json"
 if docker run --rm \
 	--platform "$platform" \
 	--volumes-from "$repo_container" \
