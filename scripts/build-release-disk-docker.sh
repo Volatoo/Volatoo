@@ -89,3 +89,48 @@ docker run --rm --privileged \
 	--mount "type=bind,src=$state,dst=/input/state,readonly" \
 	--mount "type=bind,src=$output_dir,dst=/output" \
 	"$image"
+
+output_path=$output_dir/$output_name
+manifest_path=$output_path.manifest
+for release_path in "$output_path" "$manifest_path"; do
+	[[ -f $release_path && ! -L $release_path ]] || {
+		echo "error: release builder did not publish a safe file: $release_path" >&2
+		exit 1
+	}
+done
+manifest_value()
+{
+	local key=$1
+	awk -F= -v key="$key" '
+		$1 == key { count++; value=substr($0, length(key) + 2) }
+		END { if (count != 1) exit 1; print value }
+	' "$manifest_path"
+}
+[[ $(manifest_value schema) == org.volatoo.release-media/v1 && \
+	$(manifest_value init_system) == "$init_system" && \
+	$(manifest_value disk_file) == "$output_name" ]] || {
+	echo "error: release manifest identity differs after publication" >&2
+	exit 1
+}
+expected_size=$(manifest_value disk_size)
+actual_size=$(wc -c <"$output_path" | tr -d '[:space:]')
+[[ $expected_size =~ ^[1-9][0-9]*$ && $actual_size == "$expected_size" ]] || {
+	echo "error: release size differs after publication" >&2
+	exit 1
+}
+checksum_file()
+{
+	if command -v sha256sum >/dev/null 2>&1; then
+		sha256sum "$1" | awk '{print $1}'
+	else
+		shasum -a 256 "$1" | awk '{print $1}'
+	fi
+}
+actual_disk_sha256=$(checksum_file "$output_path")
+actual_rootfs_sha256=$(checksum_file "$rootfs")
+[[ $(manifest_value disk_sha256) == "$actual_disk_sha256" && \
+	$(manifest_value rootfs_sha256) == "$actual_rootfs_sha256" ]] || {
+	echo "error: release digest differs after publication" >&2
+	exit 1
+}
+echo "verified $output_path after OrbStack publication"

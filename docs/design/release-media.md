@@ -35,7 +35,10 @@ Partitioning, filesystem creation and GRUB installation run only inside the
 pinned privileged release container through the OrbStack Docker context. The
 host wrapper accepts regular input files, creates one new regular output file,
 and refuses to overwrite an existing path. It never accepts or writes a host
-block device.
+block device. After the container exits, the wrapper independently rechecks
+the published file size, image digest, rootfs digest and manifest identity from
+the host-visible paths. A writeback or bind-publication drift therefore fails
+closed before the image can reach the installer.
 
 ## Acceptance gates
 
