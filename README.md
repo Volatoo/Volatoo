@@ -1,6 +1,12 @@
 # Volatoo
 
-**Volatoo** (*volatile* + *Gentoo*) is a Gentoo-based distribution that runs entirely from RAM: the root filesystem is a tmpfs, populated at boot from a compressed system image. Disks are demoted to cold storage — the OS itself lives in memory.
+**Volatoo** (*volatile* + *Gentoo*) is a Gentoo-based distribution with
+NixOS-style immutable system generations and a disposable writable root. The
+selected immutable objects remain in a persistent content-addressed store; the
+exact realization plan is authenticated by an initramfs-embedded Ed25519
+release key, the base and FHS update layers are independently authenticated by
+dm-verity, mounted as one read-only lower stack and read on demand, while a
+tmpfs OverlayFS upper holds all unpersisted runtime changes.
 
 > Status: Phases 0 through 2 are complete; Phase 3 now has a validated Catalyst
 > minimal-image build, with the remaining release-image work tracked below.
@@ -8,36 +14,53 @@
 
 ## Why
 
-- **Speed** — every read and write on `/` happens at RAM speed. No I/O scheduler, no disk latency, no filesystem journaling overhead.
-- **A pristine system on every boot** — the running system is disposable by construction. Reboot and you are back to a known-good image. Configuration drift, leftover state, and half-finished experiments evaporate.
-- **Practical immutability without read-only pain** — unlike image-based immutable distros, `/` stays fully writable. You can `emerge` packages, edit anything, break anything. It just doesn't survive a reboot unless you ask it to.
-- **Zero disk wear, optional disk at all** — the storage device is only touched to load the image and to sync explicitly persisted state. A Volatoo machine can run diskless from PXE.
+- **Fast startup and low memory amplification** — the kernel reads compressed
+  SquashFS blocks only when needed and verifies those blocks through dm-verity,
+  instead of expanding or hashing the complete closure during early boot.
+- **A pristine system on every boot** — the writable root is disposable by
+  construction. Reboot and you are back to the selected immutable generation.
+- **Practical immutability without read-only pain** — `/` remains writable
+  through a tmpfs upper. Experiments disappear on reboot unless they are
+  persisted or promoted into a new generation.
+- **Atomic generations and rollback** — content-addressed objects are
+  published before an atomic generation-pointer switch. Previous generations
+  remain independently bootable.
 - **Gentoo underneath** — full Portage, your USE flags, your kernel and your
   choice of OpenRC or systemd. Volatoo is a boot/lifecycle layer on top of
-  Gentoo, not a fork of it.
+  Gentoo, not a fork of it. Packages keep the normal Gentoo/FHS runtime layout;
+  content addressing applies to the complete system closure, not to package
+  installation prefixes.
+
+`ram-overlay` remains available for PXE, removable-media, and source-device
+release use cases. It copies only the compressed closure to RAM. Full
+filesystem expansion with `copy` is retained as a compatibility/debug mode,
+not the release default.
 
 ## How it works (design)
 
 ```
 bootloader
    └─ kernel + volatoo-initramfs
-        ├─ locate system image (disk / USB / PXE)
+        ├─ locate the system store or boot image (disk / USB / PXE)
         ├─ discover the optional VOLATOO-STATE filesystem
         ├─ select and verify current (or previous) system generation
-        ├─ verify the base, ordered layers, tombstones, and provenance objects
-        ├─ mount tmpfs on /newroot
-        ├─ materialize the base plus system layers
+        ├─ verify the small generation, boot-plan and realization bindings
+        ├─ authenticate the exact realization plan with a release key
+        ├─ open the base and FHS update layers through dm-verity
+        ├─ compose the authenticated immutable lower stack read-only
+        ├─ create a disposable tmpfs OverlayFS upper
+        ├─ use generation-v1 deltas only for legacy compatibility
         ├─ apply persistence policies (/etc, /var, /home …)
         ├─ restore machine identity and persistent logs
-        └─ switch_root into RAM
-             └─ the selected init system boots a normal Gentoo — from memory
+        └─ switch_root into the ephemeral merged root
+             └─ the selected init system boots a normal Gentoo
 ```
 
 Three cooperating pieces:
 
 | Component | Role |
 |---|---|
-| `volatoo-initramfs` | Initramfs generator: mounts tmpfs, unpacks the image, applies persistence, `switch_root` |
+| `volatoo-initramfs` | Initramfs generator: mounts the immutable lower and tmpfs upper, applies persistence, `switch_root` |
 | `volatoo-image` | Builds the compressed rootfs image from a Gentoo stage3 + package set (catalyst-based) |
 | `volatoo-persist` | Declarative persistence: which paths survive reboot, and how they sync back to disk |
 
@@ -58,6 +81,16 @@ See [`docs/design/machine-identity.md`](docs/design/machine-identity.md) for
 the machine-id, SSH host-key, log, and opt-out semantics.
 The atomic package update and Portage Engine boundary is specified in
 [`docs/design/atomic-package-updates.md`](docs/design/atomic-package-updates.md).
+Generation v2 Portage desired-state transitions are specified in
+[`docs/design/generation-v2.md`](docs/design/generation-v2.md).
+Incremental authenticated realization and OverlayFS tombstone semantics are
+specified in
+[`docs/design/incremental-realization.md`](docs/design/incremental-realization.md).
+The reason Volatoo keeps normal Gentoo paths rather than adopting a
+package-level `/nix/store` layout is specified in
+[`docs/design/fhs-compatibility.md`](docs/design/fhs-compatibility.md).
+The release-key, rollback and Secure Boot boundaries are specified in
+[`docs/design/release-trust.md`](docs/design/release-trust.md).
 OpenRC and systemd minimal images both pass the overlay-root BIOS and UEFI
 boot gates. They are separate, first-class release targets; users select one
 during image installation or generation selection rather than converting the
@@ -66,8 +99,10 @@ init system with an ordinary package layer.
 ## Requirements (target)
 
 - x86_64, UEFI or BIOS
-- RAM ≥ 8 GiB recommended (image size + working set; a minimal image targets ~2 GiB unpacked)
-- Any block device, USB stick, or PXE server to hold the boot image — or no disk at all
+- RAM ≥ 4 GiB target for the persistent-store mode; 8 GiB recommended for
+  full-RAM or large package-build workloads
+- A block device for the persistent system store, or PXE/removable media with
+  `ram-overlay`
 
 ## Repository layout
 

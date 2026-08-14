@@ -33,7 +33,15 @@ delta and its SquashFS object to the parent generation, package acquisition
 and resulting Portage world state.
 
 `org.volatoo.generation/v1` identifies one base SquashFS and an ordered list of
-system layers. The generation manifest digest is the generation identity.
+system layers under one immutable BuildContext. It remains readable for
+existing stores.
+
+`org.volatoo.portage-state/v1` identifies the resulting Portage configuration,
+world set, repository snapshots, profile and toolchain.
+`org.volatoo.generation/v2` binds that desired state and the exact parent
+generation to the base and ordered FHS-compatible layers. A v2 descendant may
+therefore change Portage inputs without rewriting its historical parents.
+The generation manifest digest remains the generation identity.
 
 `org.volatoo.portage-engine-target/v1` is an operator-reviewed binding from a
 Volatoo hard target to a Portage Engine profile, repository set, immutable
@@ -46,6 +54,7 @@ The JSON schemas document the wire format:
 - `schemas/build-context-v1.schema.json`
 - `schemas/build-spec-v1.schema.json`
 - `schemas/generation-v1.schema.json`
+- `schemas/generation-v2.schema.json`
 - `schemas/layer-paths-v1.schema.json`
 - `schemas/layer-transaction-v1.schema.json`
 - `schemas/package-acquisition-v1.schema.json`
@@ -53,6 +62,7 @@ The JSON schemas document the wire format:
 - `schemas/package-source-query-v1.schema.json`
 - `schemas/portage-engine-job-v1.schema.json`
 - `schemas/portage-engine-target-v1.schema.json`
+- `schemas/portage-state-v1.schema.json`
 - `schemas/tombstones-v1.schema.json`
 - `schemas/activation-policy-v1.schema.json`
 - `schemas/activation-receipt-v1.schema.json`
@@ -96,6 +106,11 @@ update/volatoo-manifest verify-generation \
   update/examples/build-context-v1.json
 
 update/volatoo-manifest verify-generation \
+  update/examples/generation-v2.json \
+  update/examples/build-context-v1.json \
+  update/examples/portage-state-v1.json
+
+update/volatoo-manifest verify-generation \
   update/examples/generation-systemd-v1.json \
   update/examples/build-context-systemd-v1.json
 
@@ -116,17 +131,25 @@ update/volatoo-manifest verify-acquisition \
 ```
 
 `verify-generation` confirms that the target, context digest and base rootfs
-digest agree. It does not inspect the referenced SquashFS or tombstone objects;
-the layer composer and boot verifier will add object verification in later
-milestones.
+digest agree. For v2 it also verifies the exact content-addressed
+PortageState. `volatoo-generation inspect` verifies the complete stored
+closure and returns its boot-plan digest. The Docker materializer requires
+that exact digest, rejects a changed generation-to-plan pointer, then hashes
+private snapshots of the manifest, boot plan and every referenced object
+before reconstructing the root only from those verified snapshots.
 
 ## Local Portage planner
 
-`volatoo-plan` must run inside a pristine root reconstructed from the selected
-generation. It deliberately does not resolve against the mutable live tmpfs
-root. The root must contain Portage's Python modules and installed VDB, while
-every configured repository must be mounted at the revision named by the
-build context.
+`plan-generation-docker.sh` is the host entry point. It resolves and validates
+an already-published generation, verifies that it names the supplied
+BuildContext, reconstructs its base and ordered layers into a private Docker
+volume, and chroots into that exact root before invoking `volatoo-plan`.
+Planning therefore cannot silently fall back to a caller-selected stage3 or
+the mutable live tmpfs root. A v1 parent requires the same context; a v2
+parent permits a new context only when its input world matches the parent
+PortageState. The reconstructed root supplies Portage's Python
+modules and installed VDB; every repository is mounted at the revision named
+by the build context.
 
 Repository revisions are read from `metadata/timestamp.commit`, a
 `.volatoo-revision` snapshot marker, or a clean Git checkout. The planner
@@ -136,15 +159,21 @@ revision and init system. Init detection uses both the profile chain and the
 installed OpenRC/systemd package, so changing only a target ID cannot bypass
 the check.
 
-Example inside the selected root:
+Example:
 
 ```sh
-update/volatoo-plan \
+update/plan-generation-docker.sh \
+  --state /.volatoo/state \
+  --generation current \
   --build-context /run/volatoo/build-context.json \
   --output /var/tmp/build-spec.json \
   --query-output /var/tmp/package-source-query.json \
   app-misc/jq
 ```
+
+Additional immutable repositories use
+`--repository NAME=/absolute/snapshot`. `volatoo-plan` remains the internal
+resolver executed inside the reconstructed root.
 
 The default request is a oneshot transaction. Add `--select` when the requested
 atoms should enter the world set. Atoms are resolved with a complete graph and
@@ -246,8 +275,10 @@ client configuration.
 
 ## Binary-only layer staging
 
-`compose-layer-docker.sh` is the P3U-3 entry point. It runs the selected Gentoo
-root in a disposable Docker container, verifies the complete acquisition,
+`compose-layer-docker.sh` is the P3U-3 entry point. It resolves the selected
+published generation from the state store, independently verifies all
+referenced objects while reconstructing its root into a Docker volume, then
+chroots into that exact parent. It verifies the complete acquisition,
 constructs a transaction-only PKGDIR and invokes Portage with
 `--usepkgonly`, `--binpkg-respect-use=y` and
 `--binpkg-changed-deps=y`. It snapshots the pristine root before and after
@@ -258,30 +289,45 @@ SquashFS compression runs in a separate minimal container. The staging root
 never receives `mksquashfs`, and neither container modifies the live host root.
 The intermediate layer tree stays on a Docker volume so Linux ownership, ACLs
 and xattrs are preserved when the host is macOS. Only the SquashFS object and
-canonical metadata are exported. Finalization writes `transaction.json` and a
-generation candidate that appends exactly one layer. It deliberately does not
-update a `current` pointer; atomic publication belongs to P3U-4.
+canonical metadata are exported. Finalization writes `transaction.json`,
+`portage-state.json` and a generation-v2 candidate that appends exactly one
+layer. It deliberately does not update a `current` pointer; atomic publication
+belongs to P3U-4.
 
 ```sh
 update/compose-layer-docker.sh \
-  --stage-image gentoo/stage3@sha256:... \
+  --state /.volatoo/state \
+  --generation current \
   --build-context /path/build-context.json \
   --build-spec /path/build-spec.json \
   --acquisition /path/acquisition.json \
-  --parent-generation /path/generation.json \
   --store /volatoo/system/objects \
   --output-dir /path/layer-output
 ```
 
 Additional pinned repositories are mounted with
-`--repository NAME=/absolute/path`. The selected Docker root must represent
-the parent generation and carry the exact Portage/profile baseline named by
-the build context.
+`--repository NAME=/absolute/path`. The pinned `--portage-image` contributes
+only the Gentoo repository snapshot; it is never used as the parent root.
 
 ## Generation publication and rollback
 
 `volatoo-generation` publishes the P3U-4 closure to the state filesystem and
 manages boot selection:
+
+On a running Volatoo host, `/.volatoo/state/volatoo/system` is intentionally
+read-only. A mutating update transaction must run through the serialized
+private view:
+
+```sh
+/usr/libexec/volatoo-update-view \
+  /usr/local/libexec/volatoo-update-transaction
+```
+
+The transaction receives its writable state path in
+`VOLATOO_UPDATE_STATE` (`/run/volatoo/update-state`). Read-only inspection can
+continue to use `/.volatoo/state`. The examples below use an installer or
+offline mount at `/mnt/volatoo-state`; inside the running host, substitute
+`"$VOLATOO_UPDATE_STATE"` from the private transaction.
 
 ```sh
 update/volatoo-generation migrate-state --state /mnt/volatoo-state
@@ -290,11 +336,21 @@ update/volatoo-generation publish \
   --state /mnt/volatoo-state \
   --generation /path/generation.json \
   --object /path/build-context.json \
+  --object /path/build-spec.json \
+  --object /path/source-catalog.json \
+  --object /path/acquisition.json \
   --object /path/base.squashfs \
   --object /path/layer.squashfs \
+  --object /path/changed-paths.json \
   --object /path/tombstones.json \
-  --object /path/transaction.json \
-  --activate
+  --object /path/transaction.json
+
+update/realize-generation-incremental-docker.sh \
+  --state /mnt/volatoo-state \
+  --generation sha256:... \
+  --output-dir /var/tmp/volatoo-realized \
+  --activate \
+  --expected-current "$PARENT_GENERATION_DIGEST"
 
 update/volatoo-generation status --state /mnt/volatoo-state
 update/volatoo-generation rollback --state /mnt/volatoo-state
@@ -302,16 +358,177 @@ update/volatoo-generation rollback --state /mnt/volatoo-state
 update/volatoo-generation pin --state /mnt/volatoo-state before-nginx
 update/volatoo-generation inspect --state /mnt/volatoo-state current
 update/volatoo-generation list --state /mnt/volatoo-state
+update/volatoo-generation scrub --state /mnt/volatoo-state
 update/volatoo-generation gc --state /mnt/volatoo-state
 update/volatoo-generation gc --state /mnt/volatoo-state --delete
 ```
 
-Every referenced object is verified before the immutable manifest and derived
-boot plan are published. `previous` is replaced before `current`, so an
-interrupted selection still names a complete old generation. At boot,
-`volatoo.generation=auto` verifies current and falls back to previous.
-`previous`, `none`, and an explicit `sha256:<digest>` are available as kernel
-command-line recovery selections.
+Every generation parent must already be published. Version 1 reconstructs
+parents as same-context prefixes; version 2 follows the explicit
+`parent_generation_digest` chain. Publication verifies the generation against
+its BuildContext and PortageState, then verifies every layer's BuildSpec,
+source catalog, acquisition receipt, changed paths, tombstones and transaction
+before publishing the immutable manifest and derived boot plan.
+The base-only parent is published first with
+`--expected-current none`; later activation names the exact current digest it
+was planned from. This compare-and-swap check rejects a stale concurrent
+update instead of silently replacing it.
+
+The ordinary update path publishes the manifest without selecting it, then
+uses `realize-generation-incremental-docker.sh` to reconstruct the exact final
+Gentoo tree in a private Linux volume. A first realization performs complete
+FHS/ELF validation. An exact direct child scans only its new layer, merges
+those records and tombstones into the authenticated parent index, and validates
+the complete FHS, shebang, loader and ELF dependency semantics from that
+merged index. It reuses
+the base and layers byte for byte unless a layer's tombstones must be
+translated to OverlayFS whiteouts or opaque-directory metadata. The
+materializer's content-verified object snapshots remain private to that build
+and are reused by later realization steps, avoiding a second read and hash of
+the mutable state paths. It creates
+and verifies an independent deterministic dm-verity tree for every new runtime
+image. Byte-identical base and historical layer images reuse exact records
+from the fully validated direct-parent v3 realization; transformed tombstone
+layers are deliberately regenerated. The realizer publishes v3 with the
+ordered composition, source digests, runtime images, root hashes, salts and
+fixed geometry. It also publishes a content-addressed parent-tree receipt that
+binds the complete FHS/ELF validation result, exact direct-parent realization,
+and separate canonical validation-index and compositional tree-state objects.
+The index contains the
+path, symlink, shebang, loader and target-ABI ELF inputs used by the
+affected-closure validator. The receipt digest is part of the signed plan,
+while the larger index stays out of the boot-critical receipt path.
+Receipt v3 uses the tree-state digest as the realization `tree` identity. The
+small state binds the exact generation, boot plan, target, BuildContext,
+validation index and direct-parent state, replacing the redundant flat scan of
+every materialized file byte. Receipt v1 and v2 remain readable.
+Publication and signing can therefore avoid another full hash of strictly
+identical inherited v3 image records while retaining shape checks and
+fail-closed dm-verity reads. Its exported `reuse-report` records cache hits and
+generated trees without entering the signed plan. Set
+`VOLATOO_VALIDATION_AUDIT=1` to retain the independent complete-tree scan and
+require its canonical index to equal the incremental result byte for byte.
+This is the periodic audit/CI Gate; ordinary exact indexed descendants use the
+incremental path.
+
+The complete closure is not recompressed for an ordinary update.
+`realize-generation-docker.sh` remains the realization-v2 path for release
+images and compaction. It produces and verifies one reproducible complete
+SquashFS plus one deterministic dm-verity tree. Both paths bind the exact
+generation, boot plan, target, BuildContext, authenticated tree identity and
+`org.volatoo.gentoo-fhs/v1` contract.
+
+With `--signing-key KEY.sec --trusted-key KEY.pub`, either realizer signs the
+exact realization-plan bytes in a network-disabled container and verifies the
+result before activation. Optional activation is compare-and-swap, so
+`current` changes only after every image, hash tree, binding and requested
+release signature is durable.
+`publish --require-realization` and `select --require-realization` are
+available to enforce this policy in lower-level workflows.
+
+An automated lab or CI workflow may sign inside the network-disabled helper
+container:
+
+```sh
+update/realize-generation-incremental-docker.sh \
+  --state /mnt/volatoo-state \
+  --generation sha256:... \
+  --output-dir /var/tmp/realized \
+  --signing-key /secure/volatoo-release.sec \
+  --trusted-key /secure/volatoo-release.pub \
+  --activate \
+  --expected-current sha256:...
+```
+
+The secret key is mounted read-only into the short-lived signing container and
+never enters the realized Gentoo closure or state image. Production release
+keys should instead remain on an isolated signing host: publish the
+realization without activation, attach the prepared state to that host, run
+the lower-level `sign-realization` command below, and activate only after its
+verification succeeds.
+
+`record-incremental-realization` is the ordinary lower-level publication
+interface for a trusted builder. The canonical v3 plan contains all ordered
+image and dm-verity records:
+
+```sh
+update/volatoo-generation record-incremental-realization \
+  --state /mnt/volatoo-state \
+  --generation sha256:... \
+  --plan /path/realization.plan \
+  --object /path/new-or-reused-object \
+  --object /path/verity-object
+```
+
+Every supplied object is hashed before publication. An object already present
+in the state store may be referenced by the plan without being supplied
+again; an unreferenced supplied object is rejected.
+
+`record-realization` is the complete-closure v1/v2 publication interface:
+
+```sh
+update/volatoo-generation record-realization \
+  --state /mnt/volatoo-state \
+  --generation sha256:... \
+  --boot-plan-digest sha256:... \
+  --rootfs /path/closure.squashfs \
+  --tree-digest sha256:... \
+  --fhs-contract org.volatoo.gentoo-fhs/v1 \
+  --verity-hash /path/closure.verity \
+  --verity-root-hash 64-lowercase-hex-digits \
+  --verity-salt 64-lowercase-hex-digits \
+  --verity-data-blocks 12345
+```
+
+Once a realization entry exists, validation requires its exact generation,
+boot plan, target, BuildContext, FHS contract, image set and builder contract.
+Version 3 boots the independently authenticated base and layer stack through
+dm-verity. Version 2 boots one complete persistent closure through dm-verity.
+Omitting all four `--verity-*` options from `record-realization` records the
+legacy version-1 contract for recovery testing; it retains eager full-object
+hashing.
+Corruption fails the generation or an authenticated read; it never silently
+downgrades to layer replay. Unbound generation-v1 stores remain bootable for
+recovery compatibility.
+
+`sign-realization` is the separated signing interface for an offline or
+operator-controlled release step. It signs the existing exact realization
+object, normalizes the unauthenticated comment, verifies the result against
+the supplied public key, and stores it at
+`signatures/<realization-hex>/<public-key-sha256>.sig`. Repeating the command
+with a new key adds a second signature for overlap during rotation:
+
+```sh
+update/volatoo-generation sign-realization \
+  --state /mnt/volatoo-state \
+  --generation sha256:... \
+  --secret-key /secure/volatoo-release.sec \
+  --trusted-key /secure/volatoo-release.pub
+
+update/volatoo-generation select \
+  --state /mnt/volatoo-state \
+  --expected-current sha256:... \
+  --require-realization \
+  --require-signature \
+  --trusted-key /secure/volatoo-release.pub \
+  sha256:...
+```
+
+`org.volatoo.gentoo-fhs/v1` deliberately keeps package payloads at their normal
+Gentoo paths. It rejects runtime references to `/nix/store`, the Volatoo CAS
+and private staging mountpoints; the CAS remains an implementation detail.
+
+`previous` is replaced before `current`, so an interrupted selection still
+names a complete old generation. At boot, `volatoo.generation=auto` verifies
+current and falls back to previous. `previous`, `none`, and an explicit
+`sha256:<digest>` are available as kernel command-line recovery selections.
+
+`scrub` hashes and validates every object reachable from `current`, `previous`
+and named pins, including realization-v2/v3 SquashFS, verity and signature
+files and authenticated parent-tree receipts.
+`--trusted-key KEY.pub --require-signature` additionally performs the release
+signature Gate for every reachable root. This is the explicit full-store
+integrity pass moved out of normal boot.
 
 `gc` is a dry run unless `--delete` is present. It retains current, previous,
 named pins, their generation ancestry, boot plans and every stored
@@ -363,8 +580,10 @@ The Docker path reconstructs the verified generation, applies tombstones and
 layers in order, recompresses one base with the pinned SquashFS toolchain and
 checks filesystem metadata equivalence after extraction. Publication and
 selection remain separate operations internally, allowing the compaction
-receipt to become durable first. The source generation becomes `previous`
-when `--activate` is used.
+receipt to become durable first. Compaction emits a new BuildContext bound to
+the new base digest, and selection compares the current pointer with the value
+captured before reconstruction. The source generation becomes `previous` when
+it was current and `--activate` is used.
 
 ## Tests
 
@@ -374,27 +593,77 @@ update/tests/test-volatoo-plan-docker.sh
 update/tests/test-volatoo-acquire-docker.sh
 update/tests/test-volatoo-layer-docker.sh
 update/tests/test-volatoo-generation.sh
+update/tests/test-volatoo-generation-v2.sh
+update/tests/test-volatoo-incremental-realization.sh
+update/tests/test-volatoo-incremental-overlay-docker.sh
+update/tests/test-volatoo-incremental-verity-reuse-docker.sh
+update/tests/test-volatoo-signatures-docker.sh
 update/tests/test-volatoo-activate.sh
 update/tests/test-volatoo-compaction-docker.sh
 ```
 
-The planner Docker test resolves `app-misc/jq` with pinned OpenRC and systemd
-Gentoo stage3 images plus a pinned repository image, verifies each two-package
-closure, and confirms that an OpenRC root rejects a systemd context.
+The planner Docker test publishes real OpenRC and systemd base generations,
+reconstructs each selected parent with a pinned repository snapshot, resolves
+`app-misc/jq`, verifies each two-package closure, and confirms that a context
+outside the selected parent is rejected.
 The layer Docker test builds a local GPKG, installs it through the acquired
-binary-only closure in both init variants, proves byte-identical SquashFS
-recompression, reconstructs each candidate on a fresh stage3 root and verifies
-the payload plus Portage VDB.
-The generation test covers publication ordering, explicit rollback, an
-interrupted pointer update, corrupt-current fallback and incomplete-closure
-rejection. The activation test covers eligibility, a healthy external handoff
-and file/selection rollback after a failed health check. The compaction Docker
-test reduces a real two-layer SquashFS generation to one verified base, then
-confirms the old chain becomes collectible only after its rollback pointer is
-explicitly removed. With built images and a development kernel, the full firmware and
-init-system matrix is:
+binary-only closure inside both reconstructed parents, proves byte-identical
+SquashFS recompression, publishes and rematerializes each candidate, and
+verifies the payload plus Portage VDB.
+The generation, incremental-realization and signature tests cover publication
+ordering, realization-v1/v2/v3 parsing, exact source/image ordering,
+unreferenced-object rejection, explicit scrub, verity-object corruption,
+missing signatures, wrong keys, key rotation, signatures over different messages,
+signature GC, explicit rollback, an interrupted pointer update,
+corrupt-current fallback, complete provenance and parent validation,
+BuildContext/base mismatch, and stale compare-and-swap rejection.
+The incremental OverlayFS Docker test round-trips whiteout character devices
+and opaque-directory xattrs through the pinned SquashFS toolchain, then proves
+pure deletion and replacement-directory behavior in a real lower stack.
+The incremental dm-verity reuse test proves the materializer retains its
+verified object snapshots, an exact direct-parent record skips hash-tree
+generation, a cache miss generates a new tree, and a changed cached hash object
+fails closed. The host contract test also proves that a receipt-bound direct
+parent can publish inherited image records and rejects a changed parent
+realization pointer.
+The activation test covers eligibility, a healthy external handoff and
+file/selection rollback after a failed health check. The compaction Docker
+test reduces a real two-layer SquashFS generation to one verified base,
+publishes and verifies its deterministic dm-verity tree, then confirms the old
+chain becomes collectible only after its rollback pointer is explicitly
+removed. It also proves that corrupt layer objects and boot-plan pointer swaps
+fail closed before materialization. With built images and a development
+kernel, the full firmware and init-system matrix is:
 
 ```sh
+update/tests/test-volatoo-generation-qemu.sh \
+  /path/to/kernel \
+  /path/to/initramfs \
+  /path/to/openrc.squashfs \
+  /path/to/systemd.squashfs
+```
+
+By default this runs normal, corrupt-current and interrupted-selection
+lifecycle boots for OpenRC and systemd under BIOS and UEFI with the persistent
+`store-overlay` root. It then reuses a normal fixture to verify the layer
+payload and tombstones in store-backed overlay, RAM-backed overlay, and
+full-copy roots.
+With `VOLATOO_GENERATION_QEMU_REALIZED=yes`, it additionally requires an
+active realization-v2 root or realization-v3 authenticated layer stack under
+BIOS and UEFI. Corrupt SquashFS data and used hash-tree blocks must fail at the
+authenticated SquashFS mount.
+Supplying `VOLATOO_GENERATION_QEMU_SIGNING_KEY` and
+`VOLATOO_GENERATION_QEMU_TRUSTED_KEY` signs that fixture and requires the
+public key to be embedded in the supplied initramfs. The signed lane verifies
+BIOS/UEFI boot and corrupts the detached signature in a third image, which
+must fail before accepting the dm-verity root hash.
+The full-copy lane has a separate 900-second timeout because cross-architecture
+TCG must expand the complete Gentoo root. A quicker smoke run can select one
+firmware and keep only the RAM-backed lane:
+
+```sh
+VOLATOO_GENERATION_QEMU_FIRMWARES=bios \
+VOLATOO_GENERATION_QEMU_PAYLOAD_ROOT_MODES=ram-overlay \
 update/tests/test-volatoo-generation-qemu.sh \
   /path/to/kernel \
   /path/to/initramfs \
