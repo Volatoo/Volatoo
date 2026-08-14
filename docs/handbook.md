@@ -163,10 +163,12 @@ The reproducible build sequence is:
 
 1. Verify and fetch matching Gentoo stage3 and repository-snapshot inputs with
    `scripts/fetch-gentoo-inputs.sh`.
-2. Prepare the pinned userspace verifier and release public key set with
-   `scripts/prepare-signify-root-docker.sh`.
-3. Build the selected Catalyst root with
-   `scripts/build-catalyst-squashfs.sh`.
+2. Prepare the pinned initramfs verifier with
+   `scripts/prepare-signify-root-docker.sh` and select the release public key
+   set. The Catalyst root installs Gentoo's native `app-crypt/signify` from the
+   verified repository snapshot.
+3. Build the selected Catalyst root with `scripts/build-catalyst-squashfs.sh`,
+   passing each release public key with `--trust-key`.
 4. Build and validate the pinned kernel with
    `scripts/build-kernel-docker.sh`.
 5. Build the release-policy initramfs and initial state image.

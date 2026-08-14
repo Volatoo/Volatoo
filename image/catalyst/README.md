@@ -1,12 +1,12 @@
 # Catalyst image build
 
-Each Phase 3 `minimal` image is a Catalyst `stage4` built from four explicit
+Each Phase 3 `minimal` image is a Catalyst `stage4` built from five explicit
 inputs:
 
 1. the selected `openrc` or `systemd` target;
 2. the matching official amd64 stage3 archive;
 3. its matching Gentoo repository snapshot in Catalyst SquashFS format;
-4. the pinned `signify` verifier closure and one or more release public keys;
+4. one or more release public keys;
 5. the version and snapshot identifiers passed on the command line.
 
 OpenRC uses `default/linux/amd64/23.0`; systemd uses
@@ -39,7 +39,6 @@ scripts/build-catalyst-squashfs.sh \
   --stage3 /path/to/stage3-amd64-openrc-20260719T170103Z.tar.xz \
   --snapshot /path/to/gentoo-20260719.xz.sqfs \
   --snapshot-id 20260719 \
-  --signify-root out/signify-root \
   --trust-key /secure/volatoo-release.pub \
   --version 20260723 \
   out/volatoo-minimal-openrc-20260723.squashfs
@@ -53,7 +52,6 @@ scripts/build-catalyst-squashfs.sh \
   --stage3 /path/to/stage3-amd64-systemd-20260719T170103Z.tar.xz \
   --snapshot /path/to/gentoo-20260719.xz.sqfs \
   --snapshot-id 20260719 \
-  --signify-root out/signify-root \
   --trust-key /secure/volatoo-release.pub \
   --version 20260723 \
   out/volatoo-minimal-systemd-20260723.squashfs
@@ -78,15 +76,15 @@ It parses the rendered spec, verifies its required stage4 fields and package
 set, and confirms that the builder's pyDeComp extension supplies SquashFS Zstd
 at level 19.
 
-Create `out/signify-root` with
-`scripts/prepare-signify-root-docker.sh`. The image stores that pinned Alpine
-runtime below `/usr/libexec/volatoo-signify` and invokes it through a wrapper
-with a private library path, so its musl libraries cannot replace Gentoo's
-glibc libraries. Catalyst executes the wrapper during finalization. Trusted
-keys are installed by SHA-256 below `/etc/volatoo/trusted.d`; use the same key
-set when building the initramfs. Omitting both options remains available for
-unsigned development images, but those images cannot perform authenticated
-generation selection from the installed userspace.
+The shared minimal package set installs Gentoo's native `app-crypt/signify`
+from the verified repository snapshot. Keeping the installed userspace on one
+glibc ABI lets realization validation cover the verifier itself instead of
+exempting a private musl runtime. Catalyst executes the verifier during
+finalization. Trusted keys are installed by SHA-256 below
+`/etc/volatoo/trusted.d`; use the same key set when building the initramfs.
+Omitting `--trust-key` remains available for unsigned development images, but
+those images cannot perform authenticated generation selection from the
+installed userspace.
 
 ## Weekly CI build
 

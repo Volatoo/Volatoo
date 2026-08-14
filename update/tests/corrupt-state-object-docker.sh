@@ -50,10 +50,20 @@ docker run --rm \
 	-c '
 		set -eu
 		apk add --no-cache e2fsprogs-extra >/dev/null
-		block=$(
-			debugfs -R "bmap '"$object_path"' 0" /state.ext4 \
-				2>/dev/null
-		)
+		block=
+		attempt=0
+		while [ "$attempt" -lt 5 ]; do
+			block=$(
+				debugfs -R "bmap '"$object_path"' 0" /state.ext4 \
+					2>/dev/null || true
+			)
+			case $block in
+				"" | *[!0-9]*) ;;
+				*) break ;;
+			esac
+			attempt=$((attempt + 1))
+			sleep 1
+		done
 		case $block in
 			"" | *[!0-9]*)
 				echo "error: could not resolve object block" >&2

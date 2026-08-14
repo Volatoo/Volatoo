@@ -14,7 +14,6 @@ Required build options:
   --stage3 PATH       Official Gentoo amd64 stage3 archive matching --init-system
   --snapshot PATH     Matching Gentoo Catalyst repository snapshot (.sqfs)
   --snapshot-id ID    Snapshot treeish used in gentoo-ID.sqfs
-  --signify-root DIR  Prepared pinned signify runtime closure
   --trust-key PATH    Install a trusted signify public key; repeat for rotation
 
 Other options:
@@ -40,7 +39,6 @@ repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 stage3_path=
 snapshot_path=
 snapshot_id=
-signify_root=
 declare -a trust_keys=()
 trust_key_count=0
 init_system=openrc
@@ -64,11 +62,6 @@ while (( $# > 0 )); do
 		--snapshot-id)
 			(( $# >= 2 )) || { echo "error: --snapshot-id requires a value" >&2; exit 2; }
 			snapshot_id=$2
-			shift 2
-			;;
-		--signify-root)
-			(( $# >= 2 )) || { echo "error: --signify-root requires a path" >&2; exit 2; }
-			signify_root=$2
 			shift 2
 			;;
 		--trust-key)
@@ -142,26 +135,6 @@ fi
 if ! [[ $work_volume =~ ^[A-Za-z0-9][A-Za-z0-9_.-]*$ ]]; then
 	echo "error: Docker work volume contains unsupported characters" >&2
 	exit 1
-fi
-if [[ -z $signify_root && $trust_key_count -gt 0 ]]; then
-	echo "error: --trust-key requires --signify-root" >&2
-	exit 2
-fi
-if [[ -n $signify_root ]]; then
-	[[ -d $signify_root && ! -L $signify_root ]] || {
-		echo "error: --signify-root must name a non-symlink directory" >&2
-		exit 1
-	}
-	[[ -x $signify_root/usr/bin/signify && \
-		-x $signify_root/lib/ld-musl-x86_64.so.1 && \
-		-f $signify_root/signify-version ]] || {
-		echo "error: --signify-root is incomplete" >&2
-		exit 1
-	}
-	[[ $(<"$signify_root/signify-version") == signify-32-r1 ]] || {
-		echo "error: unsupported signify runtime version" >&2
-		exit 1
-	}
 fi
 if (( trust_key_count > 0 )); then
 	for trust_key in "${trust_keys[@]}"; do
@@ -247,36 +220,25 @@ for update_tool in "${update_tools[@]}"; do
 done
 ln -s ../libexec/volatoo-update-view \
 	"$runtime_dir/overlay/usr/bin/volatoo-update-view"
-if [[ -n $signify_root ]]; then
-	signify_private=$runtime_dir/overlay/usr/libexec/volatoo-signify
-	mkdir -p "$signify_private/lib"
-	install -m 0755 "$signify_root/usr/bin/signify" \
-		"$signify_private/signify"
-	install -m 0755 "$signify_root/lib/ld-musl-x86_64.so.1" \
-		"$signify_private/ld-musl-x86_64.so.1"
-	cp -a "$signify_root/usr/lib/." "$signify_private/lib/"
-	install -m 0755 "$repo_root/image/catalyst/signify-wrapper" \
-		"$runtime_dir/overlay/usr/bin/signify"
-	if (( trust_key_count > 0 )); then
-		mkdir -p "$runtime_dir/overlay/etc/volatoo/trusted.d"
-		for trust_key in "${trust_keys[@]}"; do
-			if command -v sha256sum >/dev/null 2>&1; then
-				key_checksum=$(sha256sum "$trust_key")
-			else
-				key_checksum=$(shasum -a 256 "$trust_key")
-			fi
-			key_digest=${key_checksum%% *}
-			key_destination=$runtime_dir/overlay/etc/volatoo/trusted.d/$key_digest.pub
-			if [[ -e $key_destination ]]; then
-				cmp -s "$trust_key" "$key_destination" || {
-					echo "error: trusted key digest collision: $trust_key" >&2
-					exit 1
-				}
-			else
-				install -m 0644 "$trust_key" "$key_destination"
-			fi
-		done
-	fi
+if (( trust_key_count > 0 )); then
+	mkdir -p "$runtime_dir/overlay/etc/volatoo/trusted.d"
+	for trust_key in "${trust_keys[@]}"; do
+		if command -v sha256sum >/dev/null 2>&1; then
+			key_checksum=$(sha256sum "$trust_key")
+		else
+			key_checksum=$(shasum -a 256 "$trust_key")
+		fi
+		key_digest=${key_checksum%% *}
+		key_destination=$runtime_dir/overlay/etc/volatoo/trusted.d/$key_digest.pub
+		if [[ -e $key_destination ]]; then
+			cmp -s "$trust_key" "$key_destination" || {
+				echo "error: trusted key digest collision: $trust_key" >&2
+				exit 1
+			}
+		else
+			install -m 0644 "$trust_key" "$key_destination"
+		fi
+	done
 fi
 chmod 0755 \
 	"$runtime_dir/overlay/usr/sbin/volatoo-persist" \

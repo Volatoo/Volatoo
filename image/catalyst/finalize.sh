@@ -54,7 +54,7 @@ esac
 
 if [ -e /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
 	if [ ! -x /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
-		echo "error: packaged signify wrapper is missing or unsafe" >&2
+		echo "error: packaged signify executable is missing or unsafe" >&2
 		exit 1
 	fi
 	set +e
@@ -62,7 +62,7 @@ if [ -e /usr/bin/signify ] || [ -L /usr/bin/signify ]; then
 	signify_status=$?
 	set -e
 	if [ "$signify_status" -ne 1 ]; then
-		echo "error: packaged signify runtime failed its help probe" >&2
+		echo "error: packaged signify executable failed its help probe" >&2
 		exit 1
 	fi
 fi
