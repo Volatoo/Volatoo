@@ -90,6 +90,8 @@ case ${1:-} in
 				grep -Fq 'sshd|default' "$config_dir/volatoo.spec"
 				grep -Fq '  app-admin/sysklogd' "$config_dir/volatoo.spec"
 				[[ -x $config_dir/overlay/etc/init.d/volatoo-persist ]]
+				grep -Fq '/usr/bin/sshd}' "$config_dir/finalize.sh"
+				grep -Fq 'OpenRC sshd still references /usr/sbin/sshd' "$config_dir/finalize.sh"
 				[[ ! -e $config_dir/overlay/usr/lib/systemd/system/volatoo-persist.service ]]
 				;;
 			systemd)

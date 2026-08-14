@@ -89,11 +89,13 @@ load_module() {
 	module=$1
 
 	# A development base initramfs may provide kmod with support for compressed
-	# modules. Prefer it over BusyBox modprobe when it is available.
+	# modules. Prefer it when its executable is present, but do not resolve the
+	# fallback through PATH: some base initramfs images retain a broken
+	# /sbin/modprobe -> ../bin/kmod link after pruning kmod itself.
 	if [ -x /sbin/modprobe ]; then
 		/sbin/modprobe "$module" 2>/dev/null || true
-	else
-		modprobe "$module" 2>/dev/null || true
+	elif [ -x /bin/busybox ]; then
+		/bin/busybox modprobe "$module" 2>/dev/null || true
 	fi
 }
 
@@ -1852,8 +1854,15 @@ echo "[volatoo] kernel: $(uname -srmo)"
 echo "[volatoo] command line: $(cat /proc/cmdline 2>/dev/null)"
 
 # A development kernel may provide these as modules; the target Volatoo kernel
-# will build required boot drivers in. Failure is harmless for built-in drivers.
+# will build required boot and baseline network drivers in. Failure is harmless
+# for built-in drivers.
 load_module virtio_blk
+load_module virtio_net
+for network_interface_path in /sys/class/net/*; do
+	if [ -e "$network_interface_path" ]; then
+		echo "[volatoo] network interface available: ${network_interface_path##*/}"
+	fi
+done
 load_module xhci_pci
 load_module usb_storage
 load_module sd_mod

@@ -11,6 +11,7 @@ disk=$1
 init_system=$2
 firmware=$3
 timeout_seconds=${VOLATOO_RELEASE_QEMU_TIMEOUT:-240}
+ssh_key=${VOLATOO_RELEASE_SSH_KEY:-}
 [[ -f $disk && ! -L $disk ]] || {
 	echo "error: release disk is missing or unsafe: $disk" >&2
 	exit 1
@@ -27,6 +28,10 @@ timeout_seconds=${VOLATOO_RELEASE_QEMU_TIMEOUT:-240}
 	echo "error: VOLATOO_RELEASE_QEMU_TIMEOUT must be a positive integer" >&2
 	exit 2
 }
+if [[ -n $ssh_key && (! -f $ssh_key || -L $ssh_key) ]]; then
+	echo "error: VOLATOO_RELEASE_SSH_KEY is missing or unsafe" >&2
+	exit 1
+fi
 
 log=$(mktemp)
 vars=
@@ -59,6 +64,8 @@ qemu-system-x86_64 \
 	-no-reboot \
 	"${firmware_args[@]}" \
 	-drive "file=$disk,format=raw,if=virtio,snapshot=on" \
+	-netdev user,id=net0,hostfwd=tcp:127.0.0.1:2222-:22 \
+	-device virtio-net-pci,netdev=net0 \
 	>"$log" 2>&1 &
 qemu_pid=$!
 
@@ -98,5 +105,32 @@ for pattern in "${required_patterns[@]}"; do
 		exit 1
 	fi
 done
+
+if [[ -n $ssh_key ]]; then
+	ssh_output=
+	while (( SECONDS < deadline )); do
+		if ssh_output=$(ssh \
+			-o BatchMode=yes \
+			-o ConnectTimeout=3 \
+			-o LogLevel=ERROR \
+			-o StrictHostKeyChecking=no \
+			-o UserKnownHostsFile=/dev/null \
+			-i "$ssh_key" \
+			-p 2222 \
+			volatoo@127.0.0.1 \
+			'id -u; sudo -n true; printf "volatoo-ssh-ready\\n"' 2>/dev/null)
+		then
+			break
+		fi
+		if ! kill -0 "$qemu_pid" 2>/dev/null; then break; fi
+		sleep 1
+	done
+	if ! grep -Fxq volatoo-ssh-ready <<<"$ssh_output" ||
+		! grep -Fxq 1000 <<<"$ssh_output"; then
+		echo "error: $firmware key-only administrator SSH check failed" >&2
+		tail -160 "$log" >&2
+		exit 1
+	fi
+fi
 
 echo "Volatoo $init_system release disk passed $firmware boot"

@@ -84,7 +84,7 @@ elif [[ -n $ssh_authorized_key ]]; then
 	echo "error: --ssh-authorized-key conflicts with --no-provision-access" >&2
 	exit 2
 fi
-for command_name in awk blockdev dd e2fsck findmnt grep install lsblk mount mountpoint partx resize2fs sgdisk sha256sum stat sync umount; do
+for command_name in awk blockdev dd e2fsck findmnt grep install lsblk mount mountpoint partx resize2fs rm sgdisk sha256sum stat sync umount; do
 	command -v "$command_name" >/dev/null 2>&1 || {
 		echo "error: required command is unavailable: $command_name" >&2
 		exit 1
@@ -99,6 +99,24 @@ reread_partitions()
 	fi
 	if command -v udevadm >/dev/null 2>&1; then udevadm settle; fi
 	if command -v mdev >/dev/null 2>&1; then mdev -s 2>/dev/null; fi
+}
+
+wait_for_partition()
+{
+	local partition=$1
+	for _ in {1..50}; do
+		if [[ -b $partition ]] && blockdev --getsize64 "$partition" >/dev/null 2>&1; then
+			return 0
+		fi
+		# A container without udev can retain a stale mdev node when a loop
+		# device number is reused. Replace only this explicit partition node.
+		if ! command -v udevadm >/dev/null 2>&1 && command -v mdev >/dev/null 2>&1; then
+			if [[ -e $partition || -L $partition ]]; then rm -f -- "$partition"; fi
+			mdev -s 2>/dev/null || true
+		fi
+		sleep 0.1
+	done
+	return 1
 }
 
 manifest_value()
@@ -196,11 +214,7 @@ if (( target_size > expected_size )); then
 		--partition-guid="4:${state_guid}" \
 		"$device" >/dev/null
 	reread_partitions
-	for _ in {1..50}; do
-		[[ -b $state_partition ]] && break
-		sleep 0.1
-	done
-	[[ -b $state_partition ]] || {
+	wait_for_partition "$state_partition" || {
 		echo "error: state partition did not appear: $state_partition" >&2
 		exit 1
 	}
@@ -216,11 +230,7 @@ if (( target_size > expected_size )); then
 fi
 
 if [[ $provision_access == yes ]]; then
-	for _ in {1..50}; do
-		[[ -b $state_partition ]] && break
-		sleep 0.1
-	done
-	[[ -b $state_partition ]] || {
+	wait_for_partition "$state_partition" || {
 		echo "error: state partition did not appear: $state_partition" >&2
 		exit 1
 	}

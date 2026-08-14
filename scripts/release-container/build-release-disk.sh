@@ -58,18 +58,31 @@ sgdisk --clear \
 	"$staging" >/dev/null
 
 loop_device=$(losetup --find --show --partscan "$staging")
+partx --update "$loop_device" >/dev/null || {
+	echo "error: kernel refused to load the release partition table" >&2
+	exit 1
+}
 # The kernel publishes loop partitions immediately, while a container's /dev
 # does not necessarily receive their device nodes from the host device manager.
 mdev -s >/dev/null 2>&1 || true
 for number in 1 2 3 4; do
 	for _ in $(seq 1 100); do
-		[[ -b ${loop_device}p$number ]] && break
+		if [[ -b ${loop_device}p$number ]] &&
+			blockdev --getsize64 "${loop_device}p$number" >/dev/null 2>&1; then
+			break
+		fi
+		# mdev does not replace a stale node left by a reused loop number.
+		if [[ -e ${loop_device}p$number || -L ${loop_device}p$number ]]; then
+			rm -f -- "${loop_device}p$number"
+		fi
+		mdev -s >/dev/null 2>&1 || true
 		sleep 0.05
 	done
-	[[ -b ${loop_device}p$number ]] || {
+	if [[ ! -b ${loop_device}p$number ]] ||
+		! blockdev --getsize64 "${loop_device}p$number" >/dev/null 2>&1; then
 		echo "error: partition device did not appear: ${loop_device}p$number" >&2
 		exit 1
-	}
+	fi
 done
 
 mkfs.vfat -F 32 -n VOLATOOESP "${loop_device}p2" >/dev/null

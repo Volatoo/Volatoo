@@ -8,6 +8,7 @@ RUN apt-get update \
         file \
         grep \
         gzip \
+        openssh-client \
         ovmf \
         qemu-system-x86 \
     && rm -rf /var/lib/apt/lists/*

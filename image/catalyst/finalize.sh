@@ -18,6 +18,14 @@ case $init_system in
 		sed -i \
 			's|^command="/usr/sbin/syslogd"$|command="/usr/bin/syslogd"|' \
 			/etc/init.d/sysklogd
+		# OpenSSH is also installed below /usr/bin on merged-usr images.
+		sed -i \
+			's|/usr/sbin/sshd}|/usr/bin/sshd}|' \
+			/etc/init.d/sshd
+		if grep -q '/usr/sbin/sshd' /etc/init.d/sshd; then
+			echo "error: OpenRC sshd still references /usr/sbin/sshd" >&2
+			exit 1
+		fi
 		;;
 	systemd)
 		mkdir -p /etc/systemd/system/multi-user.target.wants
