@@ -13,7 +13,10 @@ containing one. When present, the VM receives 8 GiB of RAM.
 Optional environment variables:
   VOLATOO_TARGET_INIT  Program to run after switch_root (default: /bin/bash)
   VOLATOO_VM_MEMORY    QEMU memory with an image attached (default: 8G)
-  VOLATOO_ROOT_MODE    Root layout: copy or overlay (default: copy)
+  VOLATOO_QEMU_ACCEL   QEMU accelerator: tcg or kvm (default: tcg)
+  VOLATOO_QEMU_CPU     QEMU CPU model (default: max for TCG, host for KVM)
+  VOLATOO_ROOT_MODE    Root layout: store-overlay, ram-overlay, copy, or overlay
+                       (default: store-overlay)
   VOLATOO_TMPFS_SIZE   Root tmpfs size as a percentage (default: configured)
   VOLATOO_IMAGE        Device path, LABEL=..., or UUID=... (default: /dev/vda)
   VOLATOO_IMAGE_FILE   SquashFS path inside a filesystem/ISO (default: empty)
@@ -23,6 +26,7 @@ Optional environment variables:
   VOLATOO_STATE        State device spec (default with image: LABEL=VOLATOO-STATE)
   VOLATOO_STATE_REQUIRED Require state discovery: yes or no (default: configured)
   VOLATOO_GENERATION   Generation selector: auto, previous, none, or sha256:...
+  VOLATOO_SIGNATURE_POLICY Generation trust: required or allow-unsigned
   VOLATOO_QEMU_MACHINE QEMU machine type (default: pc)
   VOLATOO_QEMU_FIRMWARE Optional read-only UEFI code image; BIOS when empty
   VOLATOO_QEMU_VARS    Optional writable UEFI variables image
@@ -77,12 +81,31 @@ kernel_args="console=ttyS0 rdinit=/init panic=-1"
 qemu_machine=${VOLATOO_QEMU_MACHINE:-pc}
 qemu_firmware=${VOLATOO_QEMU_FIRMWARE:-}
 qemu_vars=${VOLATOO_QEMU_VARS:-}
+qemu_accel=${VOLATOO_QEMU_ACCEL:-tcg}
+qemu_cpu=${VOLATOO_QEMU_CPU:-}
 state_location=${VOLATOO_STATE:-}
 state_required=${VOLATOO_STATE_REQUIRED:-}
 generation_mode=${VOLATOO_GENERATION:-}
+signature_policy=${VOLATOO_SIGNATURE_POLICY:-}
 
 if [[ ! $qemu_machine =~ ^[[:alnum:]_.-]+$ ]]; then
 	echo "error: VOLATOO_QEMU_MACHINE contains unsupported characters" >&2
+	exit 1
+fi
+
+if [[ $qemu_accel != tcg && $qemu_accel != kvm ]]; then
+	echo "error: VOLATOO_QEMU_ACCEL must be tcg or kvm" >&2
+	exit 1
+fi
+if [[ -z $qemu_cpu ]]; then
+	if [[ $qemu_accel == kvm ]]; then
+		qemu_cpu=host
+	else
+		qemu_cpu=max
+	fi
+fi
+if [[ ! $qemu_cpu =~ ^[[:alnum:]_.+-]+$ ]]; then
+	echo "error: VOLATOO_QEMU_CPU contains unsupported characters" >&2
 	exit 1
 fi
 
@@ -134,10 +157,19 @@ if [[ -n $generation_mode ]]; then
 	kernel_args="$kernel_args volatoo.generation=$generation_mode"
 fi
 
+if [[ -n $signature_policy ]]; then
+	if [[ $signature_policy != required && \
+		$signature_policy != allow-unsigned ]]; then
+		echo "error: VOLATOO_SIGNATURE_POLICY must be required or allow-unsigned" >&2
+		exit 1
+	fi
+	kernel_args="$kernel_args volatoo.signature-policy=$signature_policy"
+fi
+
 if [[ -n $image_path ]]; then
 	memory=${VOLATOO_VM_MEMORY:-8G}
 	target_init=${VOLATOO_TARGET_INIT:-/bin/bash}
-	root_mode=${VOLATOO_ROOT_MODE:-copy}
+	root_mode=${VOLATOO_ROOT_MODE:-store-overlay}
 	tmpfs_size=${VOLATOO_TMPFS_SIZE:-}
 	image_bus=${VOLATOO_IMAGE_BUS:-virtio}
 	image_location=${VOLATOO_IMAGE:-}
@@ -160,8 +192,11 @@ if [[ -n $image_path ]]; then
 		echo "error: VOLATOO_TARGET_INIT must be an absolute path without whitespace" >&2
 		exit 1
 	fi
-	if [[ $root_mode != copy && $root_mode != overlay ]]; then
-		echo "error: VOLATOO_ROOT_MODE must be copy or overlay" >&2
+	if [[ $root_mode != copy && \
+		$root_mode != overlay && \
+		$root_mode != ram-overlay && \
+		$root_mode != store-overlay ]]; then
+		echo "error: VOLATOO_ROOT_MODE must be store-overlay, ram-overlay, copy, or overlay" >&2
 		exit 1
 	fi
 	if [[ $image_location == *[[:space:]]* ]] || \
@@ -195,8 +230,8 @@ if [[ -n $image_path ]]; then
 fi
 
 qemu_args=(
-	-machine "$qemu_machine,accel=tcg"
-	-cpu max
+	-machine "$qemu_machine,accel=$qemu_accel"
+	-cpu "$qemu_cpu"
 	-m "$memory"
 	-kernel "$kernel_path"
 	-initrd "$initramfs_path"

@@ -325,7 +325,7 @@ settings = portage.config(clone=portage.settings)
 settings.unlock()
 settings["BINPKG_GPG_SIGNING_BASE_COMMAND"] = (
     "/usr/bin/gpg --sign --armor --yes --pinentry-mode loopback "
-    '--passphrase "" [PORTAGE_CONFIG]'
+    "--passphrase-file /dev/null [PORTAGE_CONFIG]"
 )
 settings["BINPKG_GPG_SIGNING_DIGEST"] = "SHA512"
 settings["BINPKG_GPG_SIGNING_GPG_HOME"] = "/result/gnupg"

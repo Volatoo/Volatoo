@@ -3,6 +3,7 @@
 set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
+generation_tool=$repo_root/update/volatoo-generation
 openrc_stage3=gentoo/stage3@sha256:ffc1ede408d1f7f0194c13259679630533913a9473e7adcef367375932c7e8cb
 systemd_stage3=gentoo/stage3@sha256:0107bcedb0f12f4e905aa9dd4c7e00054b3339fe8cb7080b06e160e5a166c22d
 portage_image=gentoo/portage@sha256:6c49dbf51f9e52e3edeb43ca83e79025394b0a9b4c6cab1ed2b2f629e05c78e8
@@ -13,11 +14,17 @@ work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-layer-test.XXXXXX")
 overlay_revision=dddddddddddddddddddddddddddddddddddddddd
 fixture_atom='=app-misc/volatoo-layer-fixture-1'
 declare -a generation_volumes=()
+generation_volume_count=0
 
 cleanup()
 {
 	docker rm "$repo_container" >/dev/null 2>&1 || true
-	for volume in "${generation_volumes[@]}"; do
+	for ((
+		index = 0;
+		index < generation_volume_count;
+		index += 1
+	)); do
+		volume=${generation_volumes[index]}
 		docker volume rm "$volume" >/dev/null 2>&1 || true
 	done
 	find "$work_dir" -depth -delete 2>/dev/null || true
@@ -119,24 +126,27 @@ for init_system in openrc systemd; do
 		' \
 		"$context_example" \
 		>"$work_dir/context-$init_system.json"
+	VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+		"$repo_root/update/tests/prepare-stage-generation-docker.sh" \
+		"$stage3_image" \
+		"$work_dir/context-$init_system.json" \
+		"$work_dir/parent-$init_system"
+	cp "$work_dir/parent-$init_system/provenance/build-context.json" \
+		"$work_dir/context-$init_system-final.json"
 	target_id=$(
-		jq -r '.target.id' "$work_dir/context-$init_system.json"
+		jq -r '.target.id' "$work_dir/context-$init_system-final.json"
 	)
 
-	docker run --rm \
-		--platform "$platform" \
-		--volumes-from "$repo_container" \
-		--mount "type=bind,src=$repo_root,dst=/work,readonly" \
-		--mount "type=bind,src=$work_dir,dst=/result" \
-		--mount "type=bind,src=$overlay,dst=/var/db/repos/volatoo-test,readonly" \
-		--mount "type=bind,src=$repos_conf,dst=/etc/portage/repos.conf/volatoo-test.conf,readonly" \
-		--entrypoint /usr/bin/python3 \
-		"$stage3_image" \
-		/work/update/volatoo-plan \
-			--build-context "/result/context-$init_system.json" \
-			--output "/result/build-spec-$init_system.json" \
-			--query-output "/result/query-$init_system.json" \
-			"$fixture_atom"
+	VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+		"$repo_root/update/plan-generation-docker.sh" \
+		--state "$work_dir/parent-$init_system/state" \
+		--generation current \
+		--build-context "$work_dir/context-$init_system-final.json" \
+		--output "$work_dir/build-spec-$init_system.json" \
+		--query-output "$work_dir/query-$init_system.json" \
+		--repository "volatoo-test=$overlay" \
+		--portage-image "$portage_image" \
+		"$fixture_atom"
 
 	mkdir -p "$work_dir/pkgdir/$target_id"
 	docker run --rm \
@@ -178,53 +188,63 @@ for init_system in openrc systemd; do
 		--entrypoint /usr/bin/python3 \
 		"$stage3_image" \
 		/work/update/volatoo-acquire \
-			--build-context "/result/context-$init_system.json" \
+			--build-context "/result/context-$init_system-final.json" \
 			--build-spec "/result/build-spec-$init_system.json" \
 			--source-catalog "/result/catalog-$init_system.json" \
 			--store "/result/store-$init_system" \
 			--receipt "/result/acquisition-$init_system.json"
 
-	context_digest=$(
-		"$repo_root/update/volatoo-manifest" digest \
-			"$work_dir/context-$init_system.json"
-	)
-	jq -n \
-		--arg target "$target_id" \
-		--arg context_digest "$context_digest" \
-		'{
-		  schema: "org.volatoo.generation/v1",
-		  target_id: $target,
-		  build_context_digest: $context_digest,
-		  base: {
-		    rootfs_digest: ("sha256:" + ("4" * 64)),
-		    rootfs_size: 1,
-		    format: "squashfs"
-		  },
-		  layers: []
-		}' >"$work_dir/parent-$init_system.json"
+	parent_generation=$work_dir/parent-$init_system/provenance/base-generation.json
+
+	if [[ $init_system == openrc ]]; then
+		jq '.world_digest = ("f" * 64 | "sha256:" + .)' \
+			"$work_dir/context-$init_system-final.json" \
+			>"$work_dir/wrong-parent-context.json"
+		mkdir "$work_dir/wrong-parent-layer"
+		if VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
+			"$repo_root/update/compose-layer-docker.sh" \
+			--state "$work_dir/parent-$init_system/state" \
+			--generation current \
+			--portage-image "$portage_image" \
+			--repository "volatoo-test=$overlay" \
+			--build-context "$work_dir/wrong-parent-context.json" \
+			--build-spec "$work_dir/build-spec-$init_system.json" \
+			--acquisition "$work_dir/acquisition-$init_system.json" \
+			--store "$work_dir/store-$init_system" \
+			--output-dir "$work_dir/wrong-parent-layer" \
+			>"$work_dir/wrong-parent-layer.log" 2>&1
+		then
+			fail "composer accepted a context outside the selected parent"
+		fi
+		grep -Fq "generation v1 requires an unchanged build context" \
+			"$work_dir/wrong-parent-layer.log" ||
+			fail "composer did not diagnose the parent/context mismatch"
+	fi
 
 	mkdir "$work_dir/layer-$init_system"
 	VOLATOO_LAYER_COMPRESSOR_IMAGE=$compressor_image \
 		"$repo_root/update/compose-layer-docker.sh" \
-		--stage-image "$stage3_image" \
+		--state "$work_dir/parent-$init_system/state" \
+		--generation current \
 		--portage-image "$portage_image" \
 		--repository "volatoo-test=$overlay" \
-		--build-context "$work_dir/context-$init_system.json" \
+		--build-context "$work_dir/context-$init_system-final.json" \
 		--build-spec "$work_dir/build-spec-$init_system.json" \
 		--acquisition "$work_dir/acquisition-$init_system.json" \
-		--parent-generation "$work_dir/parent-$init_system.json" \
 		--store "$work_dir/store-$init_system" \
 		--output-dir "$work_dir/layer-$init_system"
 
 	"$repo_root/update/volatoo-manifest" verify-layer-transaction \
 		"$work_dir/layer-$init_system/transaction.json" \
 		"$work_dir/layer-$init_system/generation.json" \
-		"$work_dir/parent-$init_system.json" \
-		"$work_dir/context-$init_system.json" \
+		"$parent_generation" \
+		"$work_dir/context-$init_system-final.json" \
 		"$work_dir/build-spec-$init_system.json" \
 		"$work_dir/acquisition-$init_system.json" \
 		"$work_dir/layer-$init_system/changed-paths.json" \
-		"$work_dir/layer-$init_system/tombstones.json"
+		"$work_dir/layer-$init_system/tombstones.json" \
+		--portage-state \
+		"$work_dir/layer-$init_system/portage-state.json"
 	jq -e '
 		.paths | index("/usr/share/volatoo-layer-fixture/marker") != null
 	' "$work_dir/layer-$init_system/changed-paths.json" >/dev/null ||
@@ -236,8 +256,68 @@ for init_system in openrc systemd; do
 		"$work_dir/layer-$init_system/generation.json" >/dev/null ||
 		fail "$init_system: generation candidate did not append one layer"
 
+	parent_digest=$(
+		"$repo_root/update/volatoo-manifest" digest "$parent_generation"
+	)
+	"$repo_root/update/volatoo-generation" publish \
+		--state "$work_dir/parent-$init_system/state" \
+		--generation "$work_dir/layer-$init_system/generation.json" \
+		--object "$work_dir/context-$init_system-final.json" \
+		--object "$work_dir/build-spec-$init_system.json" \
+		--object "$work_dir/catalog-$init_system.json" \
+		--object "$work_dir/acquisition-$init_system.json" \
+		--object "$work_dir/parent-$init_system/base.squashfs" \
+		--object "$work_dir/layer-$init_system/layer.squashfs" \
+		--object "$work_dir/layer-$init_system/changed-paths.json" \
+		--object "$work_dir/layer-$init_system/tombstones.json" \
+		--object "$work_dir/layer-$init_system/transaction.json" \
+		--object "$work_dir/layer-$init_system/portage-state.json" \
+		--activate \
+		--expected-current "$parent_digest" >/dev/null
+	candidate_digest=$(
+		"$repo_root/update/volatoo-manifest" digest \
+			"$work_dir/layer-$init_system/generation.json"
+	)
+	candidate_plan_digest=$(
+		"$generation_tool" inspect \
+			--state "$work_dir/parent-$init_system/state" \
+			"$candidate_digest" |
+			jq -r '.boot_plan_digest'
+	)
+	materialized_volume=volatoo-layer-parent-check-$init_system-$$
+	generation_volumes[generation_volume_count]=$materialized_volume
+	((generation_volume_count += 1))
+	docker volume create "$materialized_volume" >/dev/null
+	docker run --rm \
+		--platform "$platform" \
+		--mount "type=bind,src=$work_dir/parent-$init_system/state,dst=/state,readonly" \
+		--mount "type=volume,src=$materialized_volume,dst=/generation" \
+		--entrypoint /usr/local/sbin/materialize-volatoo-generation \
+		"$compressor_image" \
+		/state \
+		"$candidate_digest" \
+		"$candidate_plan_digest" \
+		/generation/root
+	docker run --rm \
+		--platform "$platform" \
+		--mount "type=volume,src=$materialized_volume,dst=/parent,readonly" \
+		--entrypoint /usr/sbin/chroot \
+		"$compressor_image" \
+		/parent/root \
+		/usr/bin/python3 -c '
+from pathlib import Path
+import portage
+
+assert Path("/usr/share/volatoo-layer-fixture/marker").read_text().strip() == "layer fixture"
+vardb = portage.db[portage.settings["EROOT"]]["vartree"].dbapi
+cpv = "app-misc/volatoo-layer-fixture-1"
+assert vardb.cpv_exists(cpv)
+assert vardb.aux_get(cpv, ["repository"])[0] == "volatoo-test"
+'
+
 	generation_volume=volatoo-layer-generation-$init_system-$$
-	generation_volumes+=("$generation_volume")
+	generation_volumes[generation_volume_count]=$generation_volume
+	((generation_volume_count += 1))
 	docker volume create "$generation_volume" >/dev/null
 	docker run --rm \
 		--platform "$platform" \

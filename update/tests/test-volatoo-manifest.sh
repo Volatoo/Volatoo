@@ -7,6 +7,8 @@ tool=$repo_root/update/volatoo-manifest
 layer_tool=$repo_root/update/volatoo-layer
 context=$repo_root/update/examples/build-context-v1.json
 generation=$repo_root/update/examples/generation-v1.json
+generation_v2=$repo_root/update/examples/generation-v2.json
+portage_state=$repo_root/update/examples/portage-state-v1.json
 systemd_context=$repo_root/update/examples/build-context-systemd-v1.json
 systemd_generation=$repo_root/update/examples/generation-systemd-v1.json
 build_spec=$repo_root/update/examples/build-spec-v1.json
@@ -39,6 +41,8 @@ expect_failure()
 
 "$tool" validate "$context"
 "$tool" validate "$generation"
+"$tool" validate "$generation_v2"
+"$tool" validate "$portage_state"
 "$tool" validate "$systemd_context"
 "$tool" validate "$systemd_generation"
 "$tool" validate "$build_spec"
@@ -56,6 +60,7 @@ expected_context_digest=sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd99
 	fail "unexpected context digest: $context_digest"
 
 "$tool" verify-generation "$generation" "$context"
+"$tool" verify-generation "$generation_v2" "$context" "$portage_state"
 "$tool" verify-generation "$systemd_generation" "$systemd_context"
 "$tool" verify-build-spec "$build_spec" "$context"
 "$tool" verify-package-source-query \
@@ -71,6 +76,16 @@ expected_context_digest=sha256:fc45b271c47ab407c175451264f0847eb889d1720824edd99
 	"$acquisition" \
 	"$changed_paths" \
 	"$tombstones"
+"$tool" verify-layer-transaction \
+	"$layer_transaction" \
+	"$generation_v2" \
+	"$generation" \
+	"$context" \
+	"$build_spec" \
+	"$acquisition" \
+	"$changed_paths" \
+	"$tombstones" \
+	--portage-state "$portage_state"
 
 canonical=$("$tool" canonicalize "$context")
 canonical_digest=$(printf '%s\n' "$canonical" | "$tool" digest -)
@@ -341,6 +356,7 @@ printf '%s\n' 4.7.5 >"$work_dir/compressor-version"
 	--squashfs "$work_dir/layer.squashfs" \
 	--compressor-version "$work_dir/compressor-version" \
 	--transaction "$work_dir/finalized-transaction.json" \
+	--portage-state "$work_dir/finalized-portage-state.json" \
 	--generation "$work_dir/finalized-generation.json"
 "$tool" verify-layer-transaction \
 	"$work_dir/finalized-transaction.json" \
@@ -350,6 +366,7 @@ printf '%s\n' 4.7.5 >"$work_dir/compressor-version"
 	"$build_spec" \
 	"$acquisition" \
 	"$changed_paths" \
-	"$tombstones"
+	"$tombstones" \
+	--portage-state "$work_dir/finalized-portage-state.json"
 
 echo "volatoo manifest tests passed"

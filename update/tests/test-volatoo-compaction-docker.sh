@@ -5,6 +5,7 @@ set -euo pipefail
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
 generation_tool=$repo_root/update/volatoo-generation
 manifest=$repo_root/update/volatoo-manifest
+fixture_tool=$repo_root/update/tests/make-generation-fixture.py
 compressor_image=volatoo-layer-compressor:compaction-test
 work_dir=$(mktemp -d "${TMPDIR:-/tmp}/volatoo-compaction-test.XXXXXX")
 
@@ -18,16 +19,6 @@ fail()
 {
 	echo "error: $*" >&2
 	exit 1
-}
-
-raw_digest()
-{
-	if command -v sha256sum >/dev/null 2>&1; then
-		checksum_output=$(sha256sum "$1")
-	else
-		checksum_output=$(shasum -a 256 "$1")
-	fi
-	printf 'sha256:%s\n' "${checksum_output%% *}"
 }
 
 canonical_digest()
@@ -48,7 +39,12 @@ mkdir -p \
 	"$state/volatoo/data/overlay" \
 	"$state/volatoo/data/sync" \
 	"$state/volatoo/snapshots" \
-	"$work_dir/base-root/etc" \
+	"$work_dir/base-root/etc/init.d" \
+	"$work_dir/base-root/etc/portage" \
+	"$work_dir/base-root/usr/bin" \
+	"$work_dir/base-root/usr/lib" \
+	"$work_dir/base-root/usr/lib64" \
+	"$work_dir/base-root/var/db/pkg" \
 	"$work_dir/layer-1/etc" \
 	"$work_dir/layer-2/etc" \
 	"$work_dir/base-output" \
@@ -60,6 +56,17 @@ printf '1\n' >"$state/volatoo/layout-version"
 printf 'base\n' >"$work_dir/base-root/etc/base"
 printf 'remove-me\n' >"$work_dir/base-root/etc/removed"
 printf 'old\n' >"$work_dir/base-root/etc/replaced"
+printf 'placeholder shell\n' >"$work_dir/base-root/usr/bin/sh"
+printf 'placeholder init\n' >"$work_dir/base-root/usr/bin/init"
+printf 'placeholder openrc\n' >"$work_dir/base-root/usr/bin/openrc"
+chmod 0755 \
+	"$work_dir/base-root/usr/bin/sh" \
+	"$work_dir/base-root/usr/bin/init" \
+	"$work_dir/base-root/usr/bin/openrc"
+ln -s usr/bin "$work_dir/base-root/bin"
+ln -s usr/lib "$work_dir/base-root/lib"
+ln -s usr/lib64 "$work_dir/base-root/lib64"
+ln -s usr/bin "$work_dir/base-root/sbin"
 printf 'layer-one\n' >"$work_dir/layer-1/etc/layer-one"
 printf 'v1\n' >"$work_dir/layer-1/etc/replaced"
 printf 'layer-two\n' >"$work_dir/layer-2/etc/layer-two"
@@ -70,6 +77,135 @@ docker build \
 	--tag "$compressor_image" \
 	--file "$repo_root/update/layer-container/Dockerfile" \
 	"$repo_root" >/dev/null
+fhs_result=$(
+	docker run --rm \
+		--platform linux/amd64 \
+		--mount "type=bind,src=$work_dir/base-root,dst=/root,readonly" \
+		--mount "type=bind,src=$work_dir,dst=/result" \
+		--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+		"$compressor_image" \
+		/root \
+		volatoo/amd64/glibc/openrc/23.0/base-v1 \
+		/result/fhs-validation.index
+)
+[[ $fhs_result == org.volatoo.gentoo-fhs/v1 ]] ||
+	fail "valid FHS fixture did not produce the expected contract"
+grep -Fx 'VOLATOO_FHS_ELF_INDEX_V1' "$work_dir/fhs-validation.index" >/dev/null ||
+	fail "FHS validator did not emit the validation index header"
+grep -Fx 'target volatoo/amd64/glibc/openrc/23.0/base-v1' \
+	"$work_dir/fhs-validation.index" >/dev/null ||
+	fail "FHS validation index did not bind the target"
+grep -Fx 'P|/usr/bin/openrc|f|755' "$work_dir/fhs-validation.index" >/dev/null ||
+	fail "FHS validation index omitted a runtime path"
+grep -Fx 'L|/bin|usr/bin' "$work_dir/fhs-validation.index" >/dev/null ||
+	fail "FHS validation index omitted a runtime symlink"
+[[ $(tail -n 1 "$work_dir/fhs-validation.index") == end ]] ||
+	fail "FHS validation index has no end record"
+
+cp -a "$work_dir/base-root" "$work_dir/fhs-elf-root"
+docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-elf-root,dst=/root" \
+	--entrypoint /bin/sh \
+	"$compressor_image" \
+	-c '
+		set -eu
+		cp /usr/bin/scanelf /root/usr/bin/elf-ok
+		cp /lib/ld-musl-x86_64.so.1 \
+			/root/usr/lib/ld-musl-x86_64.so.1
+		ln -s ld-musl-x86_64.so.1 \
+			/root/usr/lib/libc.musl-x86_64.so.1
+	'
+fhs_elf_result=$(
+	docker run --rm \
+		--platform linux/amd64 \
+		--mount "type=bind,src=$work_dir/fhs-elf-root,dst=/root,readonly" \
+		--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+		"$compressor_image" \
+		/root \
+		volatoo/amd64/musl/openrc/23.0/base-v1
+)
+[[ $fhs_elf_result == org.volatoo.gentoo-fhs/v1 ]] ||
+	fail "FHS validator rejected a complete ELF dependency closure"
+
+cp -a "$work_dir/fhs-elf-root" "$work_dir/fhs-missing-elf-root"
+docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-missing-elf-root,dst=/root" \
+	--entrypoint /bin/sh \
+	"$compressor_image" \
+	-c 'cp /usr/bin/mksquashfs /root/usr/bin/missing-elf-dependency'
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-missing-elf-root,dst=/root,readonly" \
+	--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+	"$compressor_image" \
+	/root \
+	volatoo/amd64/musl/openrc/23.0/base-v1 \
+	>"$work_dir/fhs-missing-elf.stdout" \
+	2>"$work_dir/fhs-missing-elf.stderr"
+then
+	fail "FHS validator accepted a missing ELF dependency"
+fi
+grep -q 'ELF dependency is missing from the FHS closure' \
+	"$work_dir/fhs-missing-elf.stderr" ||
+	fail "FHS validator did not diagnose the missing ELF dependency"
+
+cp -a "$work_dir/base-root" "$work_dir/fhs-leak-root"
+ln -s /nix/store/unsafe-package/bin/tool \
+	"$work_dir/fhs-leak-root/usr/bin/store-tool"
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-leak-root,dst=/root,readonly" \
+	--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+	"$compressor_image" \
+	/root \
+	volatoo/amd64/glibc/openrc/23.0/base-v1 \
+	>"$work_dir/fhs-leak.stdout" \
+	2>"$work_dir/fhs-leak.stderr"
+then
+	fail "FHS validator accepted a package-store runtime symlink"
+fi
+grep -q 'symlink leaks a build/store path' "$work_dir/fhs-leak.stderr" ||
+	fail "FHS validator did not diagnose the package-store symlink"
+
+cp -a "$work_dir/base-root" "$work_dir/fhs-shebang-root"
+printf '#!/nix/store/unsafe-shell/bin/sh\nexit 0\n' \
+	>"$work_dir/fhs-shebang-root/usr/bin/store-script"
+chmod 0755 "$work_dir/fhs-shebang-root/usr/bin/store-script"
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-shebang-root,dst=/root,readonly" \
+	--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+	"$compressor_image" \
+	/root \
+	volatoo/amd64/glibc/openrc/23.0/base-v1 \
+	>"$work_dir/fhs-shebang.stdout" \
+	2>"$work_dir/fhs-shebang.stderr"
+then
+	fail "FHS validator accepted a package-store shebang"
+fi
+grep -q 'shebang leaks a build/store path' "$work_dir/fhs-shebang.stderr" ||
+	fail "FHS validator did not diagnose the package-store shebang"
+
+cp -a "$work_dir/base-root" "$work_dir/fhs-work-root"
+mkdir -p "$work_dir/fhs-work-root/work/cache"
+printf 'builder residue\n' >"$work_dir/fhs-work-root/work/cache/object"
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/fhs-work-root,dst=/root,readonly" \
+	--entrypoint /usr/local/sbin/validate-volatoo-fhs \
+	"$compressor_image" \
+	/root \
+	volatoo/amd64/glibc/openrc/23.0/base-v1 \
+	>"$work_dir/fhs-work.stdout" \
+	2>"$work_dir/fhs-work.stderr"
+then
+	fail "FHS validator accepted data below a reserved build mountpoint"
+fi
+grep -q 'contains data below reserved mountpoint' "$work_dir/fhs-work.stderr" ||
+	fail "FHS validator did not diagnose reserved build data"
+
 for entry in \
 	base:"$work_dir/base-root":"$work_dir/base-output" \
 	1:"$work_dir/layer-1":"$work_dir/layer-output-1" \
@@ -87,23 +223,19 @@ done
 mv "$work_dir/base-output/layer.squashfs" \
 	"$work_dir/base-output/base.squashfs"
 
-"$manifest" canonicalize \
-	"$repo_root/update/examples/build-context-v1.json" \
-	>"$work_dir/context.json"
-target_id=$(jq -r '.target.id' "$work_dir/context.json")
-context_digest=$(canonical_digest "$work_dir/context.json")
 base=$work_dir/base-output/base.squashfs
-base_digest=$(raw_digest "$base")
-base_size=$(wc -c <"$base" | tr -d ' ')
+python3 "$fixture_tool" context \
+	--build-context "$repo_root/update/examples/build-context-v1.json" \
+	--base "$base" \
+	--output-dir "$work_dir/provenance"
+context=$work_dir/provenance/build-context.json
+build_spec=$work_dir/provenance/build-spec.json
+source_catalog=$work_dir/provenance/source-catalog.json
+acquisition=$work_dir/provenance/acquisition.json
+base_generation=$work_dir/provenance/base-generation.json
+target_id=$(jq -r '.target.id' "$context")
 
-declare -a layer_digests=()
-declare -a layer_sizes=()
-declare -a tombstone_digests=()
-declare -a transaction_digests=()
 for number in 1 2; do
-	layer=$work_dir/layer-output-$number/layer.squashfs
-	layer_digests[number]=$(raw_digest "$layer")
-	layer_sizes[number]=$(wc -c <"$layer" | tr -d ' ')
 	if [[ $number == 1 ]]; then
 		paths='["/etc/removed"]'
 	else
@@ -118,102 +250,199 @@ for number in 1 2; do
 		  paths: $paths
 		}' |
 		"$manifest" canonicalize - >"$work_dir/tombstones-$number.json"
-	tombstone_digests[number]=$(
-		canonical_digest "$work_dir/tombstones-$number.json"
-	)
-	tombstone_count=$(jq '.paths | length' "$work_dir/tombstones-$number.json")
-	jq \
-		--arg target "$target_id" \
-		--arg context "$context_digest" \
-		--arg layer "${layer_digests[$number]}" \
-		--argjson size "${layer_sizes[$number]}" \
-		--arg tombstones "${tombstone_digests[$number]}" \
-		--argjson count "$tombstone_count" \
-		'
-		.target_id = $target
-		| .build_context_digest = $context
-		| .filesystem.rootfs_digest = $layer
-		| .filesystem.rootfs_size = $size
-		| .filesystem.tombstones_digest = $tombstones
-		| .filesystem.tombstones_count = $count
-		' \
-		"$repo_root/update/examples/layer-transaction-v1.json" |
-		"$manifest" canonicalize - >"$work_dir/transaction-$number.json"
-	transaction_digests[number]=$(
-		canonical_digest "$work_dir/transaction-$number.json"
-	)
-done
-
-write_generation()
-{
-	local count=$1
-	local output=$2
 	jq -n \
 		--arg target "$target_id" \
-		--arg context "$context_digest" \
-		--arg base "$base_digest" \
-		--argjson base_size "$base_size" \
-		--arg layer1 "${layer_digests[1]}" \
-		--argjson layer1_size "${layer_sizes[1]}" \
-		--arg tomb1 "${tombstone_digests[1]}" \
-		--arg tx1 "${transaction_digests[1]}" \
-		--arg layer2 "${layer_digests[2]}" \
-		--argjson layer2_size "${layer_sizes[2]}" \
-		--arg tomb2 "${tombstone_digests[2]}" \
-		--arg tx2 "${transaction_digests[2]}" \
-		--argjson count "$count" \
+		--arg first "/etc/layer-$number" \
+		--arg second /etc/replaced \
 		'{
-		  schema: "org.volatoo.generation/v1",
+		  schema: "org.volatoo.layer-paths/v1",
 		  target_id: $target,
-		  build_context_digest: $context,
-		  base: {
-		    rootfs_digest: $base,
-		    rootfs_size: $base_size,
-		    format: "squashfs"
-		  },
-		  layers: [
-		    {
-		      rootfs_digest: $layer1,
-		      rootfs_size: $layer1_size,
-		      format: "squashfs",
-		      tombstones_digest: $tomb1,
-		      transaction_digest: $tx1
-		    },
-		    {
-		      rootfs_digest: $layer2,
-		      rootfs_size: $layer2_size,
-		      format: "squashfs",
-		      tombstones_digest: $tomb2,
-		      transaction_digest: $tx2
-		    }
-		  ][0:$count]
+		  paths: [$first, $second]
 		}' |
-		"$manifest" canonicalize - >"$output"
-}
+		"$manifest" canonicalize - >"$work_dir/changed-$number.json"
+done
 
-write_generation 1 "$work_dir/generation-1.json"
-write_generation 2 "$work_dir/generation-2.json"
+python3 "$fixture_tool" layer \
+	--generation-version 2 \
+	--build-context "$context" \
+	--build-spec "$build_spec" \
+	--acquisition "$acquisition" \
+	--parent "$base_generation" \
+	--changed-paths "$work_dir/changed-1.json" \
+	--tombstones "$work_dir/tombstones-1.json" \
+	--layer "$work_dir/layer-output-1/layer.squashfs" \
+	--output-dir "$work_dir/generation-1"
+python3 "$fixture_tool" layer \
+	--generation-version 2 \
+	--build-context "$context" \
+	--build-spec "$build_spec" \
+	--acquisition "$acquisition" \
+	--parent "$work_dir/generation-1/generation.json" \
+	--changed-paths "$work_dir/changed-2.json" \
+	--tombstones "$work_dir/tombstones-2.json" \
+	--layer "$work_dir/layer-output-2/layer.squashfs" \
+	--output-dir "$work_dir/generation-2"
 common_objects=(
-	--object "$work_dir/context.json"
+	--object "$context"
+	--object "$build_spec"
+	--object "$source_catalog"
+	--object "$acquisition"
 	--object "$base"
 	--object "$work_dir/layer-output-1/layer.squashfs"
+	--object "$work_dir/changed-1.json"
 	--object "$work_dir/tombstones-1.json"
-	--object "$work_dir/transaction-1.json"
+	--object "$work_dir/generation-1/transaction.json"
+	--object "$work_dir/generation-1/portage-state.json"
 )
 "$generation_tool" publish \
 	--state "$state" \
-	--generation "$work_dir/generation-1.json" \
-	"${common_objects[@]}" \
-	--activate >/dev/null
+	--generation "$base_generation" \
+	--object "$context" \
+	--object "$base" \
+	--activate \
+	--expected-current none >/dev/null
+base_generation_digest=$(canonical_digest "$base_generation")
 "$generation_tool" publish \
 	--state "$state" \
-	--generation "$work_dir/generation-2.json" \
+	--generation "$work_dir/generation-1/generation.json" \
+	"${common_objects[@]}" \
+	--activate \
+	--expected-current "$base_generation_digest" >/dev/null
+generation_one=$(
+	canonical_digest "$work_dir/generation-1/generation.json"
+)
+"$generation_tool" publish \
+	--state "$state" \
+	--generation "$work_dir/generation-2/generation.json" \
 	"${common_objects[@]}" \
 	--object "$work_dir/layer-output-2/layer.squashfs" \
+	--object "$work_dir/changed-2.json" \
 	--object "$work_dir/tombstones-2.json" \
-	--object "$work_dir/transaction-2.json" \
-	--activate >/dev/null
-source_generation=$(canonical_digest "$work_dir/generation-2.json")
+	--object "$work_dir/generation-2/transaction.json" \
+	--object "$work_dir/generation-2/portage-state.json" \
+	--activate \
+	--expected-current "$generation_one" >/dev/null
+source_generation=$(canonical_digest "$work_dir/generation-2/generation.json")
+source_inspection=$(
+	"$generation_tool" inspect --state "$state" "$source_generation"
+)
+source_plan_digest=$(jq -r '.boot_plan_digest' <<<"$source_inspection")
+
+cp -a "$state" "$work_dir/corrupt-state"
+current_layer_digest=$(
+	jq -r '.layers[-1].rootfs_digest' \
+		"$work_dir/generation-2/generation.json"
+)
+current_layer_object=$work_dir/corrupt-state/volatoo/system/objects/sha256/${current_layer_digest#sha256:}
+chmod u+w "$current_layer_object"
+printf 'corrupt layer\n' >"$current_layer_object"
+mkdir "$work_dir/corrupt-output"
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/corrupt-state,dst=/state,readonly" \
+	--mount "type=bind,src=$work_dir/corrupt-output,dst=/output" \
+	--entrypoint /usr/local/sbin/materialize-volatoo-generation \
+	"$compressor_image" \
+	/state \
+	"$source_generation" \
+	"$source_plan_digest" \
+	/output/root \
+	>"$work_dir/corrupt-materialize.stdout" \
+	2>"$work_dir/corrupt-materialize.stderr"
+then
+	fail "parent materializer accepted a corrupt layer object"
+fi
+grep -q 'object digest mismatch' \
+	"$work_dir/corrupt-materialize.stderr" ||
+	fail "parent materializer did not diagnose the corrupt layer"
+
+cp -a "$state" "$work_dir/swapped-plan-state"
+first_plan_digest=$(
+	"$generation_tool" inspect --state "$state" "$generation_one" |
+		jq -r '.boot_plan_digest'
+)
+chmod u+w \
+	"$work_dir/swapped-plan-state/volatoo/system/plans/${source_generation#sha256:}"
+printf '%s\n' "$first_plan_digest" \
+	>"$work_dir/swapped-plan-state/volatoo/system/plans/${source_generation#sha256:}"
+mkdir "$work_dir/swapped-plan-output"
+if docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/swapped-plan-state,dst=/state,readonly" \
+	--mount "type=bind,src=$work_dir/swapped-plan-output,dst=/output" \
+	--entrypoint /usr/local/sbin/materialize-volatoo-generation \
+	"$compressor_image" \
+	/state \
+	"$source_generation" \
+	"$source_plan_digest" \
+	/output/root \
+	>"$work_dir/swapped-plan.stdout" \
+	2>"$work_dir/swapped-plan.stderr"
+then
+	fail "parent materializer accepted a changed boot plan pointer"
+fi
+grep -q 'boot plan pointer changed after validation' \
+	"$work_dir/swapped-plan.stderr" ||
+	fail "parent materializer did not diagnose the changed boot plan pointer"
+
+"$repo_root/update/realize-generation-docker.sh" \
+	--state "$state" \
+	--generation "$source_generation" \
+	--output-dir "$work_dir/realized"
+realization_inspection=$(
+	"$generation_tool" inspect --state "$state" "$source_generation"
+)
+jq -e \
+	--arg generation "$source_generation" \
+	'.generation_digest == $generation
+	 and .realized == true
+	 and .layer_count == 2
+	 and .realization.contract_version == 2
+	 and .realization.fhs_contract == "org.volatoo.gentoo-fhs/v1"
+	 and (.realization.rootfs_digest | startswith("sha256:"))
+	 and (.realization.verity.hash_digest | startswith("sha256:"))
+	 and (.realization.verity.root_hash | test("^[0-9a-f]{64}$"))
+	 and (.realization.verity.salt | test("^[0-9a-f]{64}$"))
+	 and .realization.verity.data_block_size == 4096
+	 and .realization.verity.hash_block_size == 4096
+	 and .realization.verity.superblock == false
+	 and (.realization.tree_digest | startswith("sha256:"))' \
+	<<<"$realization_inspection" \
+	>/dev/null ||
+	fail "realization did not bind the complete source generation"
+verity_root_hash=$(<"$work_dir/realized/verity-root-hash")
+verity_salt=$(<"$work_dir/realized/verity-salt")
+verity_data_blocks=$(<"$work_dir/realized/verity-data-blocks")
+docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/realized/closure.squashfs,dst=/closure.squashfs,readonly" \
+	--mount "type=bind,src=$work_dir/realized/closure.verity,dst=/closure.verity,readonly" \
+	--entrypoint /sbin/veritysetup \
+	"$compressor_image" \
+	verify \
+	/closure.squashfs \
+	/closure.verity \
+	"$verity_root_hash" \
+	--no-superblock \
+	--hash=sha256 \
+	--data-block-size=4096 \
+	--hash-block-size=4096 \
+	--data-blocks="$verity_data_blocks" \
+	--salt="$verity_salt"
+docker run --rm \
+	--platform linux/amd64 \
+	--mount "type=bind,src=$work_dir/realized/closure.squashfs,dst=/closure.squashfs,readonly" \
+	--entrypoint /bin/sh \
+	"$compressor_image" \
+	-c '
+		set -eu
+		unsquashfs -no-progress -d /verify /closure.squashfs >/dev/null
+		test "$(cat /verify/etc/base)" = base
+		test "$(cat /verify/etc/replaced)" = v2
+		test "$(cat /verify/etc/layer-two)" = layer-two
+		test ! -e /verify/etc/removed
+		test ! -e /verify/etc/layer-one
+	'
 
 "$repo_root/update/compact-generation-docker.sh" \
 	--state "$state" \
@@ -226,7 +455,13 @@ compacted_generation=$(canonical_digest "$work_dir/compacted/generation.json")
 [[ $(<"$system/previous") == "$source_generation" ]] ||
 	fail "compaction did not preserve the source as previous"
 jq -e \
-	'.layer_count == 0 and .valid == true' \
+	'
+		.schema == "org.volatoo.generation/v2"
+		and .parent_generation_digest == null
+		and .portage_state_digest != null
+		and .layer_count == 0
+		and .valid == true
+	' \
 	< <("$generation_tool" inspect --state "$state") >/dev/null ||
 	fail "compacted generation still has layers"
 [[ -f $system/compactions/${compacted_generation#sha256:}.json ]] ||
