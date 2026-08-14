@@ -10,6 +10,10 @@ on:
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
+      - "scripts/build-release-disk-docker.sh"
+      - "scripts/test-release-disk-docker.sh"
+      - "scripts/release-container/**"
+      - "scripts/qemu-container/**"
   pull_request:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
@@ -19,6 +23,10 @@ on:
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
+      - "scripts/build-release-disk-docker.sh"
+      - "scripts/test-release-disk-docker.sh"
+      - "scripts/release-container/**"
+      - "scripts/qemu-container/**"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -52,9 +60,13 @@ jobs:
             scripts/build-catalyst-squashfs.sh \
             scripts/fetch-gentoo-inputs.sh \
             scripts/test-qemu-boot.sh \
+            scripts/build-release-disk-docker.sh \
+            scripts/test-release-disk-docker.sh \
             scripts/tests/test-image-init-selection.sh \
             image/catalyst/finalize.sh \
-            image/catalyst/container/run-catalyst.sh
+            image/catalyst/container/run-catalyst.sh \
+            scripts/release-container/build-release-disk.sh \
+            scripts/qemu-container/test-release-disk.sh
 
       - name: Test init-system selection
         run: scripts/tests/test-image-init-selection.sh
