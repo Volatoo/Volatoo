@@ -5,6 +5,9 @@ previews, not a stable production release. The images boot through BIOS and
 UEFI, offer separate OpenRC and systemd targets, and require an SSH public key
 to be provisioned during installation. They do not ship a default password.
 
+The current images and verification files are available from the
+[`v0.1.0-dev.20260814` developer preview](https://github.com/Volatoo/Volatoo/releases/tag/v0.1.0-dev.20260814).
+
 ## Choose an image
 
 Choose exactly one init-system target:

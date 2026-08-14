@@ -8,9 +8,10 @@ release key, the base and FHS update layers are independently authenticated by
 dm-verity, mounted as one read-only lower stack and read on demand, while a
 tmpfs OverlayFS upper holds all unpersisted runtime changes.
 
-> Status: Phases 0 through 2 are complete; Phase 3 now has a validated Catalyst
-> minimal-image build, with the remaining release-image work tracked below.
-> No release image is published yet — see [ROADMAP.md](ROADMAP.md).
+> Status: Phases 0 through 2 are complete. Phase 3 has validated OpenRC and
+> systemd Catalyst targets, and the first installable `v0.1-dev` preview is
+> [published](https://github.com/Volatoo/Volatoo/releases/tag/v0.1.0-dev.20260814).
+> Remaining release work is tracked in [ROADMAP.md](ROADMAP.md).
 
 ## Why
 
