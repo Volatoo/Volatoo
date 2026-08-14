@@ -410,6 +410,26 @@ jq -e \
 	<<<"$realization_inspection" \
 	>/dev/null ||
 	fail "realization did not bind the complete source generation"
+docker run --rm \
+	--platform linux/amd64 \
+	--user 65534:65534 \
+	--mount "type=bind,src=$work_dir/realized,dst=/realized,readonly" \
+	--entrypoint /bin/sh \
+	"$compressor_image" \
+	-c '
+		set -eu
+		for name in \
+			closure.squashfs \
+			closure.verity \
+			fhs-contract \
+			tree-digest \
+			verity-data-blocks \
+			verity-root-hash \
+			verity-salt
+		do
+			test -r "/realized/$name"
+		done
+	'
 verity_root_hash=$(<"$work_dir/realized/verity-root-hash")
 verity_salt=$(<"$work_dir/realized/verity-salt")
 verity_data_blocks=$(<"$work_dir/realized/verity-data-blocks")

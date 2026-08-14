@@ -186,13 +186,13 @@ docker run --rm \
 	"$compressor_image" \
 	-c '
 		set -eu
-		cp /workspace/base.squashfs /export/closure.squashfs
-		cp /workspace/base.verity /export/closure.verity
-		cp /workspace/fhs-contract /export/fhs-contract
-		cp /workspace/tree-digest /export/tree-digest
-		cp /workspace/verity-data-blocks /export/verity-data-blocks
-		cp /workspace/verity-root-hash /export/verity-root-hash
-		cp /workspace/verity-salt /export/verity-salt
+		install -m 0644 /workspace/base.squashfs /export/closure.squashfs
+		install -m 0644 /workspace/base.verity /export/closure.verity
+		install -m 0644 /workspace/fhs-contract /export/fhs-contract
+		install -m 0644 /workspace/tree-digest /export/tree-digest
+		install -m 0644 /workspace/verity-data-blocks /export/verity-data-blocks
+		install -m 0644 /workspace/verity-root-hash /export/verity-root-hash
+		install -m 0644 /workspace/verity-salt /export/verity-salt
 		cmp /workspace/tree-digest /workspace/verified-tree-digest
 	'
 
