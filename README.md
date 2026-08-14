@@ -121,7 +121,7 @@ The reproducible minimal-image entry point is
 workflow and Docker requirements.
 
 The official Gentoo package repository is maintained separately in
-[`slchris/volatoo-overlay`](https://github.com/slchris/volatoo-overlay).
+[`Volatoo/volatoo-overlay`](https://github.com/Volatoo/volatoo-overlay).
 
 ## Contributing
 
