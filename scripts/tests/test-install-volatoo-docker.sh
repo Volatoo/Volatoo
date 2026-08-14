@@ -73,8 +73,13 @@ docker run --rm --privileged \
 			exit 1
 		fi
 		grep -q "release targets openrc, not systemd" /tmp/wrong-target.stderr
-		cp /input/release.img.manifest /tmp/bad.manifest
-		sed -i "s/^disk_sha256=./disk_sha256=0/" /tmp/bad.manifest
+		disk_digest=$(sed -n "s/^disk_sha256=//p" /input/release.img.manifest)
+		case $disk_digest in
+			0*) replacement=1 ;;
+			*) replacement=0 ;;
+		esac
+		sed "s/^disk_sha256=./disk_sha256=$replacement/" \
+			/input/release.img.manifest >/tmp/bad.manifest
 		if /repo/scripts/install-volatoo.sh \
 			--device "$loop" \
 			--init-system openrc \
