@@ -76,7 +76,7 @@ fi
 
 mounted=0
 # The function is invoked indirectly by the signal/exit trap.
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 cleanup()
 {
 	if [ "$mounted" -eq 1 ]; then
