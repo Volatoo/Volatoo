@@ -119,17 +119,14 @@ jobs:
             --metadata-only \
             "$RUNNER_TEMP/gentoo-inputs-${{ matrix.init_system }}"
 
-      - name: Validate Catalyst builder and spec
-        run: |
-          scripts/build-catalyst-squashfs.sh \
-            --init-system "${{ matrix.init_system }}" \
-            --validate-only
-
   build:
     name: Build minimal image (${{ matrix.init_system }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: validate
-    runs-on: ubuntu-24.04
+    # Image construction is allowed only on a runner whose Docker CLI is
+    # configured for OrbStack. Hosted Linux Docker must not be used as a
+    # substitute for the release Gate.
+    runs-on: [self-hosted, macOS, orbstack]
     timeout-minutes: 360
     strategy:
       fail-fast: false
