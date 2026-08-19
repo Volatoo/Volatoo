@@ -8,15 +8,15 @@ installer=/config/overlay/usr/sbin/volatoo-installer
 installer_metadata=/config/overlay/usr/share/volatoo/installer
 
 if [ -e "${installer}" ]; then
-	[ -f "${installer}" ] && [ ! -L "${installer}" ] || {
+	if ! [ -f "${installer}" ] || [ -L "${installer}" ]; then
 		echo "error: live-media installer is unsafe" >&2
 		exit 1
-	}
-	[ -f "${installer_metadata}/version" ] \
-		&& [ -f "${installer_metadata}/sha256" ] || {
+	fi
+	if ! [ -f "${installer_metadata}/version" ] \
+		|| ! [ -f "${installer_metadata}/sha256" ]; then
 		echo "error: live-media installer metadata is incomplete" >&2
 		exit 1
-	}
+	fi
 	expected_version=$(cat "${installer_metadata}/version")
 	expected_sha256=$(cat "${installer_metadata}/sha256")
 	actual_version=$("${installer}" version)
