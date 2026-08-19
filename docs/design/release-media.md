@@ -143,8 +143,8 @@ scripts/test-release-disk-docker.sh \
   tampered.img
 ```
 
-Package one validated OpenRC disk and one validated systemd disk for
-publication:
+The following command reproduces the historical, unsigned developer-preview
+bundle only:
 
 ```sh
 scripts/package-release-docker.sh \
@@ -153,13 +153,48 @@ scripts/package-release-docker.sh \
   out/volatoo-v0.1-dev-release
 ```
 
-The OrbStack packager requires manifest v2, rechecks disk identity and every
-provenance field, compresses each raw disk with pinned zstd, decompresses it to
-verify the manifest disk digest, and publishes `SHA256SUMS` only after both
-targets pass. The output also contains the matching manifests, installer and
-developer-preview handbook. Its runtime has no network access.
+This legacy OrbStack packager requires manifest v2, rechecks disk identity and
+every provenance field, compresses each raw disk with pinned zstd, decompresses
+it to verify the manifest disk digest, and publishes `SHA256SUMS` only after
+both targets pass. The output also contains the matching manifests, installer
+and developer-preview handbook. Its runtime has no network access. Formal
+releases are packaged by `Volatoo/releng` as content-addressed objects behind a
+signed release-index v1 and are installed by the separate `Volatoo/installer`
+executable. They must not include this repository's Bash writer.
 
-Install a release image only to an explicit block device:
+Releng also publishes a separately signed live-media-inputs v1 document. It
+binds the exact release-index digest, build ID and channel to the static amd64
+installer and release keyring objects used by the live root. Cross-repository
+QA rejects changed documents and independently valid documents mixed across
+different releases before any target disk is opened.
+
+The authenticated live ISO builder consumes that publication, a matching
+Catalyst SquashFS, kernel and initramfs. It re-verifies both signatures, every
+published checksum and CAS object, then checks that the installer and keyring
+inside the live root are byte-identical to the signed live-media inputs. It
+also rejects a live root missing any external installer command. The resulting
+BIOS/UEFI hybrid ISO embeds the signed publication below `/volatoo/distfiles`
+and emits an `org.volatoo.live-media/v1` digest manifest. Fixed ISO dates, GPT
+identity, GRUB UUID records and FAT serial make identical inputs produce
+byte-identical output.
+
+Once those final bytes exist, releng emits and signs a canonical
+`org.volatoo.live-media-release/v1` descriptor. It binds the complete ISO and
+build manifest to the exact release-index, live-media-inputs and release-key
+digests. QA verifies this signature and hashes the whole ISO before starting
+QEMU, so a modified downloaded medium is rejected without booting a guest or
+creating a target disk. This second signing stage is intentionally external to
+the ISO to avoid a self-referential artifact digest.
+
+The cross-repository live-media Gate boots the ISO in QEMU, reaches it through
+a QA-only SSH key injected into a separate state image, verifies the installed
+installer and keyring, and invokes the formal installer against an explicit
+virtio target using only the ISO-local signed publication. OpenRC and systemd
+targets are each installed this way and the resulting disks are subsequently
+booted under BIOS and UEFI. Production media do not contain the QA key.
+
+For compatibility testing of the historical preview, write an image only to
+an explicit block device:
 
 ```sh
 sudo scripts/install-volatoo.sh \

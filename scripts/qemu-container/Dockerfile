@@ -5,6 +5,7 @@ RUN apt-get update \
         bash \
         coreutils \
         cpio \
+        e2fsprogs \
         file \
         grep \
         gzip \

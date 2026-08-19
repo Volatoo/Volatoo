@@ -5,40 +5,48 @@ on:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
       - "image/catalyst/**"
+      - "image/live-iso/**"
       - "persist/**"
       - "scripts/tests/test-image-init-selection.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
       - "scripts/build-release-disk-docker.sh"
+      - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
       - "scripts/package-release-docker.sh"
       - "scripts/publication-container/**"
       - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
+      - "scripts/test-live-iso-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
+      - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
   pull_request:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
       - "image/catalyst/**"
+      - "image/live-iso/**"
       - "persist/**"
       - "scripts/tests/test-image-init-selection.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
       - "scripts/build-release-disk-docker.sh"
+      - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
       - "scripts/package-release-docker.sh"
       - "scripts/publication-container/**"
       - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
+      - "scripts/test-live-iso-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
+      - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
   schedule:
@@ -75,19 +83,31 @@ jobs:
             scripts/fetch-gentoo-inputs.sh \
             scripts/test-qemu-boot.sh \
             scripts/build-release-disk-docker.sh \
+            scripts/build-live-iso-docker.sh \
             scripts/install-volatoo.sh \
             scripts/prepare-secure-boot-test-key-docker.sh \
             scripts/package-release-docker.sh \
             scripts/tamper-release-efi-docker.sh \
             scripts/test-release-disk-docker.sh \
+            scripts/test-live-iso-docker.sh \
             scripts/tests/test-install-volatoo-docker.sh \
             scripts/tests/test-firstboot-access-docker.sh \
+            scripts/tests/test-live-iso-normalizer-docker.sh \
             scripts/tests/test-image-init-selection.sh \
             image/catalyst/finalize.sh \
             image/catalyst/container/run-catalyst.sh \
+            image/live-iso/container/build-live-iso.sh \
             scripts/release-container/build-release-disk.sh \
             scripts/publication-container/package-release.sh \
-            scripts/qemu-container/test-release-disk.sh
+            scripts/qemu-container/test-release-disk.sh \
+            scripts/qemu-container/test-live-iso.sh
+
+      - name: Check Python sources
+        run: |
+          python3 -m py_compile \
+            image/live-iso/container/normalize-iso.py \
+            image/live-iso/container/verify-inputs.py \
+            image/live-iso/tests/test_normalize_iso.py
 
       - name: Test init-system selection
         run: scripts/tests/test-image-init-selection.sh

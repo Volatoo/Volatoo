@@ -7,8 +7,9 @@ if (( $# != 3 )); then
 Usage: scripts/package-release-docker.sh \
   OPENRC.img SYSTEMD.img OUTPUT_DIRECTORY
 
-Validate and package two release-media v2 disks as zstd archives with their
-manifests, installer, handbook and SHA256SUMS. OUTPUT_DIRECTORY must not exist.
+Reproduce the legacy developer-preview bundle from two release-media v2 disks.
+Formal releases use Volatoo/releng and must not include install-volatoo.sh.
+OUTPUT_DIRECTORY must not exist.
 EOF
 	exit 2
 fi

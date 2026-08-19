@@ -65,6 +65,14 @@ Three cooperating pieces:
 | `volatoo-image` | Builds the compressed rootfs image from a Gentoo stage3 + package set (catalyst-based) |
 | `volatoo-persist` | Declarative persistence: which paths survive reboot, and how they sync back to disk |
 
+Installation is owned by the separate
+[`Volatoo/installer`](https://github.com/Volatoo/installer) project. Its formal
+release path authenticates a signed, versioned release index before acquiring
+content-addressed media or opening an explicit target device. The Bash disk
+writer retained in this repository exists only for the published developer
+preview and compatibility testing; it is not the installer for future formal
+releases.
+
 ### Persistence model
 
 Without a state filesystem, everything is volatile. When state is present,
@@ -122,6 +130,13 @@ The reproducible minimal-image entry point is
 `scripts/build-catalyst-squashfs.sh`; see
 [`image/catalyst/README.md`](image/catalyst/README.md) for its pinned-input
 workflow and Docker requirements.
+
+Authenticated BIOS/UEFI live media are built by
+`scripts/build-live-iso-docker.sh`; see
+[`image/live-iso/README.md`](image/live-iso/README.md) for the signed input
+contract, reproducibility rules and OrbStack QEMU Gates. The live system ships
+the standalone installer and its release keyring, and carries the exact signed
+release publication for offline installation.
 
 The official Gentoo package repository is maintained separately in
 [`Volatoo/volatoo-overlay`](https://github.com/Volatoo/volatoo-overlay).

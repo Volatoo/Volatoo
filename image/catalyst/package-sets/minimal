@@ -4,5 +4,9 @@ net-misc/openssh
 net-misc/rsync
 app-admin/sudo
 app-crypt/signify
+app-arch/zstd
+app-misc/ca-certificates
+sys-apps/coreutils
+sys-apps/gptfdisk
 sys-apps/util-linux
 sys-fs/e2fsprogs

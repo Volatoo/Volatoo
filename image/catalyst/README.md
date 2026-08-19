@@ -7,7 +7,8 @@ inputs:
 2. the matching official amd64 stage3 archive;
 3. its matching Gentoo repository snapshot in Catalyst SquashFS format;
 4. one or more release public keys;
-5. the version and snapshot identifiers passed on the command line.
+5. an optional versioned installer executable bound by SHA-256;
+6. the version and snapshot identifiers passed on the command line.
 
 OpenRC uses `default/linux/amd64/23.0`; systemd uses
 `default/linux/amd64/23.0/systemd`. They use separate Catalyst work volumes and
@@ -40,6 +41,9 @@ scripts/build-catalyst-squashfs.sh \
   --snapshot /path/to/gentoo-20260719.xz.sqfs \
   --snapshot-id 20260719 \
   --trust-key /secure/volatoo-release.pub \
+  --installer /path/to/volatoo-installer-amd64 \
+  --installer-version 0.1.0-dev \
+  --installer-sha256 INSTALLER_SHA256 \
   --version 20260723 \
   out/volatoo-minimal-openrc-20260723.squashfs
 ```
@@ -80,8 +84,19 @@ The shared minimal package set installs Gentoo's native `app-crypt/signify`
 from the verified repository snapshot. Keeping the installed userspace on one
 glibc ABI lets realization validation cover the verifier itself instead of
 exempting a private musl runtime. Catalyst executes the verifier during
-finalization. Trusted keys are installed by SHA-256 below
-`/etc/volatoo/trusted.d`; use the same key set when building the initramfs.
+finalization. It also installs every external command used by the formal
+installer (`zstd`, `sgdisk`, coreutils, util-linux and e2fsprogs) rather than
+assuming that the selected stage3 happens to contain them. Trusted keys are
+installed by SHA-256 below
+`/etc/volatoo/trusted.d` and the installer's release keyring below
+`/usr/share/volatoo/keyring/release`; use the same key set when building the
+initramfs. When an installer is supplied, the builder checks its declared
+digest on the host and checks both its embedded version and digest again in
+the pinned amd64 Catalyst container before building the root.
+For formal media, the installer path, version, digest and trust keys come from
+releng's signed live-media-inputs v1 document; the QA Gate verifies that the
+document is bound to the exact release index before passing its CAS objects to
+this builder.
 Omitting `--trust-key` remains available for unsigned development images, but
 those images cannot perform authenticated generation selection from the
 installed userspace.
