@@ -2,12 +2,14 @@ name: Weekly minimal image
 
 on:
   push:
+    branches: [main]
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
       - "image/catalyst/**"
       - "image/live-iso/**"
       - "persist/**"
       - "scripts/tests/test-image-init-selection.sh"
+      - "scripts/tests/test-docker-context-policy.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
@@ -16,6 +18,7 @@ on:
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
       - "scripts/package-release-docker.sh"
+      - "scripts/require-docker-context.sh"
       - "scripts/publication-container/**"
       - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
@@ -32,6 +35,7 @@ on:
       - "image/live-iso/**"
       - "persist/**"
       - "scripts/tests/test-image-init-selection.sh"
+      - "scripts/tests/test-docker-context-policy.sh"
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
@@ -40,6 +44,7 @@ on:
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
       - "scripts/package-release-docker.sh"
+      - "scripts/require-docker-context.sh"
       - "scripts/publication-container/**"
       - "scripts/tamper-release-efi-docker.sh"
       - "scripts/test-release-disk-docker.sh"
@@ -87,12 +92,14 @@ jobs:
             scripts/install-volatoo.sh \
             scripts/prepare-secure-boot-test-key-docker.sh \
             scripts/package-release-docker.sh \
+            scripts/require-docker-context.sh \
             scripts/tamper-release-efi-docker.sh \
             scripts/test-release-disk-docker.sh \
             scripts/test-live-iso-docker.sh \
             scripts/tests/test-install-volatoo-docker.sh \
             scripts/tests/test-firstboot-access-docker.sh \
             scripts/tests/test-live-iso-normalizer-docker.sh \
+            scripts/tests/test-docker-context-policy.sh \
             scripts/tests/test-image-init-selection.sh \
             image/catalyst/finalize.sh \
             image/catalyst/container/run-catalyst.sh \
@@ -112,6 +119,12 @@ jobs:
       - name: Test init-system selection
         run: scripts/tests/test-image-init-selection.sh
 
+      - name: Test Docker context policy
+        run: scripts/tests/test-docker-context-policy.sh
+
+      - name: Test live ISO normalization
+        run: scripts/tests/test-live-iso-normalizer-docker.sh
+
       - name: Verify and resolve Gentoo metadata
         run: |
           scripts/fetch-gentoo-inputs.sh \
@@ -119,14 +132,17 @@ jobs:
             --metadata-only \
             "$RUNNER_TEMP/gentoo-inputs-${{ matrix.init_system }}"
 
+      - name: Validate Catalyst builder and spec
+        run: |
+          scripts/build-catalyst-squashfs.sh \
+            --init-system "${{ matrix.init_system }}" \
+            --validate-only
+
   build:
     name: Build minimal image (${{ matrix.init_system }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     needs: validate
-    # Image construction is allowed only on a runner whose Docker CLI is
-    # configured for OrbStack. Hosted Linux Docker must not be used as a
-    # substitute for the release Gate.
-    runs-on: [self-hosted, macOS, orbstack]
+    runs-on: ubuntu-24.04
     timeout-minutes: 360
     strategy:
       fail-fast: false

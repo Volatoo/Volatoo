@@ -210,10 +210,9 @@ if ! docker info >/dev/null 2>&1; then
 	echo "error: the Docker daemon is not available" >&2
 	exit 1
 fi
-if [[ $(docker context show) != orbstack ]]; then
-	echo "error: Docker context must be orbstack" >&2
-	exit 1
-fi
+# shellcheck source=scripts/require-docker-context.sh
+source "$repo_root/scripts/require-docker-context.sh"
+volatoo_require_docker_context
 
 if command -v getconf >/dev/null 2>&1; then
 	default_jobs=$(getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
