@@ -51,6 +51,36 @@ preview trust boundary.
 
 ## Install to an explicit disk
 
+Formal live media include the standalone
+[`Volatoo installer`](https://github.com/Volatoo/installer), its authenticated
+release keyring and the exact signed release publication used to construct the
+medium. Boot the ISO, identify the destination independently, and invoke the
+installer with the exact device and desired init-system target:
+
+```sh
+sudo /usr/sbin/volatoo-installer install \
+  --index /.volatoo/source/volatoo/distfiles/releases/amd64/channels/v0.1-dev/index.json \
+  --channel v0.1-dev \
+  --architecture amd64 \
+  --init-system openrc \
+  --device /dev/DEVICE
+```
+
+Use `--init-system systemd` for the systemd release. The installer verifies the
+signed canonical release index with `/usr/share/volatoo/keyring/release`,
+acquires only its content-addressed objects, checks the selected artifact before
+opening the target, requires the complete device path as confirmation, performs
+a full write readback, expands persistent state and records an installation
+receipt. Add `--ssh-authorized-key /path/to/key.pub` to provision first-boot
+access, or use `--no-provision-access` only when another access mechanism is
+already arranged.
+
+### Historical developer-preview writer
+
+The remainder of this section documents the legacy Bash disk writer bundled
+with `v0.1.0-dev.20260814`. It is retained for historical release compatibility
+and is not part of the authenticated formal release path.
+
 Run the installer from a Linux environment with Bash, util-linux, GPT fdisk,
 e2fsprogs and coreutils installed. The installer does not auto-detect a target
 and never selects a disk on the operator's behalf.
@@ -175,9 +205,10 @@ The reproducible build sequence is:
 6. Assemble the raw disk with `scripts/build-release-disk-docker.sh`.
 7. Boot it with `scripts/test-release-disk-docker.sh` before installation or
    publication.
-8. Package the validated OpenRC and systemd disks with
-   `scripts/package-release-docker.sh`; publish only a directory containing its
-   final `SHA256SUMS` marker.
+8. Use the dedicated `Volatoo/releng` repository to publish a signed release
+   index and content-addressed OpenRC/systemd archives. The local
+   `scripts/package-release-docker.sh` command only reproduces the historical
+   developer-preview bundle and must not be used for a formal release.
 
 See [the Catalyst build guide](../image/catalyst/README.md),
 [release-media contract](design/release-media.md) and

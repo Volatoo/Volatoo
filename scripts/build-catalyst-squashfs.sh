@@ -15,6 +15,11 @@ Required build options:
   --snapshot PATH     Matching Gentoo Catalyst repository snapshot (.sqfs)
   --snapshot-id ID    Snapshot treeish used in gentoo-ID.sqfs
   --trust-key PATH    Install a trusted signify public key; repeat for rotation
+  --installer PATH    Install a pinned amd64 volatoo-installer executable
+  --installer-version VERSION
+                      Required embedded version for --installer
+  --installer-sha256 SHA256
+                      Required executable digest for --installer
 
 Other options:
   --init-system NAME  Select openrc or systemd (default: openrc)
@@ -41,6 +46,9 @@ snapshot_path=
 snapshot_id=
 declare -a trust_keys=()
 trust_key_count=0
+installer_path=
+installer_version=
+installer_sha256=
 init_system=openrc
 version_stamp=$(date -u +%Y%m%d)
 work_volume=
@@ -68,6 +76,21 @@ while (( $# > 0 )); do
 			(( $# >= 2 )) || { echo "error: --trust-key requires a path" >&2; exit 2; }
 			trust_keys+=("$2")
 			trust_key_count=$((trust_key_count + 1))
+			shift 2
+			;;
+		--installer)
+			(( $# >= 2 )) || { echo "error: --installer requires a path" >&2; exit 2; }
+			installer_path=$2
+			shift 2
+			;;
+		--installer-version)
+			(( $# >= 2 )) || { echo "error: --installer-version requires a value" >&2; exit 2; }
+			installer_version=$2
+			shift 2
+			;;
+		--installer-sha256)
+			(( $# >= 2 )) || { echo "error: --installer-sha256 requires a value" >&2; exit 2; }
+			installer_sha256=$2
 			shift 2
 			;;
 		--init-system)
@@ -144,6 +167,29 @@ if (( trust_key_count > 0 )); then
 		}
 	done
 fi
+if [[ -n $installer_path || -n $installer_version || -n $installer_sha256 ]]; then
+	[[ -f $installer_path && ! -L $installer_path ]] || {
+		echo "error: installer must be a regular non-symlink file" >&2
+		exit 1
+	}
+	[[ $installer_version =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ ]] || {
+		echo "error: installer version is invalid" >&2
+		exit 1
+	}
+	[[ $installer_sha256 =~ ^[0-9a-f]{64}$ ]] || {
+		echo "error: installer SHA-256 is invalid" >&2
+		exit 1
+	}
+	if command -v sha256sum >/dev/null 2>&1; then
+		installer_checksum=$(sha256sum "$installer_path")
+	else
+		installer_checksum=$(shasum -a 256 "$installer_path")
+	fi
+	[[ ${installer_checksum%% *} == "$installer_sha256" ]] || {
+		echo "error: installer differs from --installer-sha256" >&2
+		exit 1
+	}
+fi
 
 if [[ $validate_only = no ]]; then
 	[[ -n $stage3_path ]] || { echo "error: --stage3 is required" >&2; exit 2; }
@@ -162,6 +208,10 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 if ! docker info >/dev/null 2>&1; then
 	echo "error: the Docker daemon is not available" >&2
+	exit 1
+fi
+if [[ $(docker context show) != orbstack ]]; then
+	echo "error: Docker context must be orbstack" >&2
 	exit 1
 fi
 
@@ -220,8 +270,18 @@ for update_tool in "${update_tools[@]}"; do
 done
 ln -s ../libexec/volatoo-update-view \
 	"$runtime_dir/overlay/usr/bin/volatoo-update-view"
+if [[ -n $installer_path ]]; then
+	install -m 0755 "$installer_path" \
+		"$runtime_dir/overlay/usr/sbin/volatoo-installer"
+	mkdir -p "$runtime_dir/overlay/usr/share/volatoo/installer"
+	printf '%s\n' "$installer_version" \
+		>"$runtime_dir/overlay/usr/share/volatoo/installer/version"
+	printf '%s\n' "$installer_sha256" \
+		>"$runtime_dir/overlay/usr/share/volatoo/installer/sha256"
+fi
 if (( trust_key_count > 0 )); then
 	mkdir -p "$runtime_dir/overlay/etc/volatoo/trusted.d"
+	mkdir -p "$runtime_dir/overlay/usr/share/volatoo/keyring/release"
 	for trust_key in "${trust_keys[@]}"; do
 		if command -v sha256sum >/dev/null 2>&1; then
 			key_checksum=$(sha256sum "$trust_key")
@@ -238,6 +298,8 @@ if (( trust_key_count > 0 )); then
 		else
 			install -m 0644 "$trust_key" "$key_destination"
 		fi
+		keyring_destination=$runtime_dir/overlay/usr/share/volatoo/keyring/release/$key_digest.pub
+		install -m 0644 "$trust_key" "$keyring_destination"
 	done
 fi
 chmod 0755 \

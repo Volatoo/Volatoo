@@ -126,12 +126,28 @@ system generations. See `docs/design/atomic-package-updates.md`.
   - [x] Keep direct-image SHA-256 mode explicitly development-only until the
         signed generation release pipeline supplies the disk image
   - [ ] Make GPT, filesystem and GRUB output bit-reproducible for identical inputs
-- [ ] Bootable ISO that is itself a Volatoo system (the live medium *is* the distro)
-- [ ] Installer: partition, write image + bootloader + state partition (a script is fine)
+- [x] Bootable ISO that is itself a Volatoo system (the live medium *is* the distro)
+- [x] Ship the formal `Volatoo/installer` in authenticated live media
   - [x] Require an explicit block device and verify the release manifest, digest
         and selected init system before writing
   - [x] Expand the state partition and filesystem to fill a larger destination
-  - [ ] Package the installer in the live medium
+  - [x] Implement strict signed release-index verification and
+        content-addressed media acquisition in the dedicated installer
+  - [x] Verify installed-disk readback, state expansion and receipt creation
+        against both init-system targets
+  - [x] Boot formally installed OpenRC and systemd disks under BIOS and UEFI in
+        the OrbStack cross-repository QA Gate
+  - [x] Package the formal installer in the Volatoo Portage overlay
+  - [x] Bind the amd64 installer, release keyring and exact release index in a
+        separately signed live-media-inputs v1 document, and validate both
+        Catalyst init-system roots against its content-addressed objects
+  - [x] Package the installer in the live medium
+  - [x] Build byte-reproducible BIOS/UEFI hybrid ISO output and boot the final
+        authenticated image in both firmware modes through OrbStack QEMU
+  - [x] Sign a canonical descriptor for the final ISO bytes and reject a
+        modified medium or wrong release key before starting QEMU
+  - [x] Install both OpenRC and systemd targets from the running live ISO, then
+        boot each installed disk under BIOS and UEFI
 - [x] Provision a key-only `volatoo` administrator and enable DHCP/SSH for both
       init-system targets without shipping a default password
 - [ ] PXE/diskless boot documented and tested

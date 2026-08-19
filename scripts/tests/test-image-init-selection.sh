@@ -39,6 +39,11 @@ cat >"$fake_bin/docker" <<'FAKE_DOCKER'
 set -euo pipefail
 
 case ${1:-} in
+	context)
+		[[ ${2:-} == show ]]
+		echo orbstack
+		exit 0
+		;;
 	info | build)
 		exit 0
 		;;
@@ -94,6 +99,15 @@ case ${1:-} in
 			[[ ${#trusted_keys[@]} -eq 1 && -f ${trusted_keys[0]} ]]
 		fi
 		grep -Fq '  app-crypt/signify' "$config_dir/volatoo.spec"
+		for runtime_package in \
+			app-arch/zstd \
+			app-misc/ca-certificates \
+			sys-apps/coreutils \
+			sys-apps/gptfdisk \
+			sys-apps/util-linux \
+			sys-fs/e2fsprogs; do
+			grep -Fq "  $runtime_package" "$config_dir/volatoo.spec"
+		done
 		[[ ! -e $config_dir/overlay/usr/libexec/volatoo-signify ]]
 		case $init_system in
 			openrc)

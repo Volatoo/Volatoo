@@ -10,9 +10,10 @@ Usage: scripts/install-volatoo.sh \
   --image RELEASE.img [--manifest RELEASE.img.manifest] \
   (--ssh-authorized-key PUBLIC_KEY | --no-provision-access) [--yes]
 
-Write one verified Volatoo release disk to one explicit block device. This
-command never discovers or selects a destination automatically. All data on
-DEVICE will be overwritten.
+Legacy developer-preview disk writer. Future formal releases use the separate
+Volatoo/installer executable with a signed release index. This command never
+discovers or selects a destination automatically. All data on DEVICE will be
+overwritten.
 EOF
 }
 

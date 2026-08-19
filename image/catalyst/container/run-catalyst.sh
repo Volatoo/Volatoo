@@ -4,6 +4,32 @@ set -eu
 
 spec=/config/volatoo.spec
 config=/config/catalyst.conf
+installer=/config/overlay/usr/sbin/volatoo-installer
+installer_metadata=/config/overlay/usr/share/volatoo/installer
+
+if [ -e "${installer}" ]; then
+	if ! [ -f "${installer}" ] || [ -L "${installer}" ]; then
+		echo "error: live-media installer is unsafe" >&2
+		exit 1
+	fi
+	if ! [ -f "${installer_metadata}/version" ] \
+		|| ! [ -f "${installer_metadata}/sha256" ]; then
+		echo "error: live-media installer metadata is incomplete" >&2
+		exit 1
+	fi
+	expected_version=$(cat "${installer_metadata}/version")
+	expected_sha256=$(cat "${installer_metadata}/sha256")
+	actual_version=$("${installer}" version)
+	actual_sha256=$(sha256sum "${installer}" | awk '{print $1}')
+	[ "${actual_version}" = "${expected_version}" ] || {
+		echo "error: live-media installer version differs from metadata" >&2
+		exit 1
+	}
+	[ "${actual_sha256}" = "${expected_sha256}" ] || {
+		echo "error: live-media installer digest differs from metadata" >&2
+		exit 1
+	}
+fi
 
 if [ "${VOLATOO_VALIDATE_ONLY:-no}" = yes ]; then
 	python - "${spec}" <<'PY'
@@ -37,6 +63,22 @@ if values["compression_mode"] != "squashfs_zstd":
     raise SystemExit("the Volatoo image must use squashfs_zstd")
 if not values["stage4/packages"]:
     raise SystemExit("the package set is empty")
+required_installer_runtime = {
+    "app-arch/zstd",
+    "app-misc/ca-certificates",
+    "sys-apps/coreutils",
+    "sys-apps/gptfdisk",
+    "sys-apps/util-linux",
+    "sys-fs/e2fsprogs",
+}
+missing_runtime = sorted(
+    required_installer_runtime - set(values["stage4/packages"])
+)
+if missing_runtime:
+    raise SystemExit(
+        "the installer runtime package set is incomplete: "
+        + ", ".join(missing_runtime)
+    )
 required_empty = {
     "/var/cache/binpkgs",
     "/var/cache/distfiles",
