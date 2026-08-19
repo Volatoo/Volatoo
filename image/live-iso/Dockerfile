@@ -9,7 +9,7 @@ RUN apk add --no-cache \
     grub-bios=2.14-r0 \
     grub-efi=2.14-r0 \
     mtools=4.0.49-r0 \
-    python3=3.14.7-r0 \
+    python3=3.14.7-r1 \
     signify=32-r1 \
     squashfs-tools=4.7.5-r0 \
     xorriso=1.5.8-r0
