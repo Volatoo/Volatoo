@@ -109,12 +109,13 @@ if [[ -n $signify_root ]]; then
 	signify_root=$(cd -- "$signify_root" && pwd)
 fi
 
-if ! file "$busybox_path" | grep -Eq 'x86-64|x86_64'; then
+busybox_description=$(LC_ALL=C file -b -- "$busybox_path")
+if ! grep -Eq 'x86-64|x86_64' <<<"$busybox_description"; then
 	echo "error: BusyBox must be an x86_64 binary: $busybox_path" >&2
 	exit 1
 fi
 
-if ! file "$busybox_path" | grep -q 'statically linked'; then
+if ! grep -Eq '(statically|static-pie) linked' <<<"$busybox_description"; then
 	echo "error: BusyBox must be statically linked: $busybox_path" >&2
 	exit 1
 fi
