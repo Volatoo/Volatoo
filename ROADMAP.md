@@ -111,11 +111,15 @@ system generations. See `docs/design/atomic-package-updates.md`.
             and retain periodic independent full-tree validation
       - [x] Scan only the new layer and re-evaluate affected shebang, loader
             and ELF dependency edges against the merged parent index
-  - [ ] Publish stable OpenRC/systemd Engine targets and run the real signed E2E
-    - [x] Authenticate exact realization plans with an initramfs-embedded
-          Ed25519 trust key before accepting dm-verity root hashes
-    - [x] Boot signed OpenRC and systemd realization-v3 fixtures with their real
-          PID 1 under BIOS and UEFI in the OrbStack QEMU runner
+- [x] Publish stable OpenRC/systemd Engine targets and run the real signed E2E
+  - [x] Import only server-owned stable binhost inventory entries with matching
+        architecture, feature policy, metadata and immutable package namespace
+  - [x] Authenticate exact realization plans with an initramfs-embedded
+        Ed25519 trust key before accepting dm-verity root hashes
+  - [x] Boot signed OpenRC and systemd realization-v3 fixtures with their real
+        PID 1 under BIOS and UEFI in the pinned GitHub Actions QEMU runner
+  - [x] Exercise signed rollback and reject data, hash-tree, parent-tree receipt
+        and detached-signature tampering before release
 
 ## Phase 4 — Installable release
 
