@@ -228,8 +228,24 @@ required Portage FEATURES and binhost namespace.
 
 The example target bindings contain illustrative digests. Production bindings
 must be generated from and reviewed against Portage Engine's stable server
-catalog. Their binhost path is exactly `/binpkgs/<complete target_id>`, which
-keeps OpenRC and systemd artifacts isolated.
+catalog. Their binhost path uses Portage Engine's target-separated Gentoo
+namespace, `/binpkgs/releases/<arch>/binpackages/<generation>/<target>`.
+OpenRC and systemd must name different final target components.
+
+Save the response from the Engine's public `/api/v1/binhosts`
+inventory and import one reviewed stable profile instead of hand-writing a
+production binding:
+
+```sh
+update/volatoo-engine import-target \
+  --inventory /var/tmp/engine-binhosts.json \
+  --build-context /var/tmp/build-context.json \
+  --profile-id volatoo/amd64/glibc/openrc/23.0/base-v1 \
+  --output /var/tmp/portage-engine-target.json
+```
+
+Candidate profiles, incomplete metadata, cross-architecture profiles and a
+binhost path that differs from the server's consume path fail closed.
 
 ```sh
 update/volatoo-manifest canonicalize \
@@ -257,7 +273,9 @@ BuildSpec, target binding and exact request, so a changed builder generation
 does not accidentally reuse an older job. It accepts credentials only from a
 regular file inaccessible to group and other users, and rejects any resolved
 profile, repository set, builder image or mirror snapshot that differs from
-the target binding. HTTP is disabled except for an explicit `--allow-http`
+the target binding. The resolved server-owned `required_features` must also
+match: checking the BuildSpec locally is not treated as proof of the remote
+builder policy. HTTP is disabled except for an explicit `--allow-http`
 trusted-LAN/test invocation.
 
 The job receipt proves which remote request and builder context completed; it

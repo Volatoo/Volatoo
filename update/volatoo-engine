@@ -28,6 +28,11 @@ BUILD_SPEC_SCHEMA = "org.volatoo.build-spec/v1"
 DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._/-]{0,255}$")
 NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9+._-]{0,63}$")
+BINHOST_RE = re.compile(
+    r"^/binpkgs/releases/([A-Za-z0-9][A-Za-z0-9+._-]{0,63})/"
+    r"binpackages/[A-Za-z0-9][A-Za-z0-9+._-]{0,127}/"
+    r"[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$"
+)
 CPV_RE = re.compile(r"^([^/]+)/(.+)-([0-9][A-Za-z0-9._-]*)$")
 MAX_RESPONSE = 1024 * 1024
 TERMINAL_SUCCESS = {"success", "completed", "succeeded"}
@@ -119,6 +124,23 @@ def read_canonical_json(path: Path) -> tuple[dict[str, Any], bytes]:
     return value, canonical
 
 
+def read_json_object(path: Path) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+        if len(raw) > MAX_RESPONSE:
+            raise ValueError(f"input exceeds {MAX_RESPONSE} bytes")
+        value = json.loads(
+            raw.decode("utf-8"),
+            object_pairs_hook=reject_duplicate_keys,
+            parse_constant=reject_nonstandard_constant,
+        )
+    except (OSError, UnicodeError, ValueError) as error:
+        raise EngineError(f"cannot read JSON {path}: {error}") from error
+    if not isinstance(value, dict):
+        raise EngineError(f"JSON root must be an object: {path}")
+    return value
+
+
 def read_contract(
     path: Path,
     expected_schema: str,
@@ -164,6 +186,24 @@ def require_sorted_strings(
     ):
         raise EngineError(f"{description} must be a sorted unique array")
     return value
+
+
+def normalize_strings(
+    value: Any,
+    description: str,
+    pattern: re.Pattern[str],
+) -> list[str]:
+    if (
+        not isinstance(value, list)
+        or not value
+        or any(
+            not isinstance(item, str) or pattern.fullmatch(item) is None
+            for item in value
+        )
+        or len(value) != len(set(value))
+    ):
+        raise EngineError(f"{description} must be a unique non-empty array")
+    return sorted(value)
 
 
 def read_target(path: Path) -> tuple[dict[str, Any], bytes]:
@@ -215,9 +255,10 @@ def read_target(path: Path) -> tuple[dict[str, Any], bytes]:
         "engine.mirror_bundle_digest",
         DIGEST_RE,
     )
-    if engine["binhost_path"] != f"/binpkgs/{value['target_id']}":
+    binhost_match = BINHOST_RE.fullmatch(engine["binhost_path"])
+    if binhost_match is None or binhost_match.group(1) != engine["arch"]:
         raise EngineError(
-            "engine.binhost_path must be /binpkgs/<complete target_id>"
+            "engine.binhost_path is not a target-separated Gentoo binhost"
         )
     require_sorted_strings(
         engine["required_features"],
@@ -226,6 +267,89 @@ def read_target(path: Path) -> tuple[dict[str, Any], bytes]:
         allow_empty=True,
     )
     return value, raw
+
+
+def import_target(arguments: argparse.Namespace) -> None:
+    context, context_bytes = read_contract(
+        arguments.build_context,
+        BUILD_CONTEXT_SCHEMA,
+    )
+    inventory = read_json_object(arguments.inventory)
+    if set(inventory) != {"binhosts"} or not isinstance(
+        inventory["binhosts"], list
+    ):
+        raise EngineError("Portage Engine inventory fields are invalid")
+    matches = [
+        item
+        for item in inventory["binhosts"]
+        if isinstance(item, dict) and item.get("profile_id") == arguments.profile_id
+    ]
+    if len(matches) != 1:
+        raise EngineError("inventory must contain exactly one requested profile")
+    profile = matches[0]
+    required = {
+        "profile_id",
+        "arch",
+        "channel",
+        "repository_ids",
+        "repository_names",
+        "resource_class",
+        "required_features",
+        "image_digest",
+        "mirror_bundle_digest",
+        "binhost_path",
+        "sync_path",
+    }
+    if not required.issubset(profile):
+        raise EngineError("Portage Engine inventory omits target binding metadata")
+    target_id = context["target"]["id"]
+    if (
+        profile["channel"] != "stable"
+        or profile["profile_id"] != target_id
+        or profile["arch"] != context["target"]["arch"]
+        or profile["sync_path"] != "/binpkgs/" + profile["binhost_path"]
+    ):
+        raise EngineError("Portage Engine profile is not a matching stable target")
+    binding = {
+        "schema": TARGET_SCHEMA,
+        "target_id": target_id,
+        "build_context_digest": digest_bytes(context_bytes),
+        "engine": {
+            "profile_id": profile["profile_id"],
+            "arch": profile["arch"],
+            "repository_ids": normalize_strings(
+                profile["repository_ids"], "repository_ids", ID_RE
+            ),
+            "repository_names": normalize_strings(
+                profile["repository_names"], "repository_names", NAME_RE
+            ),
+            "resource_class": profile["resource_class"],
+            "image_digest": profile["image_digest"],
+            "mirror_bundle_digest": profile["mirror_bundle_digest"],
+            "binhost_path": profile["sync_path"],
+            "required_features": normalize_strings(
+                profile["required_features"], "required_features", NAME_RE
+            ),
+        },
+    }
+    output = canonical_bytes(binding)
+    arguments.output.parent.mkdir(parents=True, exist_ok=True)
+    temporary: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=arguments.output.parent,
+            prefix=f".{arguments.output.name}.validate-",
+            delete=False,
+        ) as stream:
+            temporary = Path(stream.name)
+            stream.write(output)
+        read_target(temporary)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    write_new_file(arguments.output, output)
+    print(f"Portage Engine target: {arguments.output} ({digest_bytes(output)})")
 
 
 def split_cpv(cpv: str) -> tuple[str, str]:
@@ -432,6 +556,7 @@ def validate_status(
         "resource_class": engine["resource_class"],
         "image_digest": engine["image_digest"],
         "mirror_bundle_digest": engine["mirror_bundle_digest"],
+        "required_features": engine["required_features"],
     }
     for field, value in expected.items():
         if context.get(field) != value:
@@ -537,6 +662,13 @@ def submit_request(arguments: argparse.Namespace) -> None:
 def parse_arguments() -> argparse.Namespace:
     parser = argparse.ArgumentParser(prog="volatoo-engine")
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    import_parser = subparsers.add_parser("import-target")
+    import_parser.add_argument("--inventory", type=Path, required=True)
+    import_parser.add_argument("--build-context", type=Path, required=True)
+    import_parser.add_argument("--profile-id", required=True)
+    import_parser.add_argument("--output", type=Path, required=True)
+    import_parser.set_defaults(handler=import_target)
 
     render = subparsers.add_parser("render")
     render.add_argument("--build-context", type=Path, required=True)

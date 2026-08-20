@@ -13,6 +13,11 @@ on:
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
+      - "scripts/test-qemu-boot-docker.sh"
+      - "scripts/build-kernel-docker.sh"
+      - "scripts/build-initramfs.sh"
+      - "scripts/prepare-verity-root-docker.sh"
+      - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-release-disk-docker.sh"
       - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
@@ -28,6 +33,7 @@ on:
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
+      - "update/**"
   pull_request:
     paths:
       - ".github/workflows/weekly-minimal-image.yml"
@@ -39,6 +45,11 @@ on:
       - "scripts/build-catalyst-squashfs.sh"
       - "scripts/fetch-gentoo-inputs.sh"
       - "scripts/test-qemu-boot.sh"
+      - "scripts/test-qemu-boot-docker.sh"
+      - "scripts/build-kernel-docker.sh"
+      - "scripts/build-initramfs.sh"
+      - "scripts/prepare-verity-root-docker.sh"
+      - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-release-disk-docker.sh"
       - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
@@ -54,6 +65,7 @@ on:
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
+      - "update/**"
   schedule:
     - cron: "17 3 * * 1"
   workflow_dispatch:
@@ -87,6 +99,11 @@ jobs:
             scripts/build-catalyst-squashfs.sh \
             scripts/fetch-gentoo-inputs.sh \
             scripts/test-qemu-boot.sh \
+            scripts/test-qemu-boot-docker.sh \
+            scripts/build-kernel-docker.sh \
+            scripts/build-initramfs.sh \
+            scripts/prepare-verity-root-docker.sh \
+            scripts/prepare-signify-root-docker.sh \
             scripts/build-release-disk-docker.sh \
             scripts/build-live-iso-docker.sh \
             scripts/install-volatoo.sh \
@@ -218,3 +235,93 @@ jobs:
           if-no-files-found: error
           compression-level: 0
           retention-days: 14
+
+  signed-generation-e2e:
+    name: Signed realization v3 BIOS/UEFI E2E
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Download OpenRC and systemd images
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: volatoo-minimal-*
+          path: out/images
+          merge-multiple: true
+
+      - name: Resolve exact image inputs
+        id: images
+        run: |
+          set -euo pipefail
+          for init_system in openrc systemd; do
+            mapfile -t matches < <(find out/images -maxdepth 1 -type f \
+              -name "volatoo-minimal-${init_system}-*.squashfs" -print | sort)
+            if [ "${#matches[@]}" -ne 1 ]; then
+              echo "expected exactly one ${init_system} SquashFS, found ${#matches[@]}" >&2
+              exit 1
+            fi
+            echo "${init_system}_image=${matches[0]}" >>"$GITHUB_OUTPUT"
+          done
+
+      - name: Build the pinned test kernel
+        env:
+          VOLATOO_BUILD_JOBS: '2'
+        run: scripts/build-kernel-docker.sh out/vmlinuz
+
+      - name: Reclaim the kernel build cache
+        if: always()
+        run: docker volume rm volatoo-kernel-6.18.40 >/dev/null 2>&1 || true
+
+      - name: Prepare an ephemeral realization signing key
+        run: |
+          set -euo pipefail
+          mkdir -p out/signing
+          docker run --rm --platform linux/amd64 \
+            --mount "type=bind,src=${PWD}/out/signing,dst=/output" \
+            amd64/alpine:3.24.1@sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f \
+            sh -c '
+              set -eu
+              apk add --no-cache busybox-static signify=32-r1 >/dev/null
+              cp /bin/busybox.static /output/busybox
+              signify -G -n -p /output/realization.pub -s /output/realization.sec
+              chmod 0644 /output/busybox /output/realization.pub
+              chmod 0600 /output/realization.sec
+            '
+
+      - name: Build the trusted initramfs
+        run: |
+          set -euo pipefail
+          scripts/prepare-verity-root-docker.sh out/verity-root
+          scripts/prepare-signify-root-docker.sh out/signify-root
+          scripts/build-initramfs.sh \
+            --busybox out/signing/busybox \
+            --verity-root out/verity-root \
+            --signify-root out/signify-root \
+            --trust-key out/signing/realization.pub \
+            --output out/volatoo-initramfs.cpio.gz
+
+      - name: Boot signed v3 and reject tampering
+        env:
+          VOLATOO_GENERATION_QEMU_CASES: none
+          VOLATOO_GENERATION_QEMU_FIRMWARES: bios,uefi
+          VOLATOO_GENERATION_QEMU_PAYLOAD_ROOT_MODES: none
+          VOLATOO_GENERATION_QEMU_REALIZED: 'yes'
+          VOLATOO_GENERATION_QEMU_REALIZATION_VERSION: '3'
+          VOLATOO_GENERATION_QEMU_CONTAINER: 'yes'
+          VOLATOO_GENERATION_QEMU_VERITY_TAMPER: 'yes'
+          VOLATOO_GENERATION_QEMU_SIGNING_KEY: ${{ github.workspace }}/out/signing/realization.sec
+          VOLATOO_GENERATION_QEMU_TRUSTED_KEY: ${{ github.workspace }}/out/signing/realization.pub
+          VOLATOO_GENERATION_QEMU_PAYLOAD_TIMEOUT: '1200'
+          VOLATOO_TEST_TIMEOUT: '1200'
+          VOLATOO_VM_MEMORY: 6G
+        run: |
+          update/tests/test-volatoo-generation-qemu.sh \
+            out/vmlinuz \
+            out/volatoo-initramfs.cpio.gz \
+            "${{ steps.images.outputs.openrc_image }}" \
+            "${{ steps.images.outputs.systemd_image }}"

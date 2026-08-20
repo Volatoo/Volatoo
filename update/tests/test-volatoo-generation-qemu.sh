@@ -14,7 +14,7 @@ systems under both BIOS and UEFI.
 
 Optional environment variables:
   VOLATOO_GENERATION_QEMU_CASES
-      Comma-separated normal,corrupt,interrupted (default: all three)
+      Comma-separated normal,corrupt,interrupted, or none (default: all three)
   VOLATOO_GENERATION_QEMU_FIRMWARES
       Comma-separated bios,uefi passed to the boot harness (default: both)
   VOLATOO_GENERATION_QEMU_PAYLOAD_ROOT_MODES
@@ -78,20 +78,23 @@ for path in "$kernel" "$initramfs" "$openrc_image" "$systemd_image"; do
 	}
 done
 
-IFS=, read -r -a selected_cases <<<"$cases"
-(( ${#selected_cases[@]} > 0 )) || {
-	echo "error: VOLATOO_GENERATION_QEMU_CASES is empty" >&2
-	exit 2
-}
-for selected_case in "${selected_cases[@]}"; do
-	case $selected_case in
-		normal | corrupt | interrupted) ;;
-		*)
-			echo "error: unsupported generation QEMU case: $selected_case" >&2
-			exit 2
-			;;
-	esac
-done
+declare -a selected_cases=()
+if [[ $cases != none ]]; then
+	IFS=, read -r -a selected_cases <<<"$cases"
+	(( ${#selected_cases[@]} > 0 )) || {
+		echo "error: VOLATOO_GENERATION_QEMU_CASES is empty" >&2
+		exit 2
+	}
+	for selected_case in "${selected_cases[@]}"; do
+		case $selected_case in
+			normal | corrupt | interrupted) ;;
+			*)
+				echo "error: unsupported generation QEMU case: $selected_case" >&2
+				exit 2
+				;;
+		esac
+	done
+fi
 
 IFS=, read -r -a selected_firmwares <<<"$firmwares"
 (( ${#selected_firmwares[@]} > 0 )) || {
@@ -135,6 +138,10 @@ if [[ $test_realized != yes && $test_realized != no ]]; then
 	echo "error: VOLATOO_GENERATION_QEMU_REALIZED must be yes or no" >&2
 	exit 2
 fi
+if [[ $cases == none && $payload_modes == none && $test_realized == no ]]; then
+	echo "error: at least one generation QEMU lane must be enabled" >&2
+	exit 2
+fi
 if [[ $realization_version != 2 && $realization_version != 3 ]]; then
 	echo "error: VOLATOO_GENERATION_QEMU_REALIZATION_VERSION must be 2 or 3" >&2
 	exit 2
@@ -170,55 +177,57 @@ if [[ -n $signing_key || -n $trusted_key ]]; then
 	trusted_key=$(cd -- "$(dirname -- "$trusted_key")" && pwd)/$(basename -- "$trusted_key")
 fi
 
-for init_system in openrc systemd; do
-	if [[ $init_system == openrc ]]; then
-		base_image=$openrc_image
-		context=$repo_root/update/examples/build-context-v1.json
-	else
-		base_image=$systemd_image
-		context=$repo_root/update/examples/build-context-systemd-v1.json
-	fi
+if [[ $cases != none ]]; then
+	for init_system in openrc systemd; do
+		if [[ $init_system == openrc ]]; then
+			base_image=$openrc_image
+			context=$repo_root/update/examples/build-context-v1.json
+		else
+			base_image=$systemd_image
+			context=$repo_root/update/examples/build-context-systemd-v1.json
+		fi
 
-	for selected_case in "${selected_cases[@]}"; do
-		fixture=$work_dir/$init_system-$selected_case
-		mkdir "$fixture"
-		corrupt_current=no
-		interrupt_selection=no
-		require_fallback=no
-		case $selected_case in
-			corrupt)
-				corrupt_current=yes
-				require_fallback=yes
-				;;
-			interrupted) interrupt_selection=yes ;;
-		esac
-		echo "preparing $init_system $selected_case generation fixture"
-		VOLATOO_GENERATION_FIXTURE_CORRUPT_CURRENT=$corrupt_current \
-		VOLATOO_GENERATION_FIXTURE_INTERRUPT_SELECTION=$interrupt_selection \
-			"$repo_root/update/tests/prepare-generation-qemu-fixture.sh" \
-				"$init_system" \
-				"$base_image" \
-				"$context" \
-				"$fixture"
+		for selected_case in "${selected_cases[@]}"; do
+			fixture=$work_dir/$init_system-$selected_case
+			mkdir "$fixture"
+			corrupt_current=no
+			interrupt_selection=no
+			require_fallback=no
+			case $selected_case in
+				corrupt)
+					corrupt_current=yes
+					require_fallback=yes
+					;;
+				interrupted) interrupt_selection=yes ;;
+			esac
+			echo "preparing $init_system $selected_case generation fixture"
+			VOLATOO_GENERATION_FIXTURE_CORRUPT_CURRENT=$corrupt_current \
+			VOLATOO_GENERATION_FIXTURE_INTERRUPT_SELECTION=$interrupt_selection \
+				"$repo_root/update/tests/prepare-generation-qemu-fixture.sh" \
+					"$init_system" \
+					"$base_image" \
+					"$context" \
+					"$fixture"
 
-		expected_generation=$(<"$fixture/boot.digest")
-		echo "testing $init_system $selected_case generation boot"
-		VOLATOO_STATE_IMAGE="$fixture/state.ext4" \
-		VOLATOO_STATE_REQUIRED=yes \
-		VOLATOO_TEST_ROOT_MODE=store-overlay \
-		VOLATOO_TEST_GENERATION="$expected_generation" \
-		VOLATOO_TEST_GENERATION_SIGNATURE=allow-unsigned \
-		VOLATOO_TEST_GENERATION_FALLBACK="$require_fallback" \
-		VOLATOO_TEST_FIRMWARES="$firmwares" \
-		VOLATOO_TEST_INIT_SYSTEM="$init_system" \
-		VOLATOO_TEST_TIMEOUT=${VOLATOO_TEST_TIMEOUT:-300} \
-		VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
-			"$boot_harness" \
-				"$kernel" \
-				"$initramfs" \
-				"$base_image"
+			expected_generation=$(<"$fixture/boot.digest")
+			echo "testing $init_system $selected_case generation boot"
+			VOLATOO_STATE_IMAGE="$fixture/state.ext4" \
+			VOLATOO_STATE_REQUIRED=yes \
+			VOLATOO_TEST_ROOT_MODE=store-overlay \
+			VOLATOO_TEST_GENERATION="$expected_generation" \
+			VOLATOO_TEST_GENERATION_SIGNATURE=allow-unsigned \
+			VOLATOO_TEST_GENERATION_FALLBACK="$require_fallback" \
+			VOLATOO_TEST_FIRMWARES="$firmwares" \
+			VOLATOO_TEST_INIT_SYSTEM="$init_system" \
+			VOLATOO_TEST_TIMEOUT=${VOLATOO_TEST_TIMEOUT:-300} \
+			VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
+				"$boot_harness" \
+					"$kernel" \
+					"$initramfs" \
+					"$base_image"
+		done
 	done
-done
+fi
 
 if (( payload_mode_count > 0 )); then
 	payload_fixture=$work_dir/openrc-normal

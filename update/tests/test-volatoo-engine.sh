@@ -61,6 +61,61 @@ with open(sys.argv[3], "w", encoding="utf-8") as stream:
     stream.write("\n")
 PY
 
+inventory="$work_dir/binhosts.json"
+python3 - "$target" "$inventory" <<'PY'
+import json
+import sys
+
+target = json.load(open(sys.argv[1], encoding="utf-8"))
+engine = target["engine"]
+profile = {
+    "profile_id": engine["profile_id"],
+    "arch": engine["arch"],
+    "profile_path": "volatoo/amd64/23.0/openrc/base",
+    "channel": "stable",
+    "repository_ids": engine["repository_ids"],
+    "repository_names": engine["repository_names"],
+    "resource_class": engine["resource_class"],
+    "required_features": engine["required_features"],
+    "image_digest": engine["image_digest"],
+    "mirror_bundle_digest": engine["mirror_bundle_digest"],
+    "binhost_path": engine["binhost_path"].removeprefix("/binpkgs/"),
+    "sync_path": engine["binhost_path"],
+    "default": True,
+}
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump({"binhosts": [profile]}, stream, indent=2)
+PY
+imported_target="$work_dir/imported-target.json"
+"$engine" import-target \
+    --inventory "$inventory" \
+    --build-context "$context" \
+    --profile-id volatoo/amd64/glibc/openrc/23.0/base-v1 \
+    --output "$imported_target"
+cmp "$target" "$imported_target"
+
+candidate_inventory="$work_dir/candidate-binhosts.json"
+python3 - "$inventory" "$candidate_inventory" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["binhosts"][0]["channel"] = "candidate"
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(value, stream)
+PY
+if "$engine" import-target \
+    --inventory "$candidate_inventory" \
+    --build-context "$context" \
+    --profile-id volatoo/amd64/glibc/openrc/23.0/base-v1 \
+    --output "$work_dir/candidate-target.json" \
+    >"$work_dir/candidate.out" 2>"$work_dir/candidate.err"; then
+    echo "candidate Portage Engine target was imported" >&2
+    exit 1
+fi
+grep -q "not a matching stable target" "$work_dir/candidate.err"
+test ! -e "$work_dir/candidate-target.json"
+
 request="$work_dir/request.json"
 "$engine" render \
     --build-context "$context" \
@@ -248,5 +303,43 @@ wait "$server_pid"
 server_pid=
 grep -q "resolved_context.image_digest differs" "$work_dir/mismatch.err"
 test ! -e "$work_dir/mismatch-receipt.json"
+
+feature_port_file="$work_dir/feature-port"
+feature_target="$work_dir/feature-target.json"
+python3 - "$target" "$feature_target" <<'PY'
+import json
+import sys
+
+value = json.load(open(sys.argv[1], encoding="utf-8"))
+value["engine"]["required_features"] = ["sandbox"]
+with open(sys.argv[2], "w", encoding="utf-8") as stream:
+    json.dump(value, stream, sort_keys=True, separators=(",", ":"))
+    stream.write("\n")
+PY
+python3 "$fake_engine" \
+    --target "$feature_target" \
+    --port-file "$feature_port_file" \
+    --capture "$work_dir/feature-capture.json" &
+server_pid=$!
+wait_for_port "$feature_port_file"
+feature_port=$(<"$feature_port_file")
+if "$engine" submit \
+    --request "$request" \
+    --build-spec "$spec" \
+    --engine-target "$target" \
+    --server "http://127.0.0.1:$feature_port" \
+    --api-key-file "$api_key" \
+    --receipt "$work_dir/feature-receipt.json" \
+    --timeout 5 \
+    --poll-interval 0.01 \
+    --allow-http \
+    >"$work_dir/feature.out" 2>"$work_dir/feature.err"; then
+    echo "mismatched server-owned FEATURES were accepted" >&2
+    exit 1
+fi
+wait "$server_pid"
+server_pid=
+grep -q "resolved_context.required_features differs" "$work_dir/feature.err"
+test ! -e "$work_dir/feature-receipt.json"
 
 echo "Portage Engine adapter tests passed"

@@ -6,7 +6,8 @@ usage() {
 	cat <<'EOF'
 Usage: scripts/build-kernel-docker.sh OUTPUT
 
-Build the pinned Volatoo amd64 kernel through the OrbStack Docker context.
+Build the pinned Volatoo amd64 kernel through Docker. Local builds require the
+OrbStack context; GitHub Actions Linux uses its default hosted Docker daemon.
 Kernel sources and intermediate objects are retained in a named Docker volume.
 OUTPUT must not already exist.
 EOF
@@ -35,10 +36,10 @@ if ! [[ $output_name =~ ^[A-Za-z0-9][A-Za-z0-9._+-]*$ ]]; then
 	exit 2
 fi
 
-if [[ $(docker context show) != orbstack ]]; then
-	echo "error: Docker context must be orbstack" >&2
-	exit 1
-fi
+# The guard is checked separately; its path is rooted dynamically for macOS.
+# shellcheck disable=SC1091
+source "$repo_root/scripts/require-docker-context.sh"
+volatoo_require_docker_context
 
 docker build \
 	--tag volatoo-kernel-builder:6.18.40 \

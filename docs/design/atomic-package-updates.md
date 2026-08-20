@@ -316,8 +316,10 @@ The initial integration requires:
 operator-reviewed `org.volatoo.portage-engine-target/v1` binding maps one
 BuildSpec hard target to the server-owned profile, repository set, resource
 class, immutable builder image and mirror bundle. It also pins the exact
-`/binpkgs/<complete target_id>` namespace. OpenRC and systemd therefore have
-different bindings even when all package-level choices happen to match.
+target-separated Gentoo namespace below
+`/binpkgs/releases/<arch>/binpackages/<generation>/<target>`. OpenRC and
+systemd therefore have different bindings even when all package-level choices
+happen to match.
 
 The adapter translates exact CPVs, effective USE/IUSE, accepted keywords and
 compiler/linker flags into Portage Engine's `LocalBuildRequest` and

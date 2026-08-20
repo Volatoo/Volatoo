@@ -68,7 +68,7 @@
         },
         "binhost_path": {
           "type": "string",
-          "pattern": "^/binpkgs/volatoo/"
+          "pattern": "^/binpkgs/releases/[A-Za-z0-9][A-Za-z0-9+._-]{0,63}/binpackages/[A-Za-z0-9][A-Za-z0-9+._-]{0,127}/[A-Za-z0-9][A-Za-z0-9+._-]{0,127}$"
         },
         "required_features": {
           "type": "array",
