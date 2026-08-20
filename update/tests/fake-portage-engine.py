@@ -87,6 +87,7 @@ def main() -> int:
                         "image_digest": image_digest,
                         "mirror_bundle_digest": engine["mirror_bundle_digest"],
                         "profile_id": engine["profile_id"],
+                        "required_features": engine["required_features"],
                         "repositories": [
                             {"name": name}
                             for name in engine["repository_names"]

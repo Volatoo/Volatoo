@@ -59,6 +59,7 @@ jobs:
           shellcheck \
             initramfs/init \
             scripts/build-initramfs.sh \
+            scripts/tests/test-build-initramfs-static.sh \
             scripts/prepare-verity-root-docker.sh \
             scripts/prepare-signify-root-docker.sh \
             scripts/build-state-image.sh \
@@ -114,6 +115,9 @@ jobs:
           for schema in update/schemas/*.json; do
             python3 -m json.tool "$schema" >/dev/null
           done
+
+      - name: Test initramfs BusyBox linkage policy
+        run: scripts/tests/test-build-initramfs-static.sh
 
       - name: Test manifest contracts
         run: update/tests/test-volatoo-manifest.sh
