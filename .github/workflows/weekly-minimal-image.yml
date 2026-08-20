@@ -236,10 +236,43 @@ jobs:
           compression-level: 0
           retention-days: 14
 
+  kernel:
+    name: Build pinned QEMU kernel
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Build the pinned test kernel
+        env:
+          VOLATOO_BUILD_JOBS: '2'
+        run: scripts/build-kernel-docker.sh out/vmlinuz
+
+      - name: Reclaim the kernel build cache
+        if: always()
+        run: docker volume rm volatoo-kernel-6.18.40 >/dev/null 2>&1 || true
+
+      - name: Upload the pinned test kernel
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: volatoo-kernel-6.18.40
+          path: |
+            out/vmlinuz
+            out/vmlinuz.sha256
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+
   signed-generation-e2e:
     name: Signed realization v3 BIOS/UEFI E2E
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    needs: build
+    needs:
+      - build
+      - kernel
     runs-on: ubuntu-24.04
     timeout-minutes: 360
 
@@ -254,6 +287,16 @@ jobs:
           path: out/images
           merge-multiple: true
 
+      - name: Download the pinned test kernel
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: volatoo-kernel-6.18.40
+          path: out/kernel
+
+      - name: Verify the pinned test kernel
+        run: sha256sum --check vmlinuz.sha256
+        working-directory: out/kernel
+
       - name: Resolve exact image inputs
         id: images
         run: |
@@ -267,15 +310,6 @@ jobs:
             fi
             echo "${init_system}_image=${matches[0]}" >>"$GITHUB_OUTPUT"
           done
-
-      - name: Build the pinned test kernel
-        env:
-          VOLATOO_BUILD_JOBS: '2'
-        run: scripts/build-kernel-docker.sh out/vmlinuz
-
-      - name: Reclaim the kernel build cache
-        if: always()
-        run: docker volume rm volatoo-kernel-6.18.40 >/dev/null 2>&1 || true
 
       - name: Prepare an ephemeral realization signing key
         run: |
@@ -321,7 +355,7 @@ jobs:
           VOLATOO_VM_MEMORY: 6G
         run: |
           update/tests/test-volatoo-generation-qemu.sh \
-            out/vmlinuz \
+            out/kernel/vmlinuz \
             out/volatoo-initramfs.cpio.gz \
             "${{ steps.images.outputs.openrc_image }}" \
             "${{ steps.images.outputs.systemd_image }}"

@@ -29,7 +29,20 @@ mkdir -p /work /output
 if [[ ! -f $archive ]]; then
 	temporary_archive=${archive}.partial
 	rm -f -- "$temporary_archive"
-	curl --fail --location --retry 5 --output "$temporary_archive" "$kernel_url"
+	curl \
+		--fail \
+		--location \
+		--http1.1 \
+		--retry 8 \
+		--retry-all-errors \
+		--retry-delay 2 \
+		--retry-max-time 600 \
+		--connect-timeout 30 \
+		--speed-limit 1024 \
+		--speed-time 60 \
+		--continue-at - \
+		--output "$temporary_archive" \
+		"$kernel_url"
 	printf '%s  %s\n' "$kernel_sha256" "$temporary_archive" | sha256sum --check
 	mv "$temporary_archive" "$archive"
 else
@@ -65,5 +78,8 @@ make -C "$source_dir" \
 /repo/scripts/validate-kernel-config.sh \
 	"$build_dir/.config" /repo/kernel/config/amd64.fragment
 install -m 0644 "$build_dir/arch/x86/boot/bzImage" "$output"
-sha256sum "$output" >"${output}.sha256"
+(
+	cd /output
+	sha256sum "$output_name" >"${output_name}.sha256"
+)
 echo "built $output"
