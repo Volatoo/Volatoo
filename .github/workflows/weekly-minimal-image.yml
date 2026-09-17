@@ -31,6 +31,7 @@ on:
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
+      - "scripts/tests/test-release-disk-reproducible-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -63,6 +64,7 @@ on:
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
+      - "scripts/tests/test-release-disk-reproducible-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -118,6 +120,7 @@ jobs:
             scripts/tests/test-live-iso-normalizer-docker.sh \
             scripts/tests/test-docker-context-policy.sh \
             scripts/tests/test-image-init-selection.sh \
+            scripts/tests/test-release-disk-reproducible-docker.sh \
             image/catalyst/finalize.sh \
             image/catalyst/container/run-catalyst.sh \
             image/live-iso/container/build-live-iso.sh \
