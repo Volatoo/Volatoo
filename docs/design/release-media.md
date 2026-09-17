@@ -153,6 +153,26 @@ It builds the image twice and asserts an identical SHA-256, recording both
 digests and the build commands in the evidence file. The sidecar manifests are
 allowed to differ only in the `disk_file` name they record.
 
+This was validated against real release inputs, not synthetic placeholders:
+the pinned kernel, a full verity/signify initramfs, the latest Catalyst roots
+and a state image were assembled twice per init system and the resulting disks
+were byte-identical, then each booted through the complete Gate. The inputs and
+results were:
+
+| Input | SHA-256 |
+|---|---|
+| kernel `bzImage` | `b4c0dbf4…` |
+| initramfs | `9a5f05fb…` |
+| openrc root `stage4-amd64-20260819.squashfs` | `502d99c5…` |
+| systemd root `stage4-amd64-20260814-glibc-r5.squashfs` | `e93c26e4…` |
+| state image | `c94d2314…` |
+
+| Disk | Reproducibility SHA-256 |
+|---|---|
+| openrc | `9ebd6de2…` |
+| systemd | `2ddfe1f0…` |
+
+Both disks passed the BIOS and UEFI boot Gate.
 
 Boot the complete disk through both firmware implementations:
 
