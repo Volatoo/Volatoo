@@ -121,7 +121,11 @@ if [[ -n $evidence ]]; then
 		echo "initramfs=$initramfs"
 		echo "rootfs=$rootfs"
 		echo "state=$state"
-		echo "secure_boot=${secure_boot_key:+yes}"
+		if [[ -n $secure_boot_key ]]; then
+			echo "secure_boot=yes"
+		else
+			echo "secure_boot=no"
+		fi
 		echo "build_command=$builder ${build_args[*]} OUTPUT"
 	} >"$evidence"
 	echo "evidence written: $evidence"
