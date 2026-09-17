@@ -129,7 +129,7 @@ system generations. See `docs/design/atomic-package-updates.md`.
         OrbStack QEMU runner
   - [x] Keep direct-image SHA-256 mode explicitly development-only until the
         signed generation release pipeline supplies the disk image
-  - [ ] Make GPT, filesystem and GRUB output bit-reproducible for identical inputs
+  - [x] Make GPT, filesystem and GRUB output bit-reproducible for identical inputs
 - [x] Bootable ISO that is itself a Volatoo system (the live medium *is* the distro)
 - [x] Ship the formal `Volatoo/installer` in authenticated live media
   - [x] Require an explicit block device and verify the release manifest, digest

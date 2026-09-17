@@ -102,8 +102,57 @@ The key and certificate are mounted read-only for the network-disabled build
 step and are never copied into the disk. The UKI embeds the kernel, initramfs,
 command line and OS release metadata. Its Authenticode `signingTime` is fixed
 inside the isolated builder so identical inputs produce the same signed UKI.
-The whole raw disk is not yet bit-reproducible because filesystem, GPT and GRUB
-metadata still vary.
+
+## Reproducibility
+
+Identical pinned inputs produce a byte-identical raw disk. The assembler
+eliminates every wall-clock and random input in the GPT, filesystem and GRUB
+output:
+
+- **GPT identifiers** — the disk GUID, all four partition GUIDs, the FAT
+  volume id, the ext4 filesystem UUID and the ext4 hash seed are derived from
+  the SHA-256 of the four input digests (plus the Secure Boot certificate when
+  present). The derivation domain is `volatoo-release:<kernel>:<initramfs>:
+  <rootfs>:<state>:<cert>`; each identifier is `sha256(seed ":" label)`
+  rendered as a RFC 4122 version-5 / variant-8 UUID (or a truncated 8-hex value
+  for the FAT volume id). Changing any input rotates every identifier, so a
+  changed root cannot silently reuse the previous image's GPT identity.
+- **ESP (FAT32)** — GRUB still populates the ESP through a real mount so it can
+  resolve the boot device, but the kernel-written directory-entry times are
+  discarded: the tree is lifted into a staging directory, every mtime is pinned
+  to the FAT reference epoch (`SOURCE_DATE_EPOCH`, clamped to 1980-01-01
+  because FAT cannot represent earlier years), and the FAT image is rebuilt
+  offline with `mtools`. Directory entries are created by `mcopy -s -m` of a
+  single empty pinned directory and files by `mcopy -m`, so the pinned source
+  mtimes land in both the creation and last-write fields without consulting
+  the clock. Entries are written in a globally sorted order so the FAT layout
+  never depends on the source readdir order. Only `mkfs.vfat` runs under
+  `faketime`, to pin the volume-label entry.
+- **System (ext4)** — the filesystem is built offline with `mke2fs -d` from a
+  pinned staging tree under `SOURCE_DATE_EPOCH`, with the derived UUID and
+  `hash_seed`, so the superblock and every inode timestamp are deterministic.
+- **State (ext4)** — the pinned state image is copied in and grown with
+  `e2fsck`, `resize2fs` and `e2label`, each under `faketime` so the superblock
+  last-check and last-write fields land on the reference epoch.
+
+`SOURCE_DATE_EPOCH` is fixed at `0` by the host wrapper; `TZ=UTC` and
+`LC_ALL=C` keep time and collation independent of the build host. The
+double-build check is:
+
+```sh
+scripts/tests/test-release-disk-reproducible-docker.sh \
+  --init-system openrc \
+  --kernel out/bzImage \
+  --initramfs out/volatoo-initramfs.cpio.gz \
+  --rootfs out/volatoo-minimal-openrc.squashfs \
+  --state out/volatoo-state.ext4 \
+  --evidence out/reproducible-openrc.evidence
+```
+
+It builds the image twice and asserts an identical SHA-256, recording both
+digests and the build commands in the evidence file. The sidecar manifests are
+allowed to differ only in the `disk_file` name they record.
+
 
 Boot the complete disk through both firmware implementations:
 
