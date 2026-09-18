@@ -258,6 +258,47 @@ command line applies to the SAN disk. The QEMU test models this variant by
 attaching the ISO as a virtio-blk disk. After the initramfs copies and
 re-verifies the compressed closure into RAM it releases the source device, so
 the client is diskless at runtime.
+## Whole-image in-place update (A/B slots)
+
+Separate from granular generations, Volatoo can move a machine wholesale to a
+new release image using two slots (`a` and `b`) inside the state partition. A
+slot holds a complete release image (kernel, initramfs and root SquashFS) bound
+by a signed `VOLATOO_SLOT_V1` manifest; the bootloader selects the active slot
+and the initramfs verifies the signed manifest and root digest before mounting.
+State data (identity, persistence, the generation store) is shared across slots
+and is not touched by a switch. See
+[in-place update](design/in-place-update.md) for the layout, trust boundary and
+failure modes.
+
+Slot images are staged into the inactive slot and selected atomically with
+`volatoo-slot` (run as root, or through the serialized update view when the
+state store is read-only):
+
+```sh
+sudo volatoo-slot --state /.volatoo/state status
+
+sudo volatoo-slot --state /.volatoo/state stage \
+  --slot b \
+  --kernel /path/kernel --initramfs /path/initramfs --rootfs /path/root.squashfs \
+  --channel v0.1-dev --init-system systemd \
+  --signing-key /secure/volatoo-release.sec --trusted-key /secure/volatoo-release.pub
+
+sudo reboot
+```
+
+The next boot enters the staged slot. To promote it after a successful boot, or
+to revert to the previously working slot:
+
+```sh
+sudo volatoo-slot --state /.volatoo/state commit --slot b
+sudo volatoo-slot --state /.volatoo/state rollback
+sudo reboot
+```
+
+`rollback` returns to the committed slot when a candidate is pending, or to the
+other slot otherwise. The release download itself is the same signed
+release-index / content-addressed acquisition path used by the formal installer;
+`stage` re-verifies each artifact before it is written.
 
 ## Build your own image
 

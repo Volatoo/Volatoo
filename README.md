@@ -102,6 +102,9 @@ The release-key, rollback and Secure Boot boundaries are specified in
 [`docs/design/release-trust.md`](docs/design/release-trust.md).
 The PXE/diskless topology and its trust boundary are specified in
 [`docs/design/pxe.md`](docs/design/pxe.md).
+In-place whole-image updates through A/B slots in the state partition are
+specified in
+[`docs/design/in-place-update.md`](docs/design/in-place-update.md).
 OpenRC and systemd minimal images both pass the overlay-root BIOS and UEFI
 boot gates. Signed systemd release media also pass enrolled-key Secure Boot,
 including firmware rejection after a signed UKI is changed. They are separate,

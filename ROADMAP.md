@@ -63,7 +63,7 @@ Reproducible image builds instead of hand-rolled squashfs.
 - [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
 - [ ] Run the image, boot, update and rollback CI matrix against both init systems
 - [ ] Package-set variants: `minimal` (console) first; `desktop` later
-- [ ] In-place image update: download new image to state partition, reboot into it (A/B slots)
+- [x] In-place image update: download new image to state partition, reboot into it (A/B slots)
 
 ### Phase 3U — Atomic package updates
 
