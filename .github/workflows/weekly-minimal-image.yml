@@ -35,6 +35,7 @@ on:
       - "scripts/tests/test-state-image-reproducible-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/tests/test-pxe-diskless-docker.sh"
+      - "scripts/tests/test-in-place-update-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -71,6 +72,7 @@ on:
       - "scripts/tests/test-state-image-reproducible-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/tests/test-pxe-diskless-docker.sh"
+      - "scripts/tests/test-in-place-update-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -137,7 +139,9 @@ jobs:
             scripts/qemu-container/test-release-disk.sh \
             scripts/qemu-container/test-live-iso.sh \
             scripts/qemu-container/test-pxe-diskless.sh \
-            scripts/tests/test-pxe-diskless-docker.sh
+            scripts/tests/test-pxe-diskless-docker.sh \
+            scripts/qemu-container/test-in-place-update.sh \
+            scripts/tests/test-in-place-update-docker.sh
 
       - name: Check Python sources
         run: |

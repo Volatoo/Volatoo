@@ -10,6 +10,7 @@ on:
       - "docs/design/incremental-realization.md"
       - "docs/design/release-trust.md"
       - "docs/design/state-layout.md"
+      - "docs/design/in-place-update.md"
       - "initramfs/**"
       - "kernel/**"
       - "scripts/build-initramfs.sh"
@@ -29,6 +30,7 @@ on:
       - "docs/design/incremental-realization.md"
       - "docs/design/release-trust.md"
       - "docs/design/state-layout.md"
+      - "docs/design/in-place-update.md"
       - "initramfs/**"
       - "kernel/**"
       - "scripts/build-initramfs.sh"
@@ -97,7 +99,8 @@ jobs:
             update/tests/test-volatoo-elf-closure.sh \
             update/tests/test-volatoo-update-view-docker.sh \
             update/tests/test-volatoo-compaction-docker.sh \
-            update/tests/test-volatoo-generation-qemu.sh
+            update/tests/test-volatoo-generation-qemu.sh \
+            update/tests/test-volatoo-slot-docker.sh
           awk -f update/layer-container/validate-elf-closure.awk </dev/null
 
       - name: Check Python and JSON syntax
@@ -110,6 +113,7 @@ jobs:
             update/volatoo-generation \
             update/volatoo-activate \
             update/volatoo-engine \
+            update/volatoo-slot \
             update/tests/fake-portage-engine.py \
             update/tests/make-generation-fixture.py
           for schema in update/schemas/*.json; do
@@ -121,6 +125,9 @@ jobs:
 
       - name: Test manifest contracts
         run: update/tests/test-volatoo-manifest.sh
+
+      - name: Test whole-image slot contracts
+        run: update/tests/test-volatoo-slot-docker.sh
 
       - name: Test generation publication and rollback
         run: update/tests/test-volatoo-generation.sh
