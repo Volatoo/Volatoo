@@ -158,8 +158,10 @@ done
 # p4 (state): the pinned state image is copied and grown into the partition.
 # e2fsck, resize2fs and e2label all rewrite superblock fields (last check,
 # last write) with the wall clock, so each runs under faketime pinned to the
-# reference epoch. The input state image itself already carries the pinned
-# VOLATOO-STATE UUID, so no UUID override is needed.
+# reference epoch. The input state image already carries a deterministic
+# VOLATOO-STATE UUID and hash seed, derived from its content by
+# scripts/build-state-image.sh, so the assembler must grow it without
+# overriding that identity.
 dd if=/input/state of="${loop_device}p4" bs=4M conv=fsync status=none
 faketime "@$source_date_epoch" e2fsck -fy "${loop_device}p4" >/dev/null
 faketime "@$source_date_epoch" resize2fs "${loop_device}p4" >/dev/null

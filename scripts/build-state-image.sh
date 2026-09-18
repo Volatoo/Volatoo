@@ -19,6 +19,10 @@ Options:
 
 Optional environment variables:
   VOLATOO_STATE_SIZE  Filesystem image size (default: 128M)
+  VOLATOO_STATE_EPOCH Reference epoch for filesystem timestamps, in seconds
+                      since the Unix epoch (default: 0). The image UUID and
+                      hash seed are derived from the state content, not from
+                      this epoch.
 EOF
 }
 
@@ -64,9 +68,14 @@ done
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 output_path=${output_path:-"$repo_root/out/volatoo-state.ext4"}
 state_size=${VOLATOO_STATE_SIZE:-128M}
+state_epoch=${VOLATOO_STATE_EPOCH:-0}
 
 if [[ ! $state_size =~ ^[1-9][0-9]*[MGT]$ ]]; then
 	echo "error: VOLATOO_STATE_SIZE must be a positive integer followed by M, G, or T" >&2
+	exit 1
+fi
+if [[ ! $state_epoch =~ ^[0-9]+$ ]]; then
+	echo "error: VOLATOO_STATE_EPOCH must be a non-negative integer" >&2
 	exit 1
 fi
 
@@ -124,6 +133,7 @@ trap cleanup EXIT
 docker_args=(
 	--rm
 	--env "STATE_SIZE=$state_size"
+	--env "SOURCE_DATE_EPOCH=$state_epoch"
 	--env "HOST_UID=$(id -u)"
 	--env "HOST_GID=$(id -g)"
 	--env "HAS_CONFIG=no"
@@ -151,9 +161,9 @@ if [[ -n $state_source_path ]]; then
 fi
 
 docker run "${docker_args[@]}" \
-	alpine:3.24 \
+	amd64/alpine:3.24.1@sha256:79ff19e9084a00eece421b2523fb93e22d730e2c0e525905de047e848e56d95f \
 	sh -euxc '
-		apk add --no-cache coreutils e2fsprogs >/dev/null
+		apk add --no-cache coreutils=9.11-r0 e2fsprogs=1.47.4-r0 >/dev/null
 		state_root=/tmp/state-root
 		if [ "$HAS_STATE_SOURCE" = yes ]; then
 			install -d -m 0755 "$state_root"
@@ -211,9 +221,49 @@ docker run "${docker_args[@]}" \
 				/input/identity.conf \
 				"$state_root/volatoo/config/identity.conf"
 		fi
+		derive_hex() {
+			label=$1
+			first=${2:-32}
+			printf "%s:%s" "$state_seed" "$label" | sha256sum \
+				| awk -v n="$first" "{ print substr(\$1, 1, n) }"
+		}
+		guid_from_hex() {
+			hex=$1
+			printf "%s-%s-%s-%s-%s" \
+				"$(printf "%s" "$hex" | cut -c1-8)" \
+				"$(printf "%s" "$hex" | cut -c9-12)" \
+				"5$(printf "%s" "$hex" | cut -c14-16)" \
+				"8$(printf "%s" "$hex" | cut -c18-20)" \
+				"$(printf "%s" "$hex" | cut -c21-32)"
+		}
+		state_content_sha256=$(
+			cd "$state_root" || exit 1
+			find . -mindepth 1 | LC_ALL=C sort \
+				| while IFS= read -r entry; do
+					if [ -L "$entry" ]; then
+						printf "l %s %s -> %s\n" \
+							"$entry" "$(readlink "$entry")"
+					elif [ -d "$entry" ]; then
+						printf "d %s %s\n" \
+							"$(stat -c %a "$entry")" "$entry"
+					else
+						printf "f %s %s %s\n" \
+							"$(stat -c %a "$entry")" \
+							"$(stat -c %s "$entry")" "$entry"
+						sha256sum "$entry"
+					fi
+				done \
+				| sha256sum | awk "{ print \$1 }"
+		)
+		state_seed="volatoo-state:$state_content_sha256"
+		state_uuid=$(guid_from_hex "$(derive_hex volatoo-state-uuid)")
+		state_hash_seed=$(guid_from_hex "$(derive_hex volatoo-hash-seed)")
+		find "$state_root" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 		truncate -s "$STATE_SIZE" /output/volatoo-state.ext4
-		mkfs.ext4 -q -F \
+		SOURCE_DATE_EPOCH="$SOURCE_DATE_EPOCH" mkfs.ext4 -q -F \
 			-L VOLATOO-STATE \
+			-U "$state_uuid" \
+			-E hash_seed="$state_hash_seed" \
 			-d "$state_root" \
 			/output/volatoo-state.ext4
 		chown "$HOST_UID:$HOST_GID" /output/volatoo-state.ext4
