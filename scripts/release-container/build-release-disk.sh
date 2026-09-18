@@ -15,6 +15,7 @@ init_system=${INIT_SYSTEM:?missing INIT_SYSTEM}
 host_uid=${HOST_UID:?missing HOST_UID}
 host_gid=${HOST_GID:?missing HOST_GID}
 secure_boot=${VOLATOO_SECURE_BOOT:-no}
+slot_boot=${VOLATOO_SLOTS:-no}
 source_date_epoch=${SOURCE_DATE_EPOCH:-0}
 [[ $output_name =~ ^[A-Za-z0-9._-]+\.img$ ]] || {
 	echo "error: unsafe release output name: $output_name" >&2
@@ -28,6 +29,14 @@ source_date_epoch=${SOURCE_DATE_EPOCH:-0}
 	echo "error: VOLATOO_SECURE_BOOT must be yes or no" >&2
 	exit 1
 }
+[[ $slot_boot == yes || $slot_boot == no ]] || {
+	echo "error: VOLATOO_SLOTS must be yes or no" >&2
+	exit 1
+}
+if [[ $slot_boot == yes && $secure_boot == yes ]]; then
+	echo "error: VOLATOO_SLOTS=yes requires VOLATOO_SECURE_BOOT=no" >&2
+	exit 1
+fi
 [[ $source_date_epoch =~ ^[0-9]+$ ]] || {
 	echo "error: SOURCE_DATE_EPOCH must be a non-negative integer" >&2
 	exit 1
@@ -206,13 +215,15 @@ mkfs.vfat -F 32 -n VOLATOOESP -i "$fat_volid" "${loop_device}p2" >/dev/null
 install -d "$boot_mount"
 mount "${loop_device}p2" "$boot_mount"
 install -d "$boot_mount/boot"
-install -m 0644 /input/kernel "$boot_mount/boot/vmlinuz"
-install -m 0644 /input/initramfs "$boot_mount/boot/initramfs.cpio.gz"
+if [[ $slot_boot == no ]]; then
+	install -m 0644 /input/kernel "$boot_mount/boot/vmlinuz"
+	install -m 0644 /input/initramfs "$boot_mount/boot/initramfs.cpio.gz"
+fi
 
 grub-install \
 	--target=i386-pc \
 	--boot-directory="$boot_mount/boot" \
-	--modules="part_gpt ext2 fat normal linux echo serial" \
+	--modules="part_gpt ext2 fat normal linux echo serial search" \
 	"$loop_device" >/dev/null
 kernel_command_line="console=tty0 console=ttyS0,115200 volatoo.image=LABEL=VOLATOO-SYSTEM volatoo.image-file=/volatoo/root.squashfs volatoo.image-sha256=$rootfs_sha256 volatoo.root=store-overlay volatoo.state=LABEL=VOLATOO-STATE volatoo.state-required=yes volatoo.generation=none"
 uki_sha256=none
@@ -259,7 +270,34 @@ else
 		--removable \
 		--no-nvram >/dev/null
 fi
-cat >"$boot_mount/boot/grub/grub.cfg" <<EOF
+if [[ $slot_boot == yes ]]; then
+	cat >"$boot_mount/boot/grub/grub.cfg" <<'EOF'
+set timeout=3
+set default=0
+serial --unit=0 --speed=115200
+terminal_input console serial
+terminal_output console serial
+
+search --no-floppy --label VOLATOO-STATE --set=stateroot
+if [ -e ($stateroot)/volatoo/slots/pending-a ]; then
+	set boot_slot=a
+fi
+if [ -e ($stateroot)/volatoo/slots/pending-b ]; then
+	set boot_slot=b
+fi
+if [ -z "$boot_slot" ]; then
+	if [ -e ($stateroot)/volatoo/slots/active-b ]; then
+		set boot_slot=b
+	else
+		set boot_slot=a
+	fi
+fi
+linux ($stateroot)/volatoo/slots/$boot_slot/kernel console=tty0 console=ttyS0,115200 volatoo.root=slot volatoo.slot=$boot_slot volatoo.state=LABEL=VOLATOO-STATE volatoo.state-required=yes volatoo.generation=none
+initrd ($stateroot)/volatoo/slots/$boot_slot/initramfs
+boot
+EOF
+else
+	cat >"$boot_mount/boot/grub/grub.cfg" <<EOF
 set timeout=3
 set default=0
 serial --unit=0 --speed=115200
@@ -271,6 +309,7 @@ menuentry "Volatoo v0.1-dev ($init_system)" {
 	initrd /boot/initramfs.cpio.gz
 }
 EOF
+fi
 
 sync
 mkdir -p "$esp_staging"

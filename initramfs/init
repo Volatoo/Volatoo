@@ -1470,6 +1470,326 @@ select_generation_from_state() {
 	esac
 }
 
+slot_active_name() {
+	if [ -e /state/volatoo/slots/active-a ]; then
+		printf 'a\n'
+	elif [ -e /state/volatoo/slots/active-b ]; then
+		printf 'b\n'
+	else
+		printf '\n'
+	fi
+}
+
+slot_other_name() {
+	if [ "$1" = a ]; then
+		printf 'b\n'
+	else
+		printf 'a\n'
+	fi
+}
+
+slot_decrement_tries() {
+	slot_tries_path=/state/volatoo/slots/tries
+	slot_tries=1
+	if [ -f "$slot_tries_path" ] && [ ! -L "$slot_tries_path" ]; then
+		IFS= read -r slot_tries_value <"$slot_tries_path" || true
+		case $slot_tries_value in
+			'' | *[!0-9]*) ;;
+			*) slot_tries=$slot_tries_value ;;
+		esac
+	fi
+	if [ "$slot_tries" -gt 0 ]; then
+		slot_tries=$((slot_tries - 1))
+	fi
+	printf '%s\n' "$slot_tries" >"$slot_tries_path"
+}
+
+verify_slot_manifest_signature() {
+	slot_signed_path=$1
+	slot_sig_dir=/state/volatoo/slots/signatures/$slot_manifest_hex
+	slot_key_count=0
+	slot_match_count=0
+	slot_invalid=0
+	if [ -L "$slot_sig_dir" ] || \
+		{ [ -e "$slot_sig_dir" ] && [ ! -d "$slot_sig_dir" ]; }; then
+		slot_error="slot signature directory is unsafe"
+		return 1
+	fi
+	if ! command -v signify >/dev/null 2>&1; then
+		if [ "$signature_policy" = required ]; then
+			slot_error="required slot signature verifier is unavailable"
+			return 1
+		fi
+		echo "[volatoo] warning: signify unavailable; accepting unsigned development slot"
+		return 0
+	fi
+	for slot_key in /etc/volatoo/trusted.d/*.pub; do
+		if [ ! -e "$slot_key" ] && [ ! -L "$slot_key" ]; then
+			continue
+		fi
+		if [ -L "$slot_key" ] || [ ! -f "$slot_key" ]; then
+			slot_error="embedded slot trust key is unsafe"
+			return 1
+		fi
+		slot_key_name=${slot_key##*/}
+		slot_key_hex=${slot_key_name%.pub}
+		if [ "$slot_key_name" = "$slot_key_hex" ] || \
+			! valid_sha256_hex "$slot_key_hex"; then
+			slot_error="embedded slot trust key name is malformed"
+			return 1
+		fi
+		if ! slot_key_checksum=$(sha256sum "$slot_key" 2>/dev/null) || \
+			[ "${slot_key_checksum%% *}" != "$slot_key_hex" ]; then
+			slot_error="embedded slot trust key digest differs"
+			return 1
+		fi
+		slot_key_count=$((slot_key_count + 1))
+		slot_sig=$slot_sig_dir/$slot_key_hex.sig
+		if [ ! -e "$slot_sig" ] && [ ! -L "$slot_sig" ]; then
+			continue
+		fi
+		slot_match_count=$((slot_match_count + 1))
+		if [ -L "$slot_sig" ] || [ ! -f "$slot_sig" ]; then
+			slot_error="slot signature is unsafe"
+			return 1
+		fi
+		if signify -V \
+			-p "$slot_key" \
+			-x "$slot_sig" \
+			-m "$slot_signed_path" \
+			>/dev/null 2>&1; then
+			slot_signature_verified=1
+			slot_signature_key_id=sha256:$slot_key_hex
+			echo "[volatoo] slot manifest signature verified: $slot_signature_key_id"
+			return 0
+		fi
+		slot_invalid=1
+	done
+	if [ "$slot_invalid" -eq 1 ]; then
+		slot_error="slot signature from a trusted key is invalid"
+		return 1
+	fi
+	if [ "$signature_policy" = required ]; then
+		if [ "$slot_key_count" -eq 0 ]; then
+			slot_error="no slot trust key is embedded"
+		elif [ "$slot_match_count" -eq 0 ]; then
+			slot_error="slot manifest has no signature from an embedded trust key"
+		else
+			slot_error="slot signature verification failed"
+		fi
+		return 1
+	fi
+	echo "[volatoo] warning: accepting unsigned development slot"
+	return 0
+}
+
+parse_slot_manifest() {
+	slot_manifest_path=$1
+	slot_parse_state=header
+	slot_root_digest=
+	slot_root_size=
+	slot_init_system=
+	slot_channel=
+	slot_manifest_slot=
+	while IFS= read -r slot_line || [ -n "$slot_line" ]; do
+		case $slot_parse_state in
+			header)
+				if [ "$slot_line" != VOLATOO_SLOT_V1 ]; then
+					slot_error="slot manifest has an invalid header"
+					return 1
+				fi
+				slot_parse_state=records
+				;;
+			records)
+				if [ "$slot_line" = end ]; then
+					slot_parse_state=end
+					continue
+				fi
+				set -f
+				# Intentional splitting parses the token-only records.
+				# shellcheck disable=SC2086
+				set -- $slot_line
+				set +f
+				case $1 in
+					slot)
+						[ "$#" -eq 2 ] || {
+							slot_error="slot manifest slot record is malformed"
+							return 1
+						}
+						case $2 in
+							a | b) slot_manifest_slot=$2 ;;
+							*)
+								slot_error="slot manifest slot record is invalid"
+								return 1
+								;;
+						esac
+						;;
+					channel)
+						[ "$#" -eq 2 ] || {
+							slot_error="slot manifest channel record is malformed"
+							return 1
+						}
+						slot_channel=$2
+						;;
+					init-system)
+						[ "$#" -eq 2 ] || {
+							slot_error="slot manifest init-system record is malformed"
+							return 1
+						}
+						case $2 in
+							openrc | systemd) slot_init_system=$2 ;;
+							*)
+								slot_error="slot manifest init-system is invalid"
+								return 1
+								;;
+						esac
+						;;
+					kernel | initramfs)
+						if [ "$#" -ne 3 ] || \
+							! valid_generation_digest "$2" || \
+							! valid_positive_decimal "$3"; then
+							slot_error="slot manifest $1 record is invalid"
+							return 1
+						fi
+						;;
+					rootfs)
+						if [ "$#" -ne 3 ] || \
+							! valid_generation_digest "$2" || \
+							! valid_positive_decimal "$3"; then
+							slot_error="slot manifest rootfs record is invalid"
+							return 1
+						fi
+						slot_root_digest=$2
+						slot_root_size=$3
+						;;
+					release-index)
+						if [ "$#" -ne 2 ] || \
+							! valid_generation_digest "$2"; then
+							slot_error="slot manifest release-index record is malformed"
+							return 1
+						fi
+						;;
+					*)
+						slot_error="slot manifest has an unsupported record: $1"
+						return 1
+						;;
+				esac
+				;;
+			end)
+				slot_error="slot manifest contains records after end"
+				return 1
+				;;
+		esac
+	done <"$slot_manifest_path"
+	[ "$slot_parse_state" = end ] || {
+		slot_error="slot manifest has no end record"
+		return 1
+	}
+	[ -n "$slot_root_digest" ] || {
+		slot_error="slot manifest has no rootfs record"
+		return 1
+	}
+	[ -n "$slot_init_system" ] || {
+		slot_error="slot manifest has no init-system record"
+		return 1
+	}
+	return 0
+}
+
+prepare_slot_once() {
+	slot_try=$1
+	slot_error=
+	slot_signature_verified=0
+	slot_signature_key_id=
+	slot_root=/state/volatoo/slots/$slot_try
+	if [ -L "$slot_root" ] || [ ! -d "$slot_root" ]; then
+		slot_error="slot directory is missing or unsafe"
+		return 1
+	fi
+	slot_manifest=$slot_root/manifest.plan
+	if [ -L "$slot_manifest" ] || [ ! -f "$slot_manifest" ]; then
+		slot_error="slot manifest is missing or unsafe"
+		return 1
+	fi
+	if ! slot_manifest_output=$(sha256sum "$slot_manifest" 2>/dev/null); then
+		slot_error="could not hash slot manifest"
+		return 1
+	fi
+	slot_manifest_hex=${slot_manifest_output%% *}
+	if ! valid_sha256_hex "$slot_manifest_hex"; then
+		slot_error="slot manifest digest is malformed"
+		return 1
+	fi
+	if ! parse_slot_manifest "$slot_manifest"; then
+		return 1
+	fi
+	if [ "$slot_manifest_slot" != "$slot_try" ]; then
+		slot_error="slot manifest binds slot $slot_manifest_slot, not $slot_try"
+		return 1
+	fi
+	if ! verify_slot_manifest_signature "$slot_manifest"; then
+		return 1
+	fi
+	slot_root_path=$slot_root/root.squashfs
+	if [ -L "$slot_root_path" ] || [ ! -f "$slot_root_path" ]; then
+		slot_error="slot root image is missing or unsafe"
+		return 1
+	fi
+	if ! slot_root_size_actual=$(stat -c %s "$slot_root_path" 2>/dev/null); then
+		slot_error="could not inspect slot root size"
+		return 1
+	fi
+	if [ "$slot_root_size_actual" -ne "$slot_root_size" ]; then
+		slot_error="slot root size mismatch"
+		return 1
+	fi
+	if ! slot_root_checksum=$(sha256sum "$slot_root_path" 2>/dev/null); then
+		slot_error="could not hash slot root image"
+		return 1
+	fi
+	if [ "${slot_root_checksum%% *}" != "${slot_root_digest#sha256:}" ]; then
+		slot_error="slot root digest mismatch"
+		return 1
+	fi
+	slot_loop_device=$(losetup -f)
+	if [ -z "$slot_loop_device" ] || \
+		! losetup -r "$slot_loop_device" "$slot_root_path"; then
+		slot_error="could not attach slot root image"
+		return 1
+	fi
+	return 0
+}
+
+prepare_slot() {
+	slot_try=$slot_id
+	slot_attempt=0
+	while [ "$slot_attempt" -lt 2 ]; do
+		slot_attempt=$((slot_attempt + 1))
+		if prepare_slot_once "$slot_try"; then
+			slot_id=$slot_try
+			slot_selected=1
+			image_source=$slot_loop_device
+			image_sha256=${slot_root_digest#sha256:}
+			image_copy_source=$slot_root_path
+			echo "[volatoo] slot $slot_id verified: init=$slot_init_system manifest=sha256:$slot_manifest_hex"
+			return 0
+		fi
+		echo "[volatoo] warning: slot $slot_try rejected: $slot_error"
+		if [ -e "/state/volatoo/slots/pending-$slot_try" ]; then
+			rm -f "/state/volatoo/slots/pending-$slot_try"
+			slot_decrement_tries
+			slot_try=$(slot_active_name)
+			echo "[volatoo] warning: pending candidate failed; falling back to slot $slot_try"
+		else
+			slot_try=$(slot_other_name "$slot_try")
+		fi
+		if [ -z "$slot_try" ]; then
+			break
+		fi
+	done
+	fatal slot.unbootable "no verifiable slot ($slot_error)"
+}
+
 apply_generation_layers() {
 	if [ "$generation_selected" -ne 1 ] || \
 		[ "$generation_layer_count" -eq 0 ]; then
@@ -1712,6 +2032,14 @@ generation_digest=
 generation_error=
 generation_incremental=0
 generation_incremental_image_count=0
+slot_id=${VOLATOO_SLOT:-}
+slot_selected=0
+slot_manifest_hex=
+slot_root_digest=
+slot_signature_verified=0
+slot_signature_key_id=
+slot_channel=
+slot_init_system=
 persist_config=
 persist_sync_configured=0
 
@@ -1745,6 +2073,7 @@ for argument in $(cat /proc/cmdline 2>/dev/null); do
 		volatoo.state-required=*) state_required=${argument#volatoo.state-required=} ;;
 		volatoo.generation=*) generation_mode=${argument#volatoo.generation=} ;;
 		volatoo.signature-policy=*) signature_policy=${argument#volatoo.signature-policy=} ;;
+		volatoo.slot=*) slot_id=${argument#volatoo.slot=} ;;
 	esac
 done
 
@@ -1804,7 +2133,7 @@ case $target_init in
 esac
 
 case $root_mode in
-	copy | overlay | ram-overlay | store-overlay) ;;
+	copy | overlay | ram-overlay | store-overlay | slot) ;;
 	*)
 		fatal config.root-mode "unsupported root mode: $root_mode"
 		;;
@@ -1879,6 +2208,20 @@ case $signature_policy in
 		;;
 esac
 
+if [ "$root_mode" = slot ]; then
+	case $slot_id in
+		a | b) ;;
+		*)
+			fatal config.slot \
+				"slot root mode requires volatoo.slot=a or volatoo.slot=b"
+			;;
+	esac
+	if [ "$state_spec" = none ]; then
+		fatal config.slot \
+			"slot root mode requires a state filesystem"
+	fi
+fi
+
 echo "[volatoo] kernel: $(uname -srmo)"
 echo "[volatoo] command line: $(cat /proc/cmdline 2>/dev/null)"
 
@@ -1907,29 +2250,33 @@ load_module isofs
 
 attempt=0
 image_device=
-while [ "$attempt" -lt 100 ]; do
-	image_candidates=$(resolve_device_spec "$image_spec")
-	image_device=
-	for candidate in $image_candidates; do
-		if [ -n "$image_device" ] && [ "$candidate" != "$image_device" ]; then
-			fatal image.ambiguous \
-				"multiple devices match the image location: $image_spec"
+if [ "$root_mode" != slot ]; then
+	while [ "$attempt" -lt 100 ]; do
+		image_candidates=$(resolve_device_spec "$image_spec")
+		image_device=
+		for candidate in $image_candidates; do
+			if [ -n "$image_device" ] && [ "$candidate" != "$image_device" ]; then
+				fatal image.ambiguous \
+					"multiple devices match the image location: $image_spec"
+			fi
+			image_device=$candidate
+		done
+		if [ -n "$image_device" ] && [ -b "$image_device" ]; then
+			break
 		fi
-		image_device=$candidate
+		attempt=$((attempt + 1))
+		sleep 0.1
 	done
-	if [ -n "$image_device" ] && [ -b "$image_device" ]; then
-		break
+
+	if [ -z "$image_device" ] || [ ! -b "$image_device" ]; then
+		fatal image.not-found \
+			"image device was not found within 10 seconds: $image_spec"
 	fi
-	attempt=$((attempt + 1))
-	sleep 0.1
-done
 
-if [ -z "$image_device" ] || [ ! -b "$image_device" ]; then
-	fatal image.not-found \
-		"image device was not found within 10 seconds: $image_spec"
+	echo "[volatoo] image device resolved: $image_spec -> $image_device"
+else
+	echo "[volatoo] slot root mode; image device resolution skipped"
 fi
-
-echo "[volatoo] image device resolved: $image_spec -> $image_device"
 
 if [ "$state_spec" = none ]; then
 	echo "[volatoo] state partition discovery disabled"
@@ -2057,7 +2404,9 @@ verity_data_loop_device=
 verity_hash_loop_device=
 verity_mapping=
 source_mounted=0
-if [ "$generation_selected" -eq 1 ]; then
+if [ "$root_mode" = slot ]; then
+	prepare_slot
+elif [ "$generation_selected" -eq 1 ]; then
 	if [ "$generation_incremental" -eq 1 ]; then
 		if [ "$root_mode" = ram-overlay ]; then
 			fatal generation.incremental-ram-overlay \
@@ -2270,7 +2619,7 @@ case $root_mode in
 
 		echo "[volatoo] root copy completed in $((copy_finished - copy_started))s"
 		;;
-	overlay | store-overlay)
+	overlay | store-overlay | slot)
 		if ! mount -t tmpfs -o "mode=0755,size=$tmpfs_size" tmpfs /overlay; then
 			fatal root.overlay-tmpfs \
 				"could not mount the overlay write layer"
@@ -2284,6 +2633,8 @@ case $root_mode in
 		fi
 		if [ "$root_mode" = store-overlay ]; then
 			echo "[volatoo] immutable store overlay root ready"
+		elif [ "$root_mode" = slot ]; then
+			echo "[volatoo] slot overlay root ready: slot $slot_id"
 		else
 			echo "[volatoo] legacy overlay root ready"
 		fi
@@ -2379,6 +2730,43 @@ if [ "$generation_selected" -eq 1 ]; then
 	fi
 fi
 
+if [ "$slot_selected" -eq 1 ]; then
+	mkdir -p /newroot/.volatoo
+	if ! printf '%s\n' "$slot_id" \
+		>/newroot/.volatoo/slot-id || \
+		! printf 'sha256:%s\n' "$slot_manifest_hex" \
+			>/newroot/.volatoo/slot-manifest-id || \
+		! printf '%s\n' "$slot_init_system" \
+			>/newroot/.volatoo/slot-init-system; then
+		fatal slot.identity \
+			"could not publish the selected slot identity"
+	fi
+	if [ -n "$slot_channel" ] && \
+		! printf '%s\n' "$slot_channel" \
+			>/newroot/.volatoo/slot-channel; then
+		fatal slot.identity \
+			"could not publish the selected slot channel"
+	fi
+	if ! printf 'sha256-eager\n' \
+		>/newroot/.volatoo/root-authentication; then
+		fatal slot.identity \
+			"could not publish the slot root authentication mode"
+	fi
+	if [ "$slot_signature_verified" -eq 1 ]; then
+		if ! printf 'signify-ed25519\n' \
+			>/newroot/.volatoo/release-authentication || \
+			! printf '%s\n' "$slot_signature_key_id" \
+				>/newroot/.volatoo/signature-key; then
+			fatal slot.identity \
+				"could not publish the slot release signature identity"
+		fi
+	elif ! printf 'unsigned\n' \
+		>/newroot/.volatoo/release-authentication; then
+		fatal slot.identity \
+			"could not publish the unsigned slot identity"
+	fi
+fi
+
 if [ ! -x "/newroot$target_init" ]; then
 	fatal root.init-missing \
 		"target init is not executable: $target_init"
@@ -2422,7 +2810,7 @@ case $root_mode in
 			umount /source || true
 		fi
 		;;
-	overlay | store-overlay)
+	overlay | store-overlay | slot)
 		# Keep the overlay's lower and writable backing mounts alive after the
 		# initramfs is discarded by moving them beneath the new root.
 		mkdir -p /newroot/.volatoo/lower /newroot/.volatoo/writable

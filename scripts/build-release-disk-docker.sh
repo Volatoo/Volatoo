@@ -9,10 +9,12 @@ Usage: scripts/build-release-disk-docker.sh \
   --init-system openrc|systemd \
   --kernel PATH --initramfs PATH --rootfs PATH --state PATH \
   [--secure-boot-key KEY.pem --secure-boot-cert CERT.pem] \
-  OUTPUT.img
+  [--slots] OUTPUT.img
 
 Build a new BIOS/UEFI v0.1-dev raw disk image inside the OrbStack Docker
 context. OUTPUT must not exist. This command never accepts a block device.
+With --slots, the disk boots whole-image A/B slots from the state partition
+instead of a direct image; --secure-boot-key cannot be combined with --slots.
 EOF
 }
 
@@ -23,6 +25,7 @@ rootfs=
 state=
 secure_boot_key=
 secure_boot_cert=
+slot_boot=no
 output=
 while (( $# > 0 )); do
 	case $1 in
@@ -39,6 +42,7 @@ while (( $# > 0 )); do
 			esac
 			shift 2
 			;;
+		--slots) slot_boot=yes; shift ;;
 		-h|--help) usage; exit 0 ;;
 		-*) echo "error: unknown option: $1" >&2; usage >&2; exit 2 ;;
 		*) [[ -z $output ]] || { echo "error: only one output is allowed" >&2; exit 2; }; output=$1; shift ;;
@@ -106,6 +110,7 @@ docker_args=(
 	--env "HOST_UID=$(id -u)"
 	--env "HOST_GID=$(id -g)"
 	--env SOURCE_DATE_EPOCH=0
+	--env "VOLATOO_SLOTS=$slot_boot"
 	--mount "type=bind,src=$kernel,dst=/input/kernel,readonly"
 	--mount "type=bind,src=$initramfs,dst=/input/initramfs,readonly"
 	--mount "type=bind,src=$rootfs,dst=/input/rootfs,readonly"

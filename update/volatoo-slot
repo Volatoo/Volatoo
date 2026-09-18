@@ -1,0 +1,759 @@
+#!/usr/bin/env python3
+
+"""Provision, stage, switch and verify whole-image A/B update slots.
+
+This is the release-media update path. It is a different mechanism from the
+granular generation store in update/volatoo-generation: a slot is a complete
+release image (kernel + initramfs + root SquashFS) bound by a signed text
+manifest in the same style as a generation realization plan. See
+docs/design/in-place-update.md.
+"""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import os
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any
+
+DIGEST_PREFIX = "sha256:"
+SLOT_NAMES = ("a", "b")
+SLOT_HEADER = "VOLATOO_SLOT_V1"
+MANIFEST_NAME = "manifest.plan"
+SIGNIFY_FILE_LIMIT = 1024
+VALID_INIT_SYSTEMS = ("openrc", "systemd")
+CHANNEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+~-]{0,127}$")
+DIGEST_HEX_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+class SlotError(RuntimeError):
+    pass
+
+
+def digest_bytes(value: bytes) -> str:
+    return DIGEST_PREFIX + hashlib.sha256(value).hexdigest()
+
+
+def digest_file(path: Path) -> tuple[str, int]:
+    if path.is_symlink() or not path.is_file():
+        raise SlotError(f"object must be a regular file: {path}")
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+    except OSError as error:
+        raise SlotError(f"cannot hash {path}: {error}") from error
+    return DIGEST_PREFIX + digest.hexdigest(), size
+
+
+def digest_name(digest: str) -> str:
+    if (
+        not digest.startswith(DIGEST_PREFIX)
+        or len(digest) != 71
+        or DIGEST_HEX_RE.fullmatch(digest[7:]) is None
+    ):
+        raise SlotError(f"invalid SHA-256 digest: {digest}")
+    return digest[7:]
+
+
+def require_digest(value: str, description: str) -> str:
+    digest_name(value)
+    return value
+
+
+def fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def atomic_write(path: Path, value: bytes, mode: int = 0o644) -> None:
+    temporary: Path | None = None
+    try:
+        descriptor, name = tempfile.mkstemp(
+            dir=path.parent,
+            prefix=f".{path.name}.tmp-",
+        )
+        temporary = Path(name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+        fsync_directory(path.parent)
+    except OSError as error:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise SlotError(f"cannot atomically write {path}: {error}") from error
+
+
+def require_directory(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_dir():
+        raise SlotError(f"{description} is missing or unsafe: {path}")
+
+
+def require_regular_file(path: Path, description: str) -> None:
+    if path.is_symlink() or not path.is_file():
+        raise SlotError(f"{description} is missing or unsafe: {path}")
+
+
+def require_slot_name(value: str) -> str:
+    if value not in SLOT_NAMES:
+        raise SlotError(f"slot must be a or b, found {value!r}")
+    return value
+
+
+def state_volatoo(state: Path) -> Path:
+    state = state.resolve()
+    volatoo = state / "volatoo"
+    require_directory(volatoo, "Volatoo state root")
+    marker = volatoo / "layout-version"
+    require_regular_file(marker, "state layout marker")
+    version = marker.read_text(encoding="ascii").strip()
+    if version != "1":
+        raise SlotError(f"slots require state layout version 1, found {version!r}")
+    return volatoo
+
+
+def slots_root(state: Path) -> Path:
+    return state_volatoo(state) / "slots"
+
+
+def require_slots(slots: Path) -> None:
+    require_directory(slots, "state/slots")
+    marker = slots / "layout-version"
+    require_regular_file(marker, "slot layout marker")
+    version = marker.read_text(encoding="ascii").strip()
+    if version != "1":
+        raise SlotError(f"unsupported slot layout version: {version!r}")
+    for name in SLOT_NAMES:
+        require_directory(slots / name, f"slot {name} directory")
+    require_directory(slots / "signatures", "slot signatures directory")
+
+
+def slot_dir(slots: Path, name: str) -> Path:
+    return slots / name
+
+
+def active_marker(slots: Path, name: str) -> Path:
+    return slots / f"active-{name}"
+
+
+def pending_marker(slots: Path, name: str) -> Path:
+    return slots / f"pending-{name}"
+
+
+def read_active(slots: Path) -> str | None:
+    for name in SLOT_NAMES:
+        if (slots / f"active-{name}").exists():
+            return name
+    return None
+
+
+def read_pending(slots: Path) -> str | None:
+    for name in SLOT_NAMES:
+        if (slots / f"pending-{name}").exists():
+            return name
+    return None
+
+
+def read_tries(slots: Path) -> int | None:
+    path = slots / "tries"
+    if path.is_symlink() or not path.exists():
+        return None
+    require_regular_file(path, "slot tries counter")
+    try:
+        value = int(path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError, UnicodeError) as error:
+        raise SlotError(f"invalid slot tries counter: {error}") from error
+    if value < 0:
+        raise SlotError("slot tries counter must be non-negative")
+    return value
+
+
+@contextmanager
+def slot_lock(slots: Path) -> Any:
+    lock_path = slots / "lock"
+    try:
+        flags = os.O_RDWR | os.O_CREAT
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        descriptor = os.open(lock_path, flags, 0o600)
+        with os.fdopen(descriptor, "r+b") as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise SlotError("slot lock is not a regular file")
+            fcntl.flock(stream.fileno(), fcntl.LOCK_EX)
+            yield
+    except OSError as error:
+        raise SlotError(f"cannot lock slot state: {error}") from error
+
+
+def read_signify_file(path: Path, description: str) -> bytes:
+    require_regular_file(path, description)
+    try:
+        content = path.read_bytes()
+    except OSError as error:
+        raise SlotError(f"cannot read {description}: {error}") from error
+    if not content or len(content) > SIGNIFY_FILE_LIMIT:
+        raise SlotError(f"{description} must contain 1 to {SIGNIFY_FILE_LIMIT} bytes")
+    try:
+        text = content.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise SlotError(f"{description} is not ASCII") from error
+    if not text.endswith("\n"):
+        raise SlotError(f"{description} has no final newline")
+    lines = text.splitlines()
+    if (
+        len(lines) != 2
+        or not lines[0].startswith("untrusted comment: ")
+        or not re.fullmatch(r"[A-Za-z0-9+/]+={0,2}", lines[1])
+    ):
+        raise SlotError(f"{description} is not a detached signify file")
+    return content
+
+
+def public_key_id(path: Path) -> str:
+    return digest_bytes(read_signify_file(path, f"trusted public key {path}"))
+
+
+def invoke_signify(arguments: list[str], description: str) -> None:
+    try:
+        result = subprocess.run(
+            arguments,
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        raise SlotError(f"cannot execute signify for {description}: {error}") from error
+    if result.returncode == 0:
+        return
+    detail = result.stderr.strip() or result.stdout.strip() or "verification failed"
+    detail = detail.splitlines()[-1][:512]
+    raise SlotError(f"{description} failed: {detail}")
+
+
+def signature_directory(slots: Path, manifest_digest: str) -> Path:
+    return slots / "signatures" / digest_name(manifest_digest)
+
+
+def verify_signature(
+    slots: Path,
+    manifest_digest: str,
+    manifest_path: Path,
+    trusted_keys: list[Path],
+    signify_command: str,
+    required: bool,
+) -> list[str]:
+    if not trusted_keys:
+        if required:
+            raise SlotError("slot signature verification requires a trusted public key")
+        return []
+    directory = signature_directory(slots, manifest_digest)
+    if not directory.exists() and not directory.is_symlink():
+        if required:
+            raise SlotError("slot manifest has no signature directory")
+        return []
+    require_directory(directory, "slot signature directory")
+    verified: list[str] = []
+    for trusted_key in trusted_keys:
+        key_id = public_key_id(trusted_key)
+        signature = directory / f"{digest_name(key_id)}.sig"
+        if signature.exists() or signature.is_symlink():
+            require_regular_file(signature, f"slot signature {signature.name}")
+            invoke_signify(
+                [
+                    signify_command,
+                    "-V",
+                    "-p",
+                    str(trusted_key),
+                    "-x",
+                    str(signature),
+                    "-m",
+                    str(manifest_path),
+                ],
+                f"slot manifest signature from {key_id}",
+            )
+            verified.append(key_id)
+    if required and not verified:
+        raise SlotError("slot manifest has no signature from a trusted public key")
+    return verified
+
+
+def render_manifest(fields: dict[str, Any]) -> bytes:
+    lines = [
+        SLOT_HEADER,
+        f"slot {fields['slot']}",
+        f"channel {fields['channel']}",
+        f"init-system {fields['init_system']}",
+        f"kernel {fields['kernel_digest']} {fields['kernel_size']}",
+        f"initramfs {fields['initramfs_digest']} {fields['initramfs_size']}",
+        f"rootfs {fields['rootfs_digest']} {fields['rootfs_size']}",
+    ]
+    if fields.get("release_index_digest"):
+        lines.append(f"release-index {fields['release_index_digest']}")
+    lines.append("end")
+    return ("\n".join(lines) + "\n").encode("ascii")
+
+
+def parse_manifest(data: bytes) -> dict[str, Any]:
+    try:
+        text = data.decode("ascii")
+    except UnicodeDecodeError as error:
+        raise SlotError("slot manifest is not ASCII") from error
+    if not text.endswith("\n"):
+        raise SlotError("slot manifest has no final newline")
+    lines = text.splitlines()
+    if not lines or lines[0] != SLOT_HEADER:
+        raise SlotError("slot manifest has an invalid header")
+    fields: dict[str, Any] = {}
+    saw_end = False
+    for line in lines[1:]:
+        if line == "end":
+            saw_end = True
+            continue
+        if saw_end:
+            raise SlotError("slot manifest contains records after end")
+        tokens = line.split()
+        keyword = tokens[0] if tokens else ""
+        if keyword == "slot":
+            if len(tokens) != 2 or tokens[1] not in SLOT_NAMES:
+                raise SlotError("slot manifest has a malformed slot record")
+            fields["slot"] = tokens[1]
+        elif keyword == "channel":
+            if len(tokens) != 2 or CHANNEL_RE.fullmatch(tokens[1]) is None:
+                raise SlotError("slot manifest has a malformed channel record")
+            fields["channel"] = tokens[1]
+        elif keyword == "init-system":
+            if len(tokens) != 2 or tokens[1] not in VALID_INIT_SYSTEMS:
+                raise SlotError("slot manifest has a malformed init-system record")
+            fields["init_system"] = tokens[1]
+        elif keyword in ("kernel", "initramfs", "rootfs"):
+            if len(tokens) != 3:
+                raise SlotError(f"slot manifest has a malformed {keyword} record")
+            require_digest(tokens[1], f"{keyword} digest")
+            if not tokens[2].isdigit() or int(tokens[2]) < 1:
+                raise SlotError(f"slot manifest has an invalid {keyword} size")
+            fields[f"{keyword}_digest"] = tokens[1]
+            fields[f"{keyword}_size"] = int(tokens[2])
+        elif keyword == "release-index":
+            if len(tokens) != 2:
+                raise SlotError("slot manifest has a malformed release-index record")
+            require_digest(tokens[1], "release-index digest")
+            fields["release_index_digest"] = tokens[1]
+        else:
+            raise SlotError(f"slot manifest has an unsupported record: {keyword}")
+    if not saw_end:
+        raise SlotError("slot manifest has no end record")
+    for required in (
+        "slot",
+        "channel",
+        "init_system",
+        "kernel_digest",
+        "kernel_size",
+        "initramfs_digest",
+        "initramfs_size",
+        "rootfs_digest",
+        "rootfs_size",
+    ):
+        if required not in fields:
+            raise SlotError(f"slot manifest is missing: {required}")
+    return fields
+
+
+def read_slot_manifest(slots: Path, name: str) -> tuple[dict[str, Any], str]:
+    manifest_path = slot_dir(slots, name) / MANIFEST_NAME
+    require_regular_file(manifest_path, f"slot {name} manifest")
+    try:
+        data = manifest_path.read_bytes()
+    except OSError as error:
+        raise SlotError(f"cannot read slot {name} manifest: {error}") from error
+    fields = parse_manifest(data)
+    if fields["slot"] != name:
+        raise SlotError(f"slot {name} manifest binds slot {fields['slot']!r}")
+    return fields, digest_name(digest_bytes(data))
+
+
+def verify_slot_blobs(slots: Path, name: str) -> tuple[dict[str, Any], str]:
+    manifest, manifest_hex = read_slot_manifest(slots, name)
+    directory = slot_dir(slots, name)
+    for blob, digest_key, size_key in (
+        ("kernel", "kernel_digest", "kernel_size"),
+        ("initramfs", "initramfs_digest", "initramfs_size"),
+        ("root.squashfs", "rootfs_digest", "rootfs_size"),
+    ):
+        blob_path = directory / blob
+        require_regular_file(blob_path, f"slot {name} {blob}")
+        actual_digest, actual_size = digest_file(blob_path)
+        if actual_digest != manifest[digest_key]:
+            raise SlotError(
+                f"slot {name} {blob} digest mismatch: {actual_digest} != "
+                f"{manifest[digest_key]}"
+            )
+        if actual_size != manifest[size_key]:
+            raise SlotError(
+                f"slot {name} {blob} size mismatch: {actual_size} != "
+                f"{manifest[size_key]}"
+            )
+    return manifest, manifest_hex
+
+
+def command_provision(arguments: argparse.Namespace) -> None:
+    state = arguments.state.resolve()
+    volatoo = state_volatoo(state)
+    slots = volatoo / "slots"
+    if slots.exists() or slots.is_symlink():
+        require_slots(slots)
+        print(f"slot layout already present at {slots}")
+        return
+    temporary = volatoo / ".slots-migration"
+    try:
+        temporary.mkdir()
+        for name in SLOT_NAMES:
+            (temporary / name).mkdir()
+        (temporary / "signatures").mkdir()
+        atomic_write(temporary / "layout-version", b"1\n", 0o644)
+        os.chmod(temporary, 0o755)
+        os.chmod(temporary / "signatures", 0o755)
+        fsync_directory(temporary)
+        os.replace(temporary, slots)
+        fsync_directory(volatoo)
+    except OSError as error:
+        raise SlotError(f"cannot create slot layout: {error}") from error
+    print(f"provisioned slot layout at {slots}")
+
+
+def command_sign(arguments: argparse.Namespace) -> None:
+    name = require_slot_name(arguments.slot)
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    if not arguments.secret_key or not arguments.trusted_key:
+        raise SlotError("sign requires --secret-key and --trusted-key")
+    with slot_lock(slots):
+        _fields, manifest_hex = read_slot_manifest(slots, name)
+        manifest_path = slot_dir(slots, name) / MANIFEST_NAME
+        key_id = public_key_id(arguments.trusted_key)
+        directory = signature_directory(slots, "sha256:" + manifest_hex)
+        directory.mkdir(parents=True, exist_ok=True)
+        require_directory(directory, "slot signature directory")
+        signature_path = directory / f"{digest_name(key_id)}.sig"
+        temporary = signature_path.with_name(f".{signature_path.name}.tmp-{os.getpid()}")
+        invoke_signify(
+            [
+                arguments.signify,
+                "-S",
+                "-s",
+                str(arguments.secret_key),
+                "-m",
+                str(manifest_path),
+                "-x",
+                str(temporary),
+            ],
+            f"slot {name} manifest signing",
+        )
+        os.replace(temporary, signature_path)
+        fsync_directory(directory)
+        verified = verify_signature(
+            slots,
+            "sha256:" + manifest_hex,
+            manifest_path,
+            [arguments.trusted_key],
+            arguments.signify,
+            required=True,
+        )
+    print(f"signed slot {name} manifest {manifest_hex} with {verified[0]}")
+
+
+def command_verify(arguments: argparse.Namespace) -> None:
+    name = require_slot_name(arguments.slot)
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    manifest, manifest_hex = verify_slot_blobs(slots, name)
+    trusted_keys = [Path(path) for path in (arguments.trusted_key or [])]
+    verified = []
+    if trusted_keys:
+        manifest_path = slot_dir(slots, name) / MANIFEST_NAME
+        verified = verify_signature(
+            slots,
+            "sha256:" + manifest_hex,
+            manifest_path,
+            trusted_keys,
+            arguments.signify,
+            required=arguments.require_signature,
+        )
+    print(
+        f"slot {name} verified: init_system={manifest['init_system']} "
+        f"channel={manifest['channel']} manifest=sha256:{manifest_hex} "
+        f"signatures={len(verified)}"
+    )
+
+
+def command_stage(arguments: argparse.Namespace) -> None:
+    name = require_slot_name(arguments.slot)
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    for blob in (arguments.kernel, arguments.initramfs, arguments.rootfs):
+        require_regular_file(blob, f"input {blob}")
+    with slot_lock(slots):
+        active = read_active(slots)
+        if active == name:
+            raise SlotError(f"slot {name} is active; stage into the inactive slot")
+        directory = slot_dir(slots, name)
+        require_directory(directory, f"slot {name} directory")
+
+        kernel_digest, kernel_size = digest_file(arguments.kernel)
+        initramfs_digest, initramfs_size = digest_file(arguments.initramfs)
+        rootfs_digest, rootfs_size = digest_file(arguments.rootfs)
+
+        fields: dict[str, Any] = {
+            "slot": name,
+            "channel": arguments.channel,
+            "init_system": arguments.init_system,
+            "kernel_digest": kernel_digest,
+            "kernel_size": kernel_size,
+            "initramfs_digest": initramfs_digest,
+            "initramfs_size": initramfs_size,
+            "rootfs_digest": rootfs_digest,
+            "rootfs_size": rootfs_size,
+        }
+        if arguments.release_index_digest:
+            fields["release_index_digest"] = arguments.release_index_digest
+        manifest_bytes = render_manifest(fields)
+        manifest_digest = digest_bytes(manifest_bytes)
+
+        for blob, source in (
+            ("kernel", arguments.kernel),
+            ("initramfs", arguments.initramfs),
+            ("root.squashfs", arguments.rootfs),
+        ):
+            with source.open("rb") as stream:
+                data = stream.read()
+            atomic_write(directory / blob, data, 0o644)
+        atomic_write(directory / MANIFEST_NAME, manifest_bytes, 0o644)
+
+        if arguments.signing_key and arguments.trusted_key:
+            key_id = public_key_id(arguments.trusted_key)
+            signature_dir = signature_directory(slots, manifest_digest)
+            signature_dir.mkdir(parents=True, exist_ok=True)
+            signature_path = signature_dir / f"{digest_name(key_id)}.sig"
+            temporary = signature_path.with_name(
+                f".{signature_path.name}.tmp-{os.getpid()}"
+            )
+            invoke_signify(
+                [
+                    arguments.signify,
+                    "-S",
+                    "-s",
+                    str(arguments.signing_key),
+                    "-m",
+                    str(directory / MANIFEST_NAME),
+                    "-x",
+                    str(temporary),
+                ],
+                f"slot {name} manifest signing",
+            )
+            os.replace(temporary, signature_path)
+            fsync_directory(signature_dir)
+
+        # Re-verify what was just written before arming the candidate.
+        verify_slot_blobs(slots, name)
+        if arguments.trusted_key:
+            verify_signature(
+                slots,
+                manifest_digest,
+                directory / MANIFEST_NAME,
+                [arguments.trusted_key],
+                arguments.signify,
+                required=True,
+            )
+        fsync_directory(directory)
+        fsync_directory(slots)
+
+        for other in SLOT_NAMES:
+            if other != name:
+                (slots / f"pending-{other}").unlink(missing_ok=True)
+        atomic_write(pending_marker(slots, name), b"", 0o644)
+        if arguments.tries is not None:
+            atomic_write(slots / "tries", f"{arguments.tries}\n".encode("ascii"))
+        elif not (slots / "tries").exists():
+            atomic_write(slots / "tries", b"1\n")
+        fsync_directory(slots)
+    print(
+        f"staged slot {name}: init_system={arguments.init_system} "
+        f"manifest={manifest_digest} (pending)"
+    )
+
+
+def command_commit(arguments: argparse.Namespace) -> None:
+    name = require_slot_name(arguments.slot)
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    with slot_lock(slots):
+        active = read_active(slots)
+        pending = read_pending(slots)
+        if pending is not None and pending != name:
+            raise SlotError(
+                f"commit for slot {name} but pending candidate is {pending}"
+            )
+        verify_slot_blobs(slots, name)
+        if active == name and pending is None:
+            print(f"slot {name} already active and committed")
+            return
+        other = "b" if name == "a" else "a"
+        atomic_write(active_marker(slots, name), b"", 0o644)
+        active_marker(slots, other).unlink(missing_ok=True)
+        pending_marker(slots, name).unlink(missing_ok=True)
+        fsync_directory(slots)
+    print(f"committed slot {name} as active")
+
+
+def command_rollback(arguments: argparse.Namespace) -> None:
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    with slot_lock(slots):
+        active = read_active(slots)
+        pending = read_pending(slots)
+        if pending is not None:
+            # A candidate is armed (and may be the slot running now). Revert
+            # to the committed slot without touching the active marker.
+            pending_marker(slots, pending).unlink(missing_ok=True)
+            if active is None:
+                raise SlotError("no committed slot to roll back to")
+            target = active
+        else:
+            if active is None:
+                raise SlotError("no active slot is selected")
+            target = "b" if active == "a" else "a"
+            verify_slot_blobs(slots, target)
+            atomic_write(active_marker(slots, target), b"", 0o644)
+            active_marker(slots, active).unlink(missing_ok=True)
+        fsync_directory(slots)
+    print(f"rolled back to slot {target}")
+
+
+def command_status(arguments: argparse.Namespace) -> None:
+    slots = slots_root(arguments.state)
+    require_slots(slots)
+    active = read_active(slots)
+    pending = read_pending(slots)
+    tries = read_tries(slots)
+    print(f"active: {active or 'none'}")
+    print(f"pending: {pending or 'none'}")
+    print(f"tries: {tries if tries is not None else 'unset'}")
+    for name in SLOT_NAMES:
+        manifest_path = slot_dir(slots, name) / MANIFEST_NAME
+        if manifest_path.exists() and not manifest_path.is_symlink():
+            try:
+                manifest, manifest_hex = read_slot_manifest(slots, name)
+                print(
+                    f"slot {name}: init_system={manifest['init_system']} "
+                    f"channel={manifest['channel']} manifest=sha256:{manifest_hex}"
+                )
+            except SlotError as error:
+                print(f"slot {name}: invalid manifest: {error}")
+        else:
+            print(f"slot {name}: empty")
+
+
+def parse_arguments() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        prog="volatoo-slot",
+        description="Provision and switch whole-image A/B update slots.",
+    )
+    parser.add_argument(
+        "--state",
+        required=True,
+        type=Path,
+        help="writable state filesystem mountpoint",
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    subparsers.add_parser(
+        "provision", help="create the slots sublayout if absent"
+    )
+
+    stage = subparsers.add_parser("stage", help="write a verified image into the inactive slot")
+    stage.add_argument("--slot", required=True, help="target slot: a or b")
+    stage.add_argument("--kernel", required=True, type=Path)
+    stage.add_argument("--initramfs", required=True, type=Path)
+    stage.add_argument("--rootfs", required=True, type=Path)
+    stage.add_argument("--channel", required=True, help="release channel, e.g. v0.1-dev")
+    stage.add_argument(
+        "--init-system",
+        required=True,
+        choices=("openrc", "systemd"),
+        help="target init system",
+    )
+    stage.add_argument("--release-index-digest", help="signed release-index digest")
+    stage.add_argument("--signing-key", type=Path, help="release secret key")
+    stage.add_argument("--trusted-key", type=Path, help="release public key")
+    stage.add_argument("--signify", default="signify", help="signify executable")
+    stage.add_argument("--tries", type=int, help="boot attempts for the candidate")
+
+    commit = subparsers.add_parser("commit", help="promote a pending candidate to active")
+    commit.add_argument("--slot", required=True, help="slot that booted successfully")
+
+    subparsers.add_parser("rollback", help="revert to the other slot")
+
+    verify = subparsers.add_parser("verify", help="verify a slot manifest and blobs")
+    verify.add_argument("--slot", required=True, help="slot: a or b")
+    verify.add_argument("--trusted-key", type=Path, action="append", default=[])
+    verify.add_argument(
+        "--require-signature",
+        action="store_true",
+        help="fail if no trusted-key signature verifies",
+    )
+    verify.add_argument("--signify", default="signify")
+
+    sign = subparsers.add_parser("sign", help="sign an existing slot manifest")
+    sign.add_argument("--slot", required=True, help="slot: a or b")
+    sign.add_argument("--secret-key", type=Path)
+    sign.add_argument("--trusted-key", type=Path)
+    sign.add_argument("--signify", default="signify")
+
+    subparsers.add_parser("status", help="show active/pending slots")
+    return parser.parse_args()
+
+
+def main() -> int:
+    arguments = parse_arguments()
+    try:
+        if arguments.command == "provision":
+            command_provision(arguments)
+        elif arguments.command == "stage":
+            command_stage(arguments)
+        elif arguments.command == "commit":
+            command_commit(arguments)
+        elif arguments.command == "rollback":
+            command_rollback(arguments)
+        elif arguments.command == "status":
+            command_status(arguments)
+        elif arguments.command == "verify":
+            command_verify(arguments)
+        elif arguments.command == "sign":
+            command_sign(arguments)
+        else:
+            raise SlotError(f"unknown command: {arguments.command}")
+    except SlotError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -182,6 +182,18 @@ them. The configuration grammar and policy behavior are documented in
 [`persistence-policy.md`](persistence-policy.md). Consumers must reject
 unsupported layout versions rather than guessing.
 
+## Whole-image slot sublayout (additive)
+
+Release-media in-place updates add a second, independent `slots/` sublayout
+under `/volatoo/slots`, with its own `layout-version` of `1`. It holds two
+whole-image slots (`a/`, `b/`), each containing `kernel`, `initramfs`,
+`root.squashfs` and a signed `manifest.plan`, plus `active-*`/`pending-*`
+boot-selection markers, a `tries` counter and detached signatures under
+`slots/signatures/`. It is provisioned by `update/volatoo-slot provision`, not
+by `migrate-state`, and its presence does not change the top-level or
+`system/` layout markers. The layout, trust boundary and boot selection are
+specified in [`in-place-update.md`](in-place-update.md).
+
 ## Test image
 
 The repository can create a regular ext4 image without requiring Linux host
