@@ -60,8 +60,8 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Add a RAM-backed SquashFS overlay that releases the source image device
   - [x] Add an explicit store-backed overlay and make it the default root mode
 - [x] Let installers and image tooling select `openrc` or `systemd` explicitly
-- [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
-- [ ] Run the image, boot, update and rollback CI matrix against both init systems
+- [x] Provide equivalent persistence/shutdown integration for OpenRC and systemd
+- [x] Run the image, boot, update and rollback CI matrix against both init systems
 - [ ] Package-set variants: `minimal` (console) first; `desktop` later
 - [x] In-place image update: download new image to state partition, reboot into it (A/B slots)
 
