@@ -161,6 +161,9 @@ system generations. See `docs/design/atomic-package-updates.md`.
 - [x] Provision a key-only `volatoo` administrator and enable DHCP/SSH for both
       init-system targets without shipping a default password
 - [x] PXE/diskless boot documented and tested
+  - [ ] Extend network boot to the UEFI lane once a kernel-loading EFI
+        network ROM (a bzImage-capable iPXE) or `grubnetx64.efi` is
+        available offline
 - [x] User handbook: install, persist policy, updating, rebuilding your own image
 - [x] Publish the `v0.1.0-dev.20260814` developer preview
 - [ ] Tag v0.1.0 and publish the first image release
