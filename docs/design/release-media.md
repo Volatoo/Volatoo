@@ -107,7 +107,8 @@ inside the isolated builder so identical inputs produce the same signed UKI.
 
 Identical pinned inputs produce a byte-identical raw disk. The assembler
 eliminates every wall-clock and random input in the GPT, filesystem and GRUB
-output:
+output, and the state input is itself built deterministically so the whole
+input set (kernel, initramfs, Catalyst root and state image) is reproducible:
 
 - **GPT identifiers** — the disk GUID, all four partition GUIDs, the FAT
   volume id, the ext4 filesystem UUID and the ext4 hash seed are derived from
@@ -131,9 +132,13 @@ output:
 - **System (ext4)** — the filesystem is built offline with `mke2fs -d` from a
   pinned staging tree under `SOURCE_DATE_EPOCH`, with the derived UUID and
   `hash_seed`, so the superblock and every inode timestamp are deterministic.
-- **State (ext4)** — the pinned state image is copied in and grown with
-  `e2fsck`, `resize2fs` and `e2label`, each under `faketime` so the superblock
-  last-check and last-write fields land on the reference epoch.
+- **State (ext4)** — the input state image is itself built deterministically by
+  `scripts/build-state-image.sh` from a pinned Alpine image and package
+  versions, with its UUID and hash seed derived from the SHA-256 of its content
+  (domain `volatoo-state:<content-sha256>`) and its superblock and inode
+  timestamps pinned to `SOURCE_DATE_EPOCH`. The assembler then copies it in and
+  grows it with `e2fsck`, `resize2fs` and `e2label`, each under `faketime`,
+  without overriding that identity.
 
 `SOURCE_DATE_EPOCH` is fixed at `0` by the host wrapper; `TZ=UTC` and
 `LC_ALL=C` keep time and collation independent of the build host. The
@@ -153,11 +158,18 @@ It builds the image twice and asserts an identical SHA-256, recording both
 digests and the build commands in the evidence file. The sidecar manifests are
 allowed to differ only in the `disk_file` name they record.
 
+The state image has its own double-build check, run before the disk:
+
+```sh
+scripts/tests/test-state-image-reproducible-docker.sh \
+  --evidence out/volatoo-release/evidence/state-reproducible.evidence
+```
+
 This was validated against real release inputs, not synthetic placeholders:
 the pinned kernel, a full verity/signify initramfs, the latest Catalyst roots
-and a state image were assembled twice per init system and the resulting disks
-were byte-identical, then each booted through the complete Gate. The inputs and
-results were:
+and a deterministic state image (built twice, byte-identical) were assembled
+twice per init system and the resulting disks were byte-identical, then each
+booted through the complete Gate. The inputs and results were:
 
 | Input | SHA-256 |
 |---|---|
@@ -165,12 +177,12 @@ results were:
 | initramfs | `9a5f05fb…` |
 | openrc root `stage4-amd64-20260819.squashfs` | `502d99c5…` |
 | systemd root `stage4-amd64-20260814-glibc-r5.squashfs` | `e93c26e4…` |
-| state image | `c94d2314…` |
+| state image | `61472636…` |
 
 | Disk | Reproducibility SHA-256 |
 |---|---|
-| openrc | `9ebd6de2…` |
-| systemd | `2ddfe1f0…` |
+| openrc | `2eea77e6…` |
+| systemd | `dfe447a0…` |
 
 Both disks passed the BIOS and UEFI boot Gate.
 
@@ -288,3 +300,4 @@ root and password SSH, and then starts the selected init system. DHCP and sshd
 are enabled for both OpenRC and systemd. An unattended image writer may use
 `--no-provision-access`, but that leaves the installed system without an
 administrator login and must be an explicit choice.
+

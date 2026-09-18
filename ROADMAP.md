@@ -123,13 +123,15 @@ system generations. See `docs/design/atomic-package-updates.md`.
 
 ## Phase 4 — Installable release
 
-- [ ] Produce a reproducible `v0.1-dev` raw disk image for BIOS and UEFI
+- [x] Produce a reproducible `v0.1-dev` raw disk image for BIOS and UEFI
   - [x] Assemble kernel, initramfs, immutable root and state filesystems in Docker
   - [x] Boot OpenRC and systemd assembled disks under BIOS and UEFI in the
         OrbStack QEMU runner
   - [x] Keep direct-image SHA-256 mode explicitly development-only until the
         signed generation release pipeline supplies the disk image
   - [x] Make GPT, filesystem and GRUB output bit-reproducible for identical inputs
+  - [x] Build the state image deterministically (derived UUID/hash seed, pinned
+        timestamps) so the full input set is reproducible end-to-end
 - [x] Bootable ISO that is itself a Volatoo system (the live medium *is* the distro)
 - [x] Ship the formal `Volatoo/installer` in authenticated live media
   - [x] Require an explicit block device and verify the release manifest, digest
