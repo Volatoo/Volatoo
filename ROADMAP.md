@@ -76,7 +76,7 @@ system generations. See `docs/design/atomic-package-updates.md`.
 - [x] P3U-2: local binpkg and target-specific remote binhost acquisition for both init systems
 - [x] P3U-3: binary-only staged installation and SquashFS layer composer
 - [x] P3U-4: atomic generation selection, rollback and OpenRC/systemd QEMU boot coverage
-- [ ] P3U-5: service activation policies, garbage collection and base compaction
+- [x] P3U-5: service activation policies, garbage collection and base compaction
   - [x] Add fail-closed live service activation with config and health checks
   - [x] Add generation pinning, inspection and mark-and-sweep garbage collection
   - [x] Add verified Docker base compaction and compaction receipts
@@ -120,6 +120,10 @@ system generations. See `docs/design/atomic-package-updates.md`.
           PID 1 under BIOS and UEFI in the pinned GitHub Actions QEMU runner
     - [x] Exercise signed rollback and reject data, hash-tree, parent-tree receipt
           and detached-signature tampering before release
+
+- [ ] Consume the real Portage Engine infrastructure Gate once Portage
+      Engine publishes stable OpenRC/systemd catalog targets and
+      target-separated signed binhost indexes
 
 ## Phase 4 — Installable release
 
