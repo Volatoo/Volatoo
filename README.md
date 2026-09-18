@@ -100,6 +100,8 @@ package-level `/nix/store` layout is specified in
 [`docs/design/fhs-compatibility.md`](docs/design/fhs-compatibility.md).
 The release-key, rollback and Secure Boot boundaries are specified in
 [`docs/design/release-trust.md`](docs/design/release-trust.md).
+The PXE/diskless topology and its trust boundary are specified in
+[`docs/design/pxe.md`](docs/design/pxe.md).
 OpenRC and systemd minimal images both pass the overlay-root BIOS and UEFI
 boot gates. Signed systemd release media also pass enrolled-key Secure Boot,
 including firmware rejection after a signed UKI is changed. They are separate,

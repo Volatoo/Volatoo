@@ -180,6 +180,85 @@ provide a stable public Portage Engine target or a one-command public package
 update service. See [the update contracts](../update/README.md) for the current
 operator workflow and its trust boundaries.
 
+## PXE / diskless boot
+
+A diskless client boots with no persistent system store: the kernel and
+initramfs arrive over the network, the root image arrives as a block device,
+and after boot the machine runs entirely from a RAM-backed overlay with no
+state. This is `volatoo.root=ram-overlay` combined with `volatoo.state=none`.
+Read [`design/pxe.md`](design/pxe.md) for the exact topology and the trust
+boundary before relying on it. The short version: the kernel, initramfs and the
+`volatoo.image-sha256=` expectation come from the network and are **not**
+authenticated; only the root SquashFS is integrity-checked against that
+network-supplied digest, and no release-key verification happens at all.
+
+### Reproduce the QEMU test
+
+The committed gate boots the real pinned kernel and initramfs over QEMU's
+built-in TFTP using the shipped iPXE option ROM, with the live ISO attached as
+the image container. Run it from the `orbstack` Docker context with the four
+release inputs:
+
+```sh
+scripts/tests/test-pxe-diskless-docker.sh \
+  --init-system openrc \
+  --kernel   out/volatoo-release/kernel/bzImage \
+  --initramfs out/volatoo-release/initramfs/volatoo-initramfs.cpio.gz \
+  --rootfs   out/volatoo-release/rootfs/openrc-20260819.squashfs \
+  --iso      out/volatoo-release/openrc-live.iso
+```
+
+Use `--init-system systemd` with the matching `systemd` root and ISO. The test
+asserts the same markers as the release Gates: initramfs reached, image device
+resolved, SHA-256 verified, source image released, RAM-backed overlay root
+ready, real PID 1, and the login prompt. It covers the BIOS lane only; UEFI
+network boot is blocked by the offline toolchain (see `design/pxe.md`).
+
+### Serve it from a real TFTP/HTTP server
+
+The initramfs performs no network fetch, so a deployment serves exactly two
+things over TFTP/HTTP — the kernel and the initramfs — and exposes the ISO as a
+block device. With dnsmasq as the DHCP/TFTP server:
+
+```text
+# /etc/dnsmasq.d/volatoo-pxe.conf
+interface=eth0
+dhcp-range=10.0.0.100,10.0.0.200,12h
+dhcp-boot=volatoo.ipxe
+enable-tftp
+tftp-root=/srv/tftp
+```
+
+Place the kernel, initramfs and this iPXE script under `/srv/tftp/`, replacing
+`<rootfs-sha256>` with the `rootfs_sha256` from the live ISO manifest:
+
+```text
+#!ipxe
+dhcp
+kernel tftp://${next-server}/vmlinuz console=tty0 console=ttyS0,115200 \
+  volatoo.image=/dev/sda \
+  volatoo.image-file=/volatoo/root.squashfs \
+  volatoo.image-sha256=<rootfs-sha256> \
+  volatoo.root=ram-overlay volatoo.state=none volatoo.generation=none
+initrd tftp://${next-server}/initramfs.cpio.gz
+boot
+```
+
+For the fully network-delivered variant, an iPXE ROM with HTTP and SAN support
+exposes the ISO as a block device before the kernel starts:
+
+```text
+#!ipxe
+dhcp
+sanboot http://${next-server}/volatoo-openrc-live.iso
+```
+
+then the same `volatoo.image=/dev/sda volatoo.image-file=/volatoo/root.squashfs`
+command line applies to the SAN disk. The QEMU test models this variant by
+attaching the ISO as a virtio-blk disk. After the initramfs copies and
+re-verifies the compressed closure into RAM it releases the source device, so
+the client is diskless at runtime.
+
 ## Build your own image
 
 All Docker, image, signing, layer, compression and QEMU work in the supported
