@@ -199,3 +199,12 @@ scripts/build-state-image.sh \
 Docker runs `mkfs.ext4` against a temporary regular file. The script never
 accepts or writes to a block device. Its default result is the ignored build
 artifact `out/volatoo-state.ext4`.
+
+The image is bit-reproducible for identical inputs. The builder pins the
+Alpine image and `coreutils`/`e2fsprogs` package versions, derives the ext4
+UUID and hash seed from the SHA-256 of the state content (domain
+`volatoo-state:<content-sha256>`, rendered as a RFC 4122 version-5 /
+variant-8 UUID), and pins every filesystem and inode timestamp to
+`VOLATOO_STATE_EPOCH` (default `0`). Two builds of the same inputs are
+byte-identical, checked by
+`scripts/tests/test-state-image-reproducible-docker.sh`.

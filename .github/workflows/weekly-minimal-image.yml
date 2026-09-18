@@ -19,6 +19,7 @@ on:
       - "scripts/prepare-verity-root-docker.sh"
       - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-release-disk-docker.sh"
+      - "scripts/build-state-image.sh"
       - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
@@ -30,6 +31,8 @@ on:
       - "scripts/test-live-iso-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
+      - "scripts/tests/test-release-disk-reproducible-docker.sh"
+      - "scripts/tests/test-state-image-reproducible-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
@@ -51,6 +54,7 @@ on:
       - "scripts/prepare-verity-root-docker.sh"
       - "scripts/prepare-signify-root-docker.sh"
       - "scripts/build-release-disk-docker.sh"
+      - "scripts/build-state-image.sh"
       - "scripts/build-live-iso-docker.sh"
       - "scripts/install-volatoo.sh"
       - "scripts/prepare-secure-boot-test-key-docker.sh"
@@ -62,6 +66,8 @@ on:
       - "scripts/test-live-iso-docker.sh"
       - "scripts/tests/test-install-volatoo-docker.sh"
       - "scripts/tests/test-firstboot-access-docker.sh"
+      - "scripts/tests/test-release-disk-reproducible-docker.sh"
+      - "scripts/tests/test-state-image-reproducible-docker.sh"
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
@@ -105,6 +111,7 @@ jobs:
             scripts/prepare-verity-root-docker.sh \
             scripts/prepare-signify-root-docker.sh \
             scripts/build-release-disk-docker.sh \
+            scripts/build-state-image.sh \
             scripts/build-live-iso-docker.sh \
             scripts/install-volatoo.sh \
             scripts/prepare-secure-boot-test-key-docker.sh \
@@ -115,6 +122,8 @@ jobs:
             scripts/test-live-iso-docker.sh \
             scripts/tests/test-install-volatoo-docker.sh \
             scripts/tests/test-firstboot-access-docker.sh \
+            scripts/tests/test-release-disk-reproducible-docker.sh \
+            scripts/tests/test-state-image-reproducible-docker.sh \
             scripts/tests/test-live-iso-normalizer-docker.sh \
             scripts/tests/test-docker-context-policy.sh \
             scripts/tests/test-image-init-selection.sh \
