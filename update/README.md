@@ -603,6 +603,45 @@ the new base digest, and selection compares the current pointer with the value
 captured before reconstruction. The source generation becomes `previous` when
 it was current and `--activate` is used.
 
+## Whole-image A/B slots
+
+The granular generation path above is the per-package update mechanism.
+`volatoo-slot` implements the separate release-media update path: a slot is a
+complete release image (kernel + initramfs + root SquashFS) written into an
+inactive slot inside the state partition and selected at boot by marker files.
+See [`docs/design/in-place-update.md`](../docs/design/in-place-update.md) for the
+slot layout, the trust boundary and the relationship between the two mechanisms.
+
+The signed object is a text plan `VOLATOO_SLOT_V1` (the same style as a
+generation realization plan), stored as `slots/<slot>/manifest.plan` and bound
+to the release channel, init system, optional release-index digest and the
+exact SHA-256/size of `kernel`, `initramfs` and `root.squashfs`. Detached
+signify signatures live under `slots/signatures/<manifest-hex>/<key-hex>.sig`.
+
+```sh
+update/volatoo-slot --state /mnt/volatoo-state provision
+
+update/volatoo-slot --state /mnt/volatoo-state stage \
+  --slot b \
+  --kernel /path/kernel --initramfs /path/initramfs --rootfs /path/root.squashfs \
+  --channel v0.1-dev --init-system openrc \
+  --release-index-digest sha256:... \
+  --signing-key /secure/volatoo-release.sec --trusted-key /secure/volatoo-release.pub
+
+update/volatoo-slot --state /mnt/volatoo-state verify \
+  --slot b --trusted-key /secure/volatoo-release.pub --require-signature
+update/volatoo-slot --state /mnt/volatoo-state status
+update/volatoo-slot --state /mnt/volatoo-state commit --slot b
+update/volatoo-slot --state /mnt/volatoo-state rollback
+```
+
+`stage` refuses the active slot, verifies the written blobs and signature before
+arming the candidate, and sets a `pending-<slot>` marker only after everything is
+durable. `commit` promotes a pending candidate after a successful boot;
+`rollback` clears any pending candidate and selects the other slot. The boot
+side is the `volatoo.root=slot` initramfs mode plus a slot-selecting GRUB
+configuration; both are described in the design note.
+
 ## Tests
 
 ```sh
@@ -618,6 +657,7 @@ update/tests/test-volatoo-incremental-verity-reuse-docker.sh
 update/tests/test-volatoo-signatures-docker.sh
 update/tests/test-volatoo-activate.sh
 update/tests/test-volatoo-compaction-docker.sh
+update/tests/test-volatoo-slot-docker.sh
 ```
 
 The planner Docker test publishes real OpenRC and systemd base generations,

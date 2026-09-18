@@ -1,0 +1,9 @@
+VOLATOO_SLOT_V1
+slot a
+channel v0.1-dev
+init-system openrc
+kernel sha256:b4c0dbf4aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa 14320640
+initramfs sha256:9a5f05fbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 3703622
+rootfs sha256:502d99c5cccccccccccccccccccccccccccccccccccccccccccccccccccccccc 580521984
+release-index sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+end
