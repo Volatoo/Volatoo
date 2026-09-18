@@ -438,6 +438,110 @@ if [[ $test_realized == yes ]]; then
 			"$kernel" \
 			"$initramfs" \
 			"$systemd_image"
+
+	if [[ $realization_version == 3 && -n $trusted_key ]]; then
+		systemd_realized_previous_generation=$(<"$systemd_realized_fixture/previous.digest")
+		systemd_realized_rollback_state=$work_dir/systemd-realized-rollback.ext4
+		cp "$systemd_realized_fixture/state.ext4" "$systemd_realized_rollback_state"
+		"$repo_root/update/tests/corrupt-state-object-docker.sh" \
+			"$systemd_realized_rollback_state" \
+			"$(<"$systemd_realized_fixture/realization-rootfs.digest")"
+		echo "testing signed realized systemd generation rollback"
+		VOLATOO_STATE_IMAGE="$systemd_realized_rollback_state" \
+		VOLATOO_STATE_REQUIRED=yes \
+		VOLATOO_TEST_ROOT_MODE=store-overlay \
+		VOLATOO_TEST_GENERATION="$systemd_realized_previous_generation" \
+		VOLATOO_TEST_GENERATION_SIGNATURE=required \
+		VOLATOO_TEST_GENERATION_FALLBACK=yes \
+		VOLATOO_TEST_GENERATION_REALIZED=yes \
+		VOLATOO_TEST_GENERATION_VERITY=yes \
+		VOLATOO_TEST_SERVICE_READY=yes \
+		VOLATOO_TEST_FIRMWARES="$firmwares" \
+		VOLATOO_TEST_INIT_SYSTEM=systemd \
+		VOLATOO_TEST_TIMEOUT="$payload_timeout" \
+		VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
+			"$boot_harness" \
+				"$kernel" \
+				"$initramfs" \
+				"$systemd_image"
+	fi
+
+	if [[ $test_verity_tamper == yes ]]; then
+		declare -a systemd_tamper_kinds=(data hash)
+		if [[ $realization_version == 3 ]]; then
+			systemd_tamper_kinds+=(receipt)
+		fi
+		for tamper_kind in "${systemd_tamper_kinds[@]}"; do
+			expected_tamper_failure=image.squashfs-mount
+			case $tamper_kind in
+				data)
+					tamper_digest=$(<"$systemd_realized_fixture/realization-rootfs.digest")
+					if [[ $realization_version == 3 ]]; then
+						expected_tamper_failure=generation.incremental-squashfs
+					fi
+					;;
+				hash)
+					tamper_digest=$(<"$systemd_realized_fixture/verity-hash.digest")
+					if [[ $realization_version == 3 ]]; then
+						expected_tamper_failure=generation.incremental-squashfs
+					fi
+					;;
+				receipt)
+					tamper_digest=$(<"$systemd_realized_fixture/parent-tree-receipt.digest")
+					expected_tamper_failure=generation.selected
+					;;
+			esac
+			tampered_state=$work_dir/systemd-realized-$tamper_kind.ext4
+			cp "$systemd_realized_fixture/state.ext4" "$tampered_state"
+			"$repo_root/update/tests/corrupt-state-object-docker.sh" \
+				"$tampered_state" \
+				"$tamper_digest"
+			echo "testing fail-closed realized systemd $tamper_kind corruption"
+			VOLATOO_STATE_IMAGE="$tampered_state" \
+			VOLATOO_STATE_REQUIRED=yes \
+			VOLATOO_GENERATION="$systemd_realized_generation" \
+			VOLATOO_TEST_ROOT_MODE=store-overlay \
+			VOLATOO_TEST_GENERATION="$systemd_realized_generation" \
+			VOLATOO_TEST_GENERATION_SIGNATURE="$realized_signature_policy" \
+			VOLATOO_TEST_GENERATION_REALIZED=yes \
+			VOLATOO_TEST_GENERATION_VERITY=yes \
+			VOLATOO_TEST_EXPECT_FAILURE_CODE="$expected_tamper_failure" \
+			VOLATOO_TEST_FIRMWARES=bios \
+			VOLATOO_TEST_INIT_SYSTEM=shell \
+			VOLATOO_TEST_TIMEOUT="$payload_timeout" \
+			VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
+				"$boot_harness" \
+					"$kernel" \
+					"$initramfs" \
+					"$systemd_image"
+		done
+		if [[ -n $trusted_key ]]; then
+			tampered_signature_state=$work_dir/systemd-realized-signature.ext4
+			cp "$systemd_realized_fixture/state.ext4" "$tampered_signature_state"
+			"$repo_root/update/tests/corrupt-state-signature-docker.sh" \
+				"$tampered_signature_state" \
+				"$(<"$systemd_realized_fixture/realization.digest")" \
+				"$(<"$systemd_realized_fixture/signature-key.digest")"
+			echo "testing fail-closed realized systemd signature corruption"
+			VOLATOO_STATE_IMAGE="$tampered_signature_state" \
+			VOLATOO_STATE_REQUIRED=yes \
+			VOLATOO_GENERATION="$systemd_realized_generation" \
+			VOLATOO_TEST_ROOT_MODE=store-overlay \
+			VOLATOO_TEST_GENERATION="$systemd_realized_generation" \
+			VOLATOO_TEST_GENERATION_REALIZED=yes \
+			VOLATOO_TEST_GENERATION_VERITY=yes \
+			VOLATOO_TEST_GENERATION_SIGNATURE=required \
+			VOLATOO_TEST_EXPECT_FAILURE_CODE=generation.selected \
+			VOLATOO_TEST_FIRMWARES=bios \
+			VOLATOO_TEST_INIT_SYSTEM=shell \
+			VOLATOO_TEST_TIMEOUT="$payload_timeout" \
+			VOLATOO_VM_MEMORY=${VOLATOO_VM_MEMORY:-8G} \
+				"$boot_harness" \
+					"$kernel" \
+					"$initramfs" \
+					"$systemd_image"
+		fi
+	fi
 fi
 
 echo "OpenRC/systemd lifecycle and generation payload QEMU tests passed"
