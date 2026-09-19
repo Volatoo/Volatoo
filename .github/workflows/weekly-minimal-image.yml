@@ -1,5 +1,14 @@
 name: Weekly minimal image
 
+# PR / push runs execute only the fast `validate` job (shellcheck, Python
+# syntax, and the fake-Docker unit tests including the OpenRC/systemd
+# persistence-parity contract). Schedule and manual runs additionally build
+# both init-system images and the pinned kernel, then boot them under BIOS and
+# UEFI through the signed realization-v3 generation Gate, which now exercises
+# update, rollback and tamper rejection for both init systems. The full build
+# and QEMU lanes take hours and use real Gentoo inputs, so they stay out of the
+# PR path by design.
+
 on:
   push:
     branches: [main]
@@ -36,6 +45,7 @@ on:
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/tests/test-pxe-diskless-docker.sh"
       - "scripts/tests/test-in-place-update-docker.sh"
+      - "scripts/tests/test-init-parity.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -73,6 +83,7 @@ on:
       - "scripts/tests/test-live-iso-normalizer-docker.sh"
       - "scripts/tests/test-pxe-diskless-docker.sh"
       - "scripts/tests/test-in-place-update-docker.sh"
+      - "scripts/tests/test-init-parity.sh"
       - "scripts/release-container/**"
       - "scripts/qemu-container/**"
       - "update/**"
@@ -141,7 +152,8 @@ jobs:
             scripts/qemu-container/test-pxe-diskless.sh \
             scripts/tests/test-pxe-diskless-docker.sh \
             scripts/qemu-container/test-in-place-update.sh \
-            scripts/tests/test-in-place-update-docker.sh
+            scripts/tests/test-in-place-update-docker.sh \
+            scripts/tests/test-init-parity.sh
 
       - name: Check Python sources
         run: |
@@ -152,6 +164,9 @@ jobs:
 
       - name: Test init-system selection
         run: scripts/tests/test-image-init-selection.sh
+
+      - name: Test init-system persistence parity
+        run: scripts/tests/test-init-parity.sh
 
       - name: Test Docker context policy
         run: scripts/tests/test-docker-context-policy.sh

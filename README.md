@@ -88,6 +88,10 @@ Additional persistence is opt-in and declarative:
 
 See [`docs/design/machine-identity.md`](docs/design/machine-identity.md) for
 the machine-id, SSH host-key, log, and opt-out semantics.
+The persistence and shutdown integration is equivalent across the OpenRC and
+systemd targets; the file-level comparison and the contract test that keeps
+them in step are in
+[`docs/design/init-system-parity.md`](docs/design/init-system-parity.md).
 The atomic package update and Portage Engine boundary is specified in
 [`docs/design/atomic-package-updates.md`](docs/design/atomic-package-updates.md).
 Generation v2 Portage desired-state transitions are specified in

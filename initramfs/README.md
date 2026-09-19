@@ -301,9 +301,16 @@ volatoo-persist status
 volatoo-persist sync
 ```
 
-The installed OpenRC service starts in the default runlevel and synchronizes
-while that runlevel is stopped. Its `localmount` dependency makes the snapshot
-finish before the state filesystem is unmounted.
+The same `sync` runs automatically when the system stops. The OpenRC service
+starts in the default runlevel and synchronizes while that runlevel is stopped;
+its `localmount` dependency makes the snapshot finish before the state
+filesystem is unmounted. The systemd unit is a `oneshot` service with
+`RemainAfterExit=yes` and `Before=umount.target`, so its `ExecStop` runs the
+same command during shutdown. Both units are guarded by the state layout
+marker and the published image id. See
+[`docs/design/init-system-parity.md`](../docs/design/init-system-parity.md)
+for the file-level comparison and the parity contract test that keeps the two
+targets equivalent.
 
 ### Default machine identity and logs
 

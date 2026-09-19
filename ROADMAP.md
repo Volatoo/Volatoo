@@ -60,8 +60,15 @@ Reproducible image builds instead of hand-rolled squashfs.
   - [x] Add a RAM-backed SquashFS overlay that releases the source image device
   - [x] Add an explicit store-backed overlay and make it the default root mode
 - [x] Let installers and image tooling select `openrc` or `systemd` explicitly
-- [ ] Provide equivalent persistence/shutdown integration for OpenRC and systemd
-- [ ] Run the image, boot, update and rollback CI matrix against both init systems
+- [x] Provide equivalent persistence/shutdown integration for OpenRC and systemd
+  - [ ] Confirm systemd journald writes into the persisted `/var/log` once a
+        systemd boot gate covers it (currently an inference recorded in
+        docs/design/init-system-parity.md, not observed)
+- [x] Run the image, boot, update and rollback CI matrix against both init systems
+  - [ ] Execute the extended realized-v3 Gate on the schedule runner: the new
+        systemd signed-rollback and tamper lanes are a mirror of the OpenRC
+        block and passed locally against the real pinned inputs (2026-09-19),
+        but the schedule runner has not run them yet
 - [ ] Package-set variants: `minimal` (console) first; `desktop` later
 - [x] In-place image update: download new image to state partition, reboot into it (A/B slots)
 
